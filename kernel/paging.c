@@ -11,7 +11,7 @@ static uint32_t page_directory[1024] __attribute__((aligned(4096)));
 
 void paging_init(void) {
     for (uint32_t i = 0; i < 1024; i++) {
-        page_directory[i] = (i * 0x400000) | 0x83; /* present, rw, 4MB page */
+        page_directory[i] = (i * 0x400000) | 0x87; /* present, rw, user, 4MB page */
     }
 
     __asm__ volatile (

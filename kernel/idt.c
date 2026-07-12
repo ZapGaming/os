@@ -112,10 +112,16 @@ void idt_init(void) {
 
 /* Called from the asm stubs' common handler */
 void isr_dispatch(struct registers *regs) {
-    if (handlers[regs->int_no]) {
-        handlers[regs->int_no](regs);
-    }
+    /* EOI must be sent before the handler runs, not after: a handler is
+     * allowed to switch tasks (e.g. the scheduler's timer tick), which
+     * means control may never actually unwind back to this function --
+     * it instead resumes some other task's previously-suspended call
+     * chain. If we waited to EOI here, the PIC would consider this IRQ
+     * permanently "in service" and never deliver it again. */
     if (regs->int_no >= 32 && regs->int_no <= 47) {
         pic_send_eoi(regs->int_no - 32);
+    }
+    if (handlers[regs->int_no]) {
+        handlers[regs->int_no](regs);
     }
 }

@@ -3,9 +3,12 @@
 #include <drivers/mouse.h>
 #include <drivers/keyboard.h>
 #include <kernel/pit.h>
+#include <kernel/scheduler.h>
+#include <kernel/demo.h>
+#include <kernel/syscall.h>
 #include <string.h>
 
-#define MAX_WINDOWS   4
+#define MAX_WINDOWS   5
 #define TITLEBAR_H    28
 #define TASKBAR_H     44
 
@@ -15,6 +18,7 @@ typedef struct {
     const char *body_line1;
     const char *body_line2;
     uint32_t accent;
+    int is_process_monitor;
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -39,6 +43,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->body_line1 = l1;
     win->body_line2 = l2;
     win->accent = accent;
+    win->is_process_monitor = 0;
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -62,6 +67,9 @@ void gui_init(void) {
     add_window(260, 340, 320, 150, "Roadmap",
                "Next up: networking + audio",
                "See README.md for the plan", 0xE0954C);
+
+    int pm = add_window(640, 420, 320, 190, "Process Monitor", NULL, NULL, 0xB05CE0);
+    windows[pm].is_process_monitor = 1;
 }
 
 static void utoa(unsigned int val, char *buf) {
@@ -93,6 +101,25 @@ static void draw_clock(int x, int y) {
     buf[i] = 0;
 
     fb_draw_string(x, y, buf, COL_TEXT, 2);
+}
+
+static void draw_labeled_uint(int x, int y, const char *label, unsigned int val, uint32_t color) {
+    char buf[16];
+    utoa(val, buf);
+    fb_draw_string(x, y, label, COL_MUTED, 1);
+    fb_draw_string(x + fb_text_width(label, 1), y, buf, color, 1);
+}
+
+static void draw_process_monitor(const gui_window_t *w) {
+    int x = w->x + 14;
+    int y = w->y + TITLEBAR_H + 14;
+
+    draw_labeled_uint(x, y, "tasks running: ", (unsigned int)scheduler_task_count(), COL_TEXT);
+    draw_labeled_uint(x, y + 20, "bg kernel task ticks: ", get_bg_counter(), 0x8FE3A8);
+    draw_labeled_uint(x, y + 40, "ring-3 syscalls seen: ", (unsigned int)syscall_message_count(), 0xE0954C);
+
+    fb_draw_string(x, y + 68, "last message from ring 3:", COL_MUTED, 1);
+    fb_draw_string(x, y + 86, syscall_last_message(), COL_TEXT, 1);
 }
 
 static void draw_shadow(int x, int y, int w, int h) {
@@ -129,6 +156,7 @@ static void draw_window(const gui_window_t *w, int focused) {
 
     if (w->body_line1) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 16, w->body_line1, COL_TEXT, 1);
     if (w->body_line2) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 34, w->body_line2, COL_MUTED, 1);
+    if (w->is_process_monitor) draw_process_monitor(w);
 }
 
 static void draw_taskbar(void) {

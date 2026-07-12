@@ -100,4 +100,8 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+; Syscall gate: ring3 code invokes `int 0x80` deliberately. This IDT entry
+; is given DPL=3 so it's actually callable from CPL 3 (see syscall.c).
+ISR_NOERR 128
+
 section .note.GNU-stack noalloc noexec nowrite progbits

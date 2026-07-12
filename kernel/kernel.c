@@ -12,7 +12,25 @@
 #include <drivers/mouse.h>
 #include <gui/framebuffer.h>
 #include <gui/compositor.h>
+#include <kernel/scheduler.h>
+#include <kernel/demo.h>
+#include <kernel/exceptions.h>
+#include <kernel/tss.h>
+#include <kernel/syscall.h>
+#include <kernel/demo_user_task.h>
 #include <stdint.h>
+
+static volatile uint32_t bg_counter = 0;
+
+uint32_t get_bg_counter(void) {
+    return bg_counter;
+}
+
+static void bg_task_entry(void) {
+    for (;;) {
+        bg_counter++;
+    }
+}
 
 void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     serial_init();
@@ -22,8 +40,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     gdt_init();
     serial_printf("GDT loaded\n");
 
+    tss_init();
+    serial_printf("TSS loaded\n");
+
     idt_init();
     serial_printf("IDT loaded\n");
+
+    exceptions_init();
+    serial_printf("Exception handlers registered\n");
+
+    syscall_init();
 
     pic_remap();
     serial_printf("PIC remapped\n");
@@ -46,6 +72,13 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
         fb_init((uint32_t)mb_info.fb_addr, mb_info.fb_pitch,
                  mb_info.fb_width, mb_info.fb_height, mb_info.fb_bpp);
     }
+
+    scheduler_init();
+    task_create(bg_task_entry);
+    task_create_user(demo_user_task_entry);
+    pit_set_tick_callback(schedule);
+    scheduler_start();
+    serial_printf("Scheduler started with %d tasks\n", scheduler_task_count());
 
     __asm__ volatile ("sti");
     serial_printf("Interrupts enabled\n");

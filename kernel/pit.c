@@ -1,6 +1,7 @@
 #include <kernel/pit.h>
 #include <kernel/idt.h>
 #include <kernel/io.h>
+#include <stddef.h>
 
 #define PIT_CHANNEL0 0x40
 #define PIT_COMMAND  0x43
@@ -8,10 +9,16 @@
 
 static volatile uint32_t ticks = 0;
 static uint32_t tick_rate_hz = 100;
+static pit_tick_callback_t tick_callback = NULL;
 
 static void pit_handler(struct registers *regs) {
     (void)regs;
     ticks++;
+    if (tick_callback) tick_callback();
+}
+
+void pit_set_tick_callback(pit_tick_callback_t cb) {
+    tick_callback = cb;
 }
 
 void pit_init(uint32_t frequency_hz) {
