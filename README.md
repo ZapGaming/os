@@ -114,10 +114,16 @@ you can keep building on.
   downloads. Verified end-to-end against both real, live websites and a
   local multi-page CSS test site (see "How the browser works" below).
 - **A real JavaScript engine**: a from-scratch lexer, recursive-descent
-  parser, and tree-walking interpreter (`js/`) for a pragmatic ES5-ish
-  subset — variables (`var`/`let`/`const` with real block scoping),
-  functions with genuine closures, `if`/`for`/`while`, all the standard
-  operators, array/object literals — wired to a minimal but real DOM API
+  parser, and tree-walking interpreter (`js/`) for a pragmatic ES5-plus-
+  some-ES6 subset — variables (`var`/`let`/`const` with real block
+  scoping), functions with genuine closures, `if`/`for`/`while`, all the
+  standard operators, array/object literals, plus arrow functions
+  (with correct lexical `this`), classes (`constructor`/methods, no
+  `extends` — this engine has no prototype chain to hang inheritance
+  off of, so it's an honest parse error rather than a silent no-op),
+  template literals, destructuring (array/object, including in function
+  params), and spread (`...` in array literals and call arguments) —
+  wired to a minimal but real DOM API
   (`document.getElementById`, `element.textContent`/`innerHTML` get and
   set, `element.style.property = ...`, `element.onclick = fn` with
   event bubbling, `console.log`, `Math`). Inline `<script>` bodies run
@@ -1297,6 +1303,101 @@ Two real, and one very educational, bugs came out of building this:
    giving `JS_ASSIGN` its own `value` field instead of overloading a
    field with an unrelated meaning.
 
+**ES6+ additions.** Arrow functions, classes, template literals,
+destructuring, and spread were added on top of the above without
+touching its fundamental shape. A few things worth knowing:
+
+- Arrow functions get their own `enum js_obj_kind` (`JS_OBJ_ARROW`)
+  purely so `js_call()` can tell them apart from regular functions:
+  everything about calling one is identical except that an arrow must
+  *not* get its own `this` binding declared in its call scope — leaving
+  that declaration out is what makes `this` resolve lexically through
+  `closure_env` the way real arrow functions do (e.g. an arrow assigned
+  inside a class method correctly sees the *method's* `this`, not
+  whatever called the arrow later).
+- `(a, b) => ...` and a bare parenthesized expression share an
+  identical prefix, so the parser can't tell which one it's looking at
+  until it's read past the closing `)`. It resolves this the standard
+  recursive-descent way: snapshot the lexer (a flat struct, safe to
+  copy/restore), speculatively try to parse an arrow parameter list,
+  and roll back to the snapshot if it doesn't end in `=>`.
+- Classes don't get a real prototype chain (this engine never had one
+  — see `js.h`'s `enum js_obj_kind`, still no `JS_OBJ_ARRAY`-style
+  delegation). `new Foo(...)` instead copies each method as its own
+  bound closure directly onto the new plain object, then runs
+  `constructor` with `this` set to it. That's why `extends` isn't
+  supported: there's no shared prototype to delegate an unfound method
+  lookup up to, so inheritance would need a fundamentally different
+  object model, not just more parser cases — `class A extends B {}`
+  is therefore a deliberate, honest parse error (`extends` was never
+  added as a keyword) rather than a silent no-op that drops the parent.
+- Destructuring binds through one shared recursive `bind_pattern()`
+  used for `const {a, b} = obj`, `const [x, y] = arr`, and destructured
+  function/arrow parameters alike, so array and object patterns can
+  nest inside each other the same way real JS allows.
+- Verified with a host-side test harness (compiling the actual
+  `js/*.c` against stub kernel headers, the same practice described
+  under "How HTTPS/TLS works") covering all five features individually,
+  together in one combined test, and a regression pass over every
+  pre-ES6 feature this interpreter already had.
+
+## How the WASM interpreter works
+
+`net/wasm.c` is a self-contained WebAssembly binary-format parser and
+stack-machine interpreter — **i32 only**, no i64/f32/f64, matching the
+JS engine's own int32-only constraint one section up (this kernel is
+built `-mno-sse -mno-80387 -mgeneral-regs-only`, so a single float
+instruction anywhere in the interpreter's C code is a hard compile
+error, not a style choice). It isn't wired into the browser or JS
+engine yet — see "What's next" above for why (no `fetch()`/`ArrayBuffer`
+exists to hand it bytes in the first place) — but the interpreter core
+itself is complete and independently tested.
+
+The parser walks every standard MVP section (Type/Import/Function/
+Memory/Global/Export/Start/Code/Data), rejecting any f32/f64/i64 type
+or instruction outright rather than misreading it, and structurally
+skipping (not rejecting) Table/Element sections since real toolchains
+sometimes emit an empty one even when a module never uses
+`call_indirect` — an unused table shouldn't block an otherwise-
+supported module. The interpreter itself is a straightforward
+operand-stack machine, but with one kernel-specific twist: the operand
+stack and the block/loop/if label stack are each one `kmalloc`'d array
+owned by the `wasm_instance` and shared across the *entire* active call
+chain, rather than a fresh C-level array per nested call. A kernel task
+only gets a 16KB stack (`TASK_STACK_SIZE`, `include/kernel/scheduler.h`)
+— letting `exec_function()`'s C-level recursion carry its own
+WASM-level value stack on the real machine stack would blow that budget
+on anything but the shallowest call depth.
+
+Every failure mode traps cleanly instead of corrupting memory or
+crashing the kernel: divide-by-zero, the INT32_MIN/-1 overflow case
+(`i32.div_s` traps on it per spec; `i32.rem_s` correctly returns 0
+instead), out-of-bounds memory access (bounds-checked via a 64-bit
+intermediate so an address like `0xFFFFFFFF` can't wrap around and
+falsely pass), value-stack under/overflow, call-stack depth limits, and
+calls to an unbound import or to `call_indirect` (parsed but never
+actually executable, since there's no table support) all fail with a
+clean `serial_printf` and a 0 return rather than undefined behavior —
+important since this kernel has no memory protection between the
+interpreter and the rest of the system.
+
+Verified with a host-side harness (the actual `net/wasm.c`, unmodified,
+compiled against stub kernel headers) against real `.wasm` binaries —
+`clang --target=wasm32` plus `wasm-ld` were available in this
+environment, so most test modules are genuinely toolchain-compiled, with
+a few hand-encoded byte-for-byte for cases easier to construct directly
+(f32/f64/i64 rejection, `call_indirect`'s trap, the divide/overflow/OOB
+trap cases). One of those test builds surfaced a real toolchain quirk
+worth knowing about: a `-O1` build of a simple summing `while` loop
+failed to parse, because LLVM's loop-induction-variable-widening
+optimization pass had promoted the (plain `int`, i.e. i32) trip count to
+i64 in the compiled output even though nothing in the C source asked
+for 64-bit arithmetic. That's not an interpreter bug — the module
+genuinely uses an i64 local — and rebuilding at `-O0` avoided the
+idiom; it's a good reminder that this scope cut will occasionally
+reject real-world `-O1`+ output for reasons that have nothing to do
+with what the source code actually says.
+
 ## How the Terminal and shell work
 
 `gui/shell.c`'s `shell_execute()` is the whole shell: split the typed
@@ -1706,19 +1807,34 @@ done (see above). Rough order of what's next:
 7. **File delete/rename** — the FAT32 driver can create and overwrite
    files now, but there's still no way to remove or rename one from the
    File Manager.
-8. **Growing the JS engine** — the interpreter is deliberately minimal
-   today (integer-only numbers, no prototypes/classes, no `try`/`catch`,
-   no external `<script src>` fetching). Next steps there would be a
-   software fixed-point or soft-float number type (the kernel is built
-   `-mno-sse -mno-80387`, so real floats need emulation, not just
-   enabling the FPU), prototype-based objects, and wiring `<script src>`
-   through the existing HTTP fetch code.
+8. **Growing the JS engine** — arrow functions, classes, template
+   literals, destructuring, and spread all work now (see "How the JS
+   engine works" below), but the interpreter is still otherwise minimal
+   (integer-only numbers, no real prototype chain -- classes copy method
+   closures onto each instance rather than delegating through a shared
+   prototype, no `try`/`catch`, no external `<script src>` fetching, no
+   `extends`). Next steps there would be a software fixed-point or
+   soft-float number type (the kernel is built `-mno-sse -mno-80387`, so
+   real floats need emulation, not just enabling the FPU), a real
+   prototype chain, and wiring `<script src>` through the existing HTTP
+   fetch code.
 9. **More image formats** — BMP (`net/bmp.c`) and PNG (`net/png.c`,
    reusing `net/gzip.c`'s DEFLATE decompressor for IDAT) both decode now.
    JPEG (baseline sequential DCT only, no progressive/arithmetic coding)
    and animated GIF remain -- JPEG needs a real DCT/Huffman decoder, a
    genuinely different algorithm family from PNG's chunk/filter approach
    and a substantial project on its own.
+10. **Wiring the WASM interpreter into the browser** — `net/wasm.c` is a
+    complete, host-tested WebAssembly binary-format parser and i32
+    stack-machine interpreter (see "How the WASM interpreter works"
+    below), but nothing in the browser or JS engine calls it yet: there's
+    no `WebAssembly` JS global, and no way for a page to hand it a
+    `.wasm` blob (this JS engine has no `fetch()`/`ArrayBuffer` to carry
+    the bytes in the first place). Exposing it for real would mean
+    picking a binding shape (likely a native `WebAssembly.instantiate`
+    that accepts an array of byte values, given there's no `ArrayBuffer`
+    type) and deciding how a page's exported WASM functions get called
+    back into from JS.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.
