@@ -1,6 +1,7 @@
 #include <drivers/ata.h>
 #include <kernel/io.h>
 #include <kernel/serial.h>
+#include <string.h>
 
 #define ATA_IO_BASE   0x1F0
 #define ATA_CTRL_BASE 0x3F6
@@ -34,6 +35,18 @@
 #define ATA_WAIT_TIMEOUT 100000
 
 static int disk_present = 0;
+
+/* Non-NULL once ata_use_ram_disk() is called -- every read/write below
+ * then serves out of this buffer instead of touching real I/O ports. */
+static uint8_t *ram_disk = NULL;
+static uint32_t ram_disk_size = 0;
+
+void ata_use_ram_disk(void *base, uint32_t size) {
+    ram_disk = (uint8_t *)base;
+    ram_disk_size = size;
+    disk_present = 1;
+    serial_printf("ata: no hardware disk -- using embedded %u-byte RAM disk image instead\n", size);
+}
 
 /* Bounded poll -- returns 1 once BSY clears, 0 on timeout (no drive, or a
  * drive that's wedged). Never spins forever on a floating/absent bus. */
@@ -103,6 +116,13 @@ static void ata_setup_lba(uint32_t lba, uint8_t count) {
 
 int ata_read_sectors(uint32_t lba, uint8_t count, void *buf) {
     if (!disk_present) return 0;
+    if (ram_disk) {
+        uint32_t offset = lba * ATA_SECTOR_SIZE;
+        uint32_t len = (uint32_t)count * ATA_SECTOR_SIZE;
+        if (offset + len > ram_disk_size) return 0;
+        memcpy(buf, ram_disk + offset, len);
+        return 1;
+    }
     uint16_t *out = (uint16_t *)buf;
 
     if (!ata_wait_bsy()) return 0;
@@ -118,6 +138,13 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf) {
 
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf) {
     if (!disk_present) return 0;
+    if (ram_disk) {
+        uint32_t offset = lba * ATA_SECTOR_SIZE;
+        uint32_t len = (uint32_t)count * ATA_SECTOR_SIZE;
+        if (offset + len > ram_disk_size) return 0;
+        memcpy(ram_disk + offset, buf, len);
+        return 1;
+    }
     const uint16_t *in = (const uint16_t *)buf;
 
     if (!ata_wait_bsy()) return 0;

@@ -1,6 +1,7 @@
 #include <net/http.h>
 #include <net/dns.h>
 #include <net/tcp.h>
+#include <net/gzip.h>
 #include <kernel/pit.h>
 #include <kernel/kheap.h>
 #include <kernel/serial.h>
@@ -8,6 +9,101 @@
 
 static int ci_starts_with(const char *s, const char *prefix);
 static uint32_t parse_uint(const char *s, const char *end);
+
+#define HTTP_MAX_REDIRECTS 5
+
+/* A flat, per-host cookie jar -- no Path/Expires/HttpOnly/Secure/
+ * SameSite handling, no per-path scoping, just "these name=value pairs
+ * go out with every request to this host" (close enough for the sites
+ * that actually need cookies to function at all, e.g. session/consent
+ * cookies). Replaced by name on a new Set-Cookie for the same host. */
+#define COOKIE_JAR_ENTRIES 32
+#define COOKIE_HOST_LEN    64
+#define COOKIE_NAME_LEN    64
+#define COOKIE_VALUE_LEN   192
+
+struct cookie_entry {
+    char host[COOKIE_HOST_LEN];
+    char name[COOKIE_NAME_LEN];
+    char value[COOKIE_VALUE_LEN];
+    int valid;
+};
+
+static struct cookie_entry cookie_jar[COOKIE_JAR_ENTRIES];
+
+static void cookie_store(const char *host, const char *name, uint32_t name_len,
+                          const char *value, uint32_t value_len) {
+    if (name_len == 0 || name_len >= COOKIE_NAME_LEN || value_len >= COOKIE_VALUE_LEN) return;
+
+    int slot = -1;
+    for (int i = 0; i < COOKIE_JAR_ENTRIES; i++) {
+        if (cookie_jar[i].valid && strcmp(cookie_jar[i].host, host) == 0 &&
+            strncmp(cookie_jar[i].name, name, name_len) == 0 && cookie_jar[i].name[name_len] == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < COOKIE_JAR_ENTRIES; i++) {
+            if (!cookie_jar[i].valid) { slot = i; break; }
+        }
+    }
+    if (slot < 0) return; /* jar full -- drop it rather than evict, cookies are best-effort here */
+
+    strncpy(cookie_jar[slot].host, host, COOKIE_HOST_LEN - 1);
+    cookie_jar[slot].host[COOKIE_HOST_LEN - 1] = 0;
+    memcpy(cookie_jar[slot].name, name, name_len);
+    cookie_jar[slot].name[name_len] = 0;
+    memcpy(cookie_jar[slot].value, value, value_len);
+    cookie_jar[slot].value[value_len] = 0;
+    cookie_jar[slot].valid = 1;
+}
+
+/* Parses one "Name=Value" pair out of a Set-Cookie header value
+ * (stopping at the first ';' -- every other attribute: Path, Expires,
+ * Max-Age, Domain, Secure, HttpOnly, SameSite -- is ignored) and stores
+ * it for `host`. */
+static void cookie_parse_set_cookie(const char *host, const char *value, const char *end) {
+    const char *p = value;
+    const char *eq = NULL;
+    while (p < end && *p != ';') {
+        if (!eq && *p == '=') eq = p;
+        p++;
+    }
+    if (!eq) return;
+    const char *name_start = value;
+    while (name_start < eq && *name_start == ' ') name_start++;
+    const char *name_end = eq;
+    while (name_end > name_start && name_end[-1] == ' ') name_end--;
+    const char *val_start = eq + 1;
+    const char *val_end = p;
+    while (val_end > val_start && val_end[-1] == ' ') val_end--;
+
+    cookie_store(host, name_start, (uint32_t)(name_end - name_start), val_start, (uint32_t)(val_end - val_start));
+}
+
+/* Builds "name1=value1; name2=value2" for every cookie stored against
+ * `host`. Returns the number of bytes written (0 if none / doesn't fit). */
+static uint32_t cookie_build_header(const char *host, char *out, uint32_t out_cap) {
+    uint32_t pos = 0;
+    int first = 1;
+    for (int i = 0; i < COOKIE_JAR_ENTRIES; i++) {
+        if (!cookie_jar[i].valid || strcmp(cookie_jar[i].host, host) != 0) continue;
+        uint32_t name_len = (uint32_t)strlen(cookie_jar[i].name);
+        uint32_t value_len = (uint32_t)strlen(cookie_jar[i].value);
+        uint32_t need = name_len + 1 + value_len + (first ? 0 : 2);
+        if (pos + need >= out_cap) break;
+        if (!first) { out[pos++] = ';'; out[pos++] = ' '; }
+        memcpy(out + pos, cookie_jar[i].name, name_len);
+        pos += name_len;
+        out[pos++] = '=';
+        memcpy(out + pos, cookie_jar[i].value, value_len);
+        pos += value_len;
+        first = 0;
+    }
+    out[pos] = 0;
+    return pos;
+}
 
 /* Sized to hold a whole response (headers + body) in one shot -- big
  * enough for a short downloaded clip, not big enough to stream an
@@ -21,6 +117,11 @@ static uint32_t parse_uint(const char *s, const char *end);
 #define HTTP_RAW_BUF_SIZE (2u * 1024 * 1024)
 
 static uint8_t *raw_buf = NULL;
+
+/* Holds the response body after Transfer-Encoding (chunked) has been
+ * undone but before Content-Encoding (gzip/deflate) has -- i.e. still
+ * possibly compressed. Same lazy-kmalloc/sizing convention as raw_buf. */
+static uint8_t *comp_buf = NULL;
 
 /* A small in-memory response cache, keyed by "host:port/path", so a
  * page revisited (or a stylesheet/image shared by several pages) in
@@ -216,6 +317,83 @@ static uint32_t decode_chunked(const uint8_t *data, uint32_t len, uint8_t *out, 
     return outlen;
 }
 
+/* Like find_header(), but starts searching after `from` (NULL = start
+ * of headers) so every occurrence of a repeatable header (e.g.
+ * Set-Cookie, which a response can carry several of) can be visited by
+ * calling this in a loop with each previous return value. */
+static const char *find_header_next(const char *headers, uint32_t len, const char *name, const char *from) {
+    uint32_t name_len = (uint32_t)strlen(name);
+    const char *p = from ? from : headers;
+    const char *end = headers + len;
+    while (p < end) {
+        if ((uint32_t)(end - p) >= name_len + 1 && ci_starts_with(p, name) && p[name_len] == ':') {
+            const char *v = p + name_len + 1;
+            while (v < end && *v == ' ') v++;
+            return v;
+        }
+        while (p < end && *p != '\n') p++;
+        p++;
+    }
+    return NULL;
+}
+
+/* Parses a Location header value into an (updated) host/port/path.
+ * Handles absolute ("http://host[:port]/path"), scheme-relative
+ * ("//host/path"), and root-relative ("/path") targets -- the common
+ * real-world cases. Returns 0 (can't/won't follow) for an https target
+ * (no TLS client exists yet) or an opaque relative path (this doesn't
+ * attempt dot-segment resolution against the current URL), 1 otherwise. */
+static int parse_location(const char *loc, uint32_t loc_len, char *host, uint32_t host_cap,
+                           uint16_t *port, char *path, uint32_t path_cap) {
+    const char *p = loc;
+    const char *end = loc + loc_len;
+
+    if (loc_len >= 8 && ci_starts_with(p, "https://")) return 0;
+
+    if (loc_len >= 7 && ci_starts_with(p, "http://")) {
+        p += 7;
+    } else if (loc_len >= 2 && p[0] == '/' && p[1] == '/') {
+        p += 2; /* scheme-relative -- assume http, same reasoning as above */
+    } else if (loc_len >= 1 && p[0] == '/') {
+        uint32_t n = (uint32_t)(end - p);
+        if (n >= path_cap) n = path_cap - 1;
+        memcpy(path, p, n);
+        path[n] = 0;
+        return 1; /* root-relative: host/port unchanged */
+    } else {
+        return 0;
+    }
+
+    const char *host_start = p;
+    while (p < end && *p != '/' && *p != ':') p++;
+    uint32_t hn = (uint32_t)(p - host_start);
+    if (hn >= host_cap) hn = host_cap - 1;
+    memcpy(host, host_start, hn);
+    host[hn] = 0;
+
+    if (p < end && *p == ':') {
+        p++;
+        *port = (uint16_t)parse_uint(p, end);
+        while (p < end && *p != '/') p++;
+    } else {
+        *port = 80;
+    }
+
+    if (p < end) {
+        uint32_t pn = (uint32_t)(end - p);
+        if (pn >= path_cap) pn = path_cap - 1;
+        memcpy(path, p, pn);
+        path[pn] = 0;
+    } else {
+        strcpy(path, "/");
+    }
+    return 1;
+}
+
+static int is_redirect_status(int status) {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
 int http_get(const char *host, uint16_t port, const char *path,
              int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
              char *content_type_out, uint32_t content_type_cap) {
@@ -241,62 +419,109 @@ int http_get(const char *host, uint16_t port, const char *path,
     }
 
     if (!raw_buf) raw_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
-    if (!raw_buf) {
+    if (!comp_buf) comp_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
+    if (!raw_buf || !comp_buf) {
         serial_printf("http: out of memory allocating %u-byte receive buffer\n", HTTP_RAW_BUF_SIZE);
         return 0;
     }
 
-    uint32_t ip;
-    if (!dns_resolve(host, &ip)) return 0;
-    if (!tcp_connect(ip, port)) return 0;
+    char cur_host[128];
+    char cur_path[512];
+    uint16_t cur_port = port;
+    strncpy(cur_host, host, sizeof(cur_host) - 1); cur_host[sizeof(cur_host) - 1] = 0;
+    strncpy(cur_path, path, sizeof(cur_path) - 1); cur_path[sizeof(cur_path) - 1] = 0;
 
-    char req[512];
-    strcpy(req, "GET ");
-    strcat(req, path);
-    strcat(req, " HTTP/1.1\r\nHost: ");
-    strcat(req, host);
-    strcat(req, "\r\nUser-Agent: ZapOS/1.0\r\nConnection: close\r\n\r\n");
-    int req_len = (int)strlen(req);
+    uint32_t total = 0, header_end = 0;
 
-    if (!tcp_send(req, (uint16_t)req_len)) {
+    for (int hop = 0; ; hop++) {
+        uint32_t ip;
+        if (!dns_resolve(cur_host, &ip)) return 0;
+        if (!tcp_connect(ip, cur_port)) return 0;
+
+        char cookie_hdr[512];
+        uint32_t cookie_hdr_len = cookie_build_header(cur_host, cookie_hdr, sizeof(cookie_hdr));
+
+        char req[1600];
+        strcpy(req, "GET ");
+        strcat(req, cur_path);
+        strcat(req, " HTTP/1.1\r\nHost: ");
+        strcat(req, cur_host);
+        strcat(req, "\r\nUser-Agent: ZapOS/1.0\r\nAccept-Encoding: gzip, deflate\r\n");
+        if (cookie_hdr_len > 0) {
+            strcat(req, "Cookie: ");
+            strcat(req, cookie_hdr);
+            strcat(req, "\r\n");
+        }
+        strcat(req, "Connection: close\r\n\r\n");
+
+        if (!tcp_send(req, (uint16_t)strlen(req))) {
+            tcp_close();
+            return 0;
+        }
+
+        total = 0;
+        for (;;) {
+            int got = tcp_recv(raw_buf + total, (uint16_t)(HTTP_RAW_BUF_SIZE - total > 4096 ? 4096 : HTTP_RAW_BUF_SIZE - total));
+            if (got > 0) {
+                total += (uint32_t)got;
+            } else if (got < 0) {
+                break;
+            } else {
+                pit_sleep(20);
+            }
+            if (total >= HTTP_RAW_BUF_SIZE - 4096) {
+                break;
+            }
+        }
         tcp_close();
-        return 0;
-    }
 
-    uint32_t total = 0;
-    for (;;) {
-        int got = tcp_recv(raw_buf + total, (uint16_t)(HTTP_RAW_BUF_SIZE - total > 4096 ? 4096 : HTTP_RAW_BUF_SIZE - total));
-        if (got > 0) {
-            total += (uint32_t)got;
-        } else if (got < 0) {
-            break;
-        } else {
-            pit_sleep(20);
+        header_end = 0;
+        for (uint32_t i = 0; i + 3 < total; i++) {
+            if (raw_buf[i] == '\r' && raw_buf[i + 1] == '\n' && raw_buf[i + 2] == '\r' && raw_buf[i + 3] == '\n') {
+                header_end = i + 4;
+                break;
+            }
         }
-        if (total >= HTTP_RAW_BUF_SIZE - 4096) {
-            break;
+        if (header_end == 0) {
+            serial_printf("http: malformed response (no header terminator)\n");
+            return 1; /* connected fine, just nothing sensible to show */
         }
-    }
-    tcp_close();
 
-    /* find end of headers */
-    uint32_t header_end = 0;
-    for (uint32_t i = 0; i + 3 < total; i++) {
-        if (raw_buf[i] == '\r' && raw_buf[i + 1] == '\n' && raw_buf[i + 2] == '\r' && raw_buf[i + 3] == '\n') {
-            header_end = i + 4;
-            break;
-        }
-    }
-    if (header_end == 0) {
-        serial_printf("http: malformed response (no header terminator)\n");
-        return 1; /* connected fine, just nothing sensible to show */
-    }
+        const char *p = (const char *)raw_buf;
+        while (p < (const char *)raw_buf + header_end && *p != ' ') p++;
+        if (*p == ' ') p++;
+        *status_out = (int)parse_uint(p, (const char *)raw_buf + header_end);
 
-    /* status line: "HTTP/1.1 200 OK\r\n" */
-    const char *p = (const char *)raw_buf;
-    while (p < (const char *)raw_buf + header_end && *p != ' ') p++;
-    if (*p == ' ') p++;
-    *status_out = (int)parse_uint(p, (const char *)raw_buf + header_end);
+        const char *hdr_end = (const char *)raw_buf + header_end;
+        const char *sc = find_header_next((const char *)raw_buf, header_end, "set-cookie", NULL);
+        while (sc) {
+            const char *line_end = sc;
+            while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
+            cookie_parse_set_cookie(cur_host, sc, line_end);
+            sc = find_header_next((const char *)raw_buf, header_end, "set-cookie", sc);
+        }
+
+        if (is_redirect_status(*status_out) && hop < HTTP_MAX_REDIRECTS) {
+            const char *loc = find_header((const char *)raw_buf, header_end, "location");
+            if (loc) {
+                const char *line_end = loc;
+                while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
+                char next_host[128], next_path[512];
+                uint16_t next_port;
+                strcpy(next_host, cur_host);
+                next_port = cur_port;
+                if (parse_location(loc, (uint32_t)(line_end - loc), next_host, sizeof(next_host),
+                                    &next_port, next_path, sizeof(next_path))) {
+                    strcpy(cur_host, next_host);
+                    cur_port = next_port;
+                    strcpy(cur_path, next_path);
+                    serial_printf("http: %d redirect -> %s:%u%s\n", *status_out, cur_host, cur_port, cur_path);
+                    continue;
+                }
+            }
+        }
+        break;
+    }
 
     const uint8_t *body = raw_buf + header_end;
     uint32_t body_avail = total - header_end;
@@ -323,20 +548,38 @@ int http_get(const char *host, uint16_t port, const char *path,
         content_type_out[content_type_cap - 1] = 0;
     }
 
-    uint32_t body_len;
+    /* Decode Transfer-Encoding (chunked) into comp_buf first -- it may
+     * still be Content-Encoding-compressed at this point, hence the
+     * name: the compressed-but-de-chunked body. */
+    uint32_t comp_len;
     if (is_chunked) {
-        body_len = decode_chunked(body, body_avail, (uint8_t *)body_out, body_cap);
+        comp_len = decode_chunked(body, body_avail, comp_buf, HTTP_RAW_BUF_SIZE);
     } else {
         const char *cl = find_header((const char *)raw_buf, header_end, "content-length");
         uint32_t content_length = cl ? parse_uint(cl, (const char *)raw_buf + header_end) : body_avail;
-        body_len = content_length < body_avail ? content_length : body_avail;
-        if (body_len > body_cap) body_len = body_cap;
-        memcpy(body_out, body, body_len);
+        comp_len = content_length < body_avail ? content_length : body_avail;
+        if (comp_len > HTTP_RAW_BUF_SIZE) comp_len = HTTP_RAW_BUF_SIZE;
+        memcpy(comp_buf, body, comp_len);
+    }
+
+    const char *enc = find_header((const char *)raw_buf, header_end, "content-encoding");
+    int is_gzip = enc && ci_starts_with(enc, "gzip");
+    int is_deflate = enc && ci_starts_with(enc, "deflate");
+
+    uint32_t body_len;
+    if (is_gzip) {
+        gzip_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &body_len);
+    } else if (is_deflate) {
+        deflate_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &body_len);
+    } else {
+        body_len = comp_len < body_cap ? comp_len : body_cap;
+        memcpy(body_out, comp_buf, body_len);
     }
 
     *body_len_out = body_len;
-    serial_printf("http: %s%s -> status=%d body=%u bytes%s\n",
-                  host, path, *status_out, body_len, is_chunked ? " (chunked)" : "");
+    serial_printf("http: %s%s -> status=%d body=%u bytes%s%s\n",
+                  host, path, *status_out, body_len, is_chunked ? " (chunked)" : "",
+                  is_gzip ? " (gzip)" : is_deflate ? " (deflate)" : "");
 
     const char *cc = find_header((const char *)raw_buf, header_end, "cache-control");
     if (cc) {

@@ -45,6 +45,16 @@ void multiboot_parse(uint32_t info_addr, struct mb_parsed_info *out) {
             out->fb_width  = fb->width;
             out->fb_height = fb->height;
             out->fb_bpp    = fb->bpp;
+        } else if (tag->type == 3) { /* module (see iso/grub.cfg's module2 line) */
+            struct mb_module_tag {
+                uint32_t type, size;
+                uint32_t mod_start, mod_end;
+                char cmdline[];
+            } __attribute__((packed)) *mod = (struct mb_module_tag *)ptr;
+
+            out->has_module   = 1;
+            out->module_addr  = mod->mod_start;
+            out->module_size  = mod->mod_end - mod->mod_start;
         }
 
         /* tags are 8-byte aligned */
@@ -54,4 +64,7 @@ void multiboot_parse(uint32_t info_addr, struct mb_parsed_info *out) {
     serial_printf("multiboot: highest usable addr=%x fb=%d %ux%ux%d pitch=%d\n",
                   (uint32_t)out->highest_usable_addr, out->has_framebuffer,
                   out->fb_width, out->fb_height, out->fb_bpp, out->fb_pitch);
+    if (out->has_module) {
+        serial_printf("multiboot: module at %x size=%u bytes\n", out->module_addr, out->module_size);
+    }
 }

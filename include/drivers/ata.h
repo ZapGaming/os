@@ -13,4 +13,10 @@ int ata_init(void);
 int ata_read_sectors(uint32_t lba, uint8_t count, void *buf);
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf);
 
+/* Fallback path for when there's no real ATA hardware disk: redirects
+ * every read/write above to an in-memory image instead (e.g. a GRUB
+ * module embedded in the ISO -- see kernel.c). `base` must already be
+ * mapped (true everywhere under this kernel's full identity map). */
+void ata_use_ram_disk(void *base, uint32_t size);
+
 #endif

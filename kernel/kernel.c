@@ -105,7 +105,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     if (net_up) serial_printf("Network: %s up\n", net_get_driver_name());
     else serial_printf("Network: no NIC found\n");
 
-    int fs_up = ata_init() && fat32_init();
+    int disk_ready = ata_init();
+    if (!disk_ready && mb_info.has_module) {
+        /* No real ATA hard disk (e.g. booted from the ISO alone, with
+         * no second -drive) -- fall back to the FAT32 image GRUB
+         * loaded as a module (see iso/grub.cfg), so the filesystem
+         * (and DOOM.ELF etc. on it) is still there either way. */
+        ata_use_ram_disk((void *)mb_info.module_addr, mb_info.module_size);
+        disk_ready = 1;
+    }
+    int fs_up = disk_ready && fat32_init();
     serial_printf(fs_up ? "Filesystem: FAT32 mounted\n" : "Filesystem: no disk/FAT32 found\n");
 
     int audio_up = ac97_init();

@@ -70,14 +70,28 @@ $(KERNEL): $(OBJECTS) linker.ld
 
 -include $(C_OBJECTS:.o=.d)
 
-iso: $(KERNEL)
+# The disk image is baked directly into the ISO as a GRUB module (see
+# iso/grub.cfg's `module2` line and drivers/ata.c's RAM-disk fallback),
+# so zapos.iso alone -- no separate file to carry around -- boots with
+# the full filesystem, DOOM.ELF included.
+iso: $(KERNEL) $(DISK)
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.elf
+	cp $(DISK) $(ISODIR)/boot/disk.img
 	cp iso/grub.cfg $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR)
 
+# Real ATA hardware disk still takes priority over the embedded module
+# (see kernel.c), so attaching zapos_disk.img as a second drive here
+# keeps behaving exactly as before -- persisting writes across reboots.
 run: iso disk
 	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 \
+		-serial stdio -m 512M -netdev user,id=net0 -device rtl8139,netdev=net0 -device AC97
+
+# Boots zapos.iso with NO second drive at all -- proves the ISO is
+# self-contained (embedded disk image module + RAM-disk fallback).
+run-iso-only: iso
+	qemu-system-i386 -boot order=d -cdrom $(ISO) \
 		-serial stdio -m 512M -netdev user,id=net0 -device rtl8139,netdev=net0 -device AC97
 
 clean:
