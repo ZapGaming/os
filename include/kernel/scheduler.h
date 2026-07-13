@@ -2,6 +2,7 @@
 #define KERNEL_SCHEDULER_H
 
 #include <stdint.h>
+#include <kernel/fpu.h>
 
 #define TASK_STACK_SIZE (16 * 1024)
 #define MAX_TASKS 16
@@ -16,6 +17,7 @@ struct task {
     void (*user_entry)(void);
     uint32_t user_stack_top;  /* ring-3 ESP to start at; only used when page_dir_phys != 0 */
     uint32_t page_dir_phys;   /* 0 = shared/legacy kernel directory; else this task's own isolated one */
+    uint8_t fpu_state[FPU_STATE_SIZE]; /* x87 FPU registers/control word, saved/restored every switch */
     enum task_state state;
     struct task *next;
 };

@@ -13,6 +13,7 @@
 #include <gui/framebuffer.h>
 #include <gui/compositor.h>
 #include <kernel/scheduler.h>
+#include <kernel/fpu.h>
 #include <kernel/demo.h>
 #include <kernel/exceptions.h>
 #include <kernel/tss.h>
@@ -63,6 +64,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     pit_init(100);
     serial_printf("PIT initialized\n");
+
+    fpu_init();
+    serial_printf("FPU enabled\n");
 
     struct mb_parsed_info mb_info;
     multiboot_parse(mb_info_addr, &mb_info);

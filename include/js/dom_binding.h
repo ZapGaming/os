@@ -48,4 +48,10 @@ void js_dom_reset(void);
  * the tree -- same pattern as css_extract_style_blocks(). */
 void js_run_inline_scripts(const char *html, uint32_t len, struct js_env *env);
 
+/* Redirects console.log's output to `sink` instead of the serial log --
+ * used by the terminal's "js <file>" command so a script's console.log
+ * lands in its own scrollback. Pass NULL to go back to serial (the
+ * default; the browser never needs to call this itself). */
+void js_set_console_sink(void (*sink)(const char *));
+
 #endif

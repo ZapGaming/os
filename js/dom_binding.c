@@ -10,6 +10,20 @@
 static struct dom_node *g_document_root = NULL;
 static int g_needs_relayout = 0;
 
+/* console.log normally goes straight to the serial log -- the only
+ * "console" that exists when a page's script is the caller. The
+ * terminal's "js <file>" command (gui/shell.c) wants that same
+ * console.log to land in its own scrollback instead, so it points this
+ * at a sink before running a script and clears it back to NULL (serial)
+ * afterward. Never both at once: browser onclick handlers and a
+ * terminal-run script both execute synchronously within the single GUI
+ * task, never concurrently. */
+static void (*g_console_sink)(const char *) = NULL;
+
+void js_set_console_sink(void (*sink)(const char *)) {
+    g_console_sink = sink;
+}
+
 static struct {
     struct dom_node *node;
     js_value handler;
@@ -219,11 +233,12 @@ static js_value native_get_element_by_id(js_value this_val, js_value *args, int 
 
 static js_value native_console_log(js_value this_val, js_value *args, int argc) {
     (void)this_val;
+    void (*out)(const char *) = g_console_sink ? g_console_sink : serial_write;
     for (int i = 0; i < argc; i++) {
-        serial_write(i > 0 ? " " : "");
-        serial_write(js_to_string(args[i]));
+        out(i > 0 ? " " : "");
+        out(js_to_string(args[i]));
     }
-    serial_write("\n");
+    out("\n");
     return js_undefined();
 }
 

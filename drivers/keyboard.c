@@ -96,6 +96,13 @@ static void keyboard_handler(struct registers *regs) {
     if (sc < 128) {
         int use_shift = shift_held ^ (caps_lock && ((scancode_ascii[sc] >= 'a' && scancode_ascii[sc] <= 'z')));
         char c = use_shift ? scancode_ascii_shift[sc] : scancode_ascii[sc];
+        /* Ctrl+letter -> the standard C0 control code (Ctrl+A=0x01 ...
+         * Ctrl+Z=0x1A), the same mapping real terminals use -- lets
+         * ASCII-ring consumers (the text editor's Ctrl+S save, the
+         * terminal's own future use) tell a chord apart from the bare
+         * letter without needing the separate raw scancode queue. */
+        if (ctrl_held && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
+        else if (ctrl_held && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
         if (c) ring_push(c);
     }
 }

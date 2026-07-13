@@ -8,13 +8,29 @@ CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -fno-builtin -nostdlib -nostdinc -Wall -Wextra -O2 \
            -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mgeneral-regs-only \
            -Iinclude -isystem $(GCC_FREESTANDING_INC) -MMD -MP
+
+# py/*.c (the Python-subset interpreter) is the one part of this kernel
+# that needs real floating point (a tagged int/float value union, per
+# js/js.h's comment explaining why the JS engine deliberately avoids
+# this). -mgeneral-regs-only and -mno-80387 make emitting any float
+# instruction at all a hard compile error, so those two flags are
+# dropped here -- everything else, including -mno-sse/-mno-sse2/-mno-mmx,
+# stays: the per-task FPU save/restore added in kernel/fpu.c only
+# FSAVE/FRSTORs the x87 register file, not SSE/XMM state, so float math
+# must be forced through x87 (which -mno-sse already does on this
+# target) rather than SSE for it to survive a context switch correctly.
+PY_CFLAGS := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
+           -fno-builtin -nostdlib -nostdinc -Wall -Wextra -O2 \
+           -mno-sse -mno-sse2 -mno-mmx \
+           -Iinclude -isystem $(GCC_FREESTANDING_INC) -MMD -MP
+
 LDFLAGS := -m elf_i386 -T linker.ld -nostdlib
 ASFLAGS := -f elf32
 
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui net fs js -name '*.c')
+C_SOURCES   := $(shell find boot kernel drivers gui net fs js py -name '*.c')
 ASM_SOURCES := $(shell find boot kernel drivers gui net fs js -name '*.asm')
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES))
@@ -37,6 +53,13 @@ disk: $(DISK)
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# More specific than the generic rule above (shorter stem: "lexer" vs
+# "py/lexer"), so GNU Make prefers this one for anything under py/ --
+# no changes needed to the generic rule.
+$(BUILD)/py/%.o: py/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(PY_CFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)

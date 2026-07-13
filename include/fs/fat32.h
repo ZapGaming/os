@@ -36,4 +36,24 @@ uint32_t fat32_read_file(uint32_t cluster, uint32_t file_size, void *buf, uint32
  * 0 if the disk is full. */
 int fat32_write_file(uint32_t dir_cluster, const char *name_8_3, const void *data, uint32_t len);
 
+/* Deletes a file or empty directory. Returns 1 on success, 0 if the
+ * name doesn't exist or (for a directory) still has entries in it. */
+int fat32_delete_file(uint32_t dir_cluster, const char *name_8_3);
+
+/* Renames (same directory) or moves (different directory) a file or
+ * directory, keeping its existing cluster chain -- cheap regardless of
+ * size. Returns 1 on success, 0 if the source doesn't exist or the
+ * destination name is already taken. */
+int fat32_rename_file(uint32_t old_dir_cluster, const char *old_name_8_3,
+                       uint32_t new_dir_cluster, const char *new_name_8_3);
+
+/* Creates a new, empty subdirectory of `parent_cluster` (with standard
+ * "."/".." entries -- see fat32_parent_cluster). Returns 1 on success,
+ * 0 if the name already exists or the disk is full. */
+int fat32_mkdir(uint32_t parent_cluster, const char *name_8_3);
+
+/* Returns the parent of `dir_cluster` (reading its ".." entry), or the
+ * root cluster for the root itself or a directory with no ".." entry. */
+uint32_t fat32_parent_cluster(uint32_t dir_cluster);
+
 #endif

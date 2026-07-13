@@ -195,6 +195,8 @@ int fat32_list_dir(uint32_t dir_cluster, struct fat_dirent_info *out, int max_en
                 if (de->attr & ATTR_VOLUME_ID) continue;
                 if (count >= max_entries) return count;
 
+                if (de->name[0] == '.') continue; /* "." / ".." (see fat32_mkdir) */
+
                 format_dirent_name(de->name, out[count].name);
                 out[count].is_dir = (de->attr & ATTR_DIRECTORY) != 0;
                 out[count].size = de->file_size;
@@ -320,4 +322,236 @@ int fat32_write_file(uint32_t dir_cluster, const char *name_8_3, const void *dat
     if (!write_dirent_contents(de, data, len)) return 0;
     ata_write_sectors(lba, 1, sector);
     return 1;
+}
+
+struct dirent_loc {
+    uint32_t lba;        /* sector LBA containing the entry */
+    uint32_t sector_off; /* byte offset of the entry within that sector */
+};
+
+/* Scans `dir_cluster` for a live (non-deleted, non-LFN, non-volume-id)
+ * entry named `raw_name`. On a match, loads its containing sector into
+ * `sector` and fills `loc`, returning 1; returns 0 if not found. */
+static int find_dirent(uint32_t dir_cluster, const uint8_t raw_name[11],
+                        uint8_t sector[ATA_SECTOR_SIZE], struct dirent_loc *loc) {
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT_EOC_MIN) {
+        uint32_t lba = cluster_to_lba(cluster);
+        for (uint32_t s = 0; s < sectors_per_cluster; s++) {
+            ata_read_sectors(lba + s, 1, sector);
+            for (int off = 0; off < ATA_SECTOR_SIZE; off += 32) {
+                struct fat_dirent *de = (struct fat_dirent *)(sector + off);
+                if (de->name[0] == 0x00) return 0; /* end of directory */
+                if (de->name[0] == 0xE5) continue;
+                if (de->attr == ATTR_LFN) continue;
+                if (de->attr & ATTR_VOLUME_ID) continue;
+                if (memcmp(de->name, raw_name, 11) == 0) {
+                    loc->lba = lba + s;
+                    loc->sector_off = (uint32_t)off;
+                    return 1;
+                }
+            }
+        }
+        cluster = fat_read_entry(cluster);
+    }
+    return 0;
+}
+
+/* Finds a free (deleted or never-used) slot in `dir_cluster`, growing
+ * the directory by one cluster if every existing slot is taken --
+ * the same "grow on demand" logic fat32_write_file uses for a brand
+ * new name, factored out so fat32_mkdir/fat32_rename_file (moving
+ * into a different directory) can place an entry without also
+ * allocating file content clusters. */
+static int alloc_dirent_slot(uint32_t dir_cluster, uint8_t sector[ATA_SECTOR_SIZE], struct dirent_loc *loc) {
+    uint32_t cluster = dir_cluster;
+    uint32_t last_cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT_EOC_MIN) {
+        last_cluster = cluster;
+        uint32_t lba = cluster_to_lba(cluster);
+        for (uint32_t s = 0; s < sectors_per_cluster; s++) {
+            ata_read_sectors(lba + s, 1, sector);
+            for (int off = 0; off < ATA_SECTOR_SIZE; off += 32) {
+                struct fat_dirent *de = (struct fat_dirent *)(sector + off);
+                if (de->name[0] == 0x00 || de->name[0] == 0xE5) {
+                    loc->lba = lba + s;
+                    loc->sector_off = (uint32_t)off;
+                    return 1;
+                }
+            }
+        }
+        cluster = fat_read_entry(cluster);
+    }
+
+    uint32_t new_dir_cluster = alloc_chain(1);
+    if (!new_dir_cluster) return 0;
+    memset(sector, 0, ATA_SECTOR_SIZE);
+    uint32_t lba = cluster_to_lba(new_dir_cluster);
+    for (uint32_t s = 0; s < sectors_per_cluster; s++) ata_write_sectors(lba + s, 1, sector);
+    fat_write_entry(last_cluster, new_dir_cluster);
+
+    loc->lba = lba;
+    loc->sector_off = 0;
+    return 1;
+}
+
+/* Deletes a file or empty directory. Refuses (returns 0) if `name_8_3`
+ * doesn't exist, or is a directory that still has entries in it --
+ * fat32_list_dir already filters out "."/".." (see fat32_mkdir), so
+ * any listed entry means it's genuinely not empty. */
+int fat32_delete_file(uint32_t dir_cluster, const char *name_8_3) {
+    if (!mounted) return 0;
+
+    uint8_t raw_name[11];
+    format_name_to_83(name_8_3, raw_name);
+
+    uint8_t sector[ATA_SECTOR_SIZE];
+    struct dirent_loc loc;
+    if (!find_dirent(dir_cluster, raw_name, sector, &loc)) return 0;
+
+    struct fat_dirent *de = (struct fat_dirent *)(sector + loc.sector_off);
+    uint32_t cluster = ((uint32_t)de->cluster_high << 16) | de->cluster_low;
+
+    if (de->attr & ATTR_DIRECTORY) {
+        struct fat_dirent_info tmp[1];
+        if (cluster >= 2 && fat32_list_dir(cluster, tmp, 1) > 0) return 0;
+    }
+
+    if (cluster >= 2) free_chain(cluster);
+    de->name[0] = 0xE5;
+    ata_write_sectors(loc.lba, 1, sector);
+    return 1;
+}
+
+/* Renames (same directory) or moves (different directory) a file or
+ * directory. The moved entry keeps its existing cluster chain --
+ * nothing is re-read/re-written, just relinked under a new name/
+ * parent -- so this is cheap regardless of file size. Fails without
+ * changing anything if `old_name_8_3` doesn't exist or `new_name_8_3`
+ * already exists in the destination directory. */
+int fat32_rename_file(uint32_t old_dir_cluster, const char *old_name_8_3,
+                       uint32_t new_dir_cluster, const char *new_name_8_3) {
+    if (!mounted) return 0;
+
+    uint8_t old_raw[11], new_raw[11];
+    format_name_to_83(old_name_8_3, old_raw);
+    format_name_to_83(new_name_8_3, new_raw);
+
+    uint8_t sector[ATA_SECTOR_SIZE];
+    struct dirent_loc loc;
+    if (!find_dirent(old_dir_cluster, old_raw, sector, &loc)) return 0;
+
+    uint8_t dest_sector[ATA_SECTOR_SIZE];
+    struct dirent_loc dest_loc;
+    if (find_dirent(new_dir_cluster, new_raw, dest_sector, &dest_loc)) return 0; /* name taken */
+
+    struct fat_dirent *de = (struct fat_dirent *)(sector + loc.sector_off);
+
+    if (old_dir_cluster == new_dir_cluster) {
+        memcpy(de->name, new_raw, 11);
+        ata_write_sectors(loc.lba, 1, sector);
+        return 1;
+    }
+
+    uint8_t attr = de->attr;
+    uint32_t cluster = ((uint32_t)de->cluster_high << 16) | de->cluster_low;
+    uint32_t size = de->file_size;
+
+    struct dirent_loc new_loc;
+    if (!alloc_dirent_slot(new_dir_cluster, dest_sector, &new_loc)) return 0;
+    struct fat_dirent *new_de = (struct fat_dirent *)(dest_sector + new_loc.sector_off);
+    memset(new_de, 0, sizeof(*new_de));
+    memcpy(new_de->name, new_raw, 11);
+    new_de->attr = attr;
+    new_de->cluster_high = (uint16_t)(cluster >> 16);
+    new_de->cluster_low = (uint16_t)(cluster & 0xFFFF);
+    new_de->file_size = size;
+    ata_write_sectors(new_loc.lba, 1, dest_sector);
+
+    /* Re-read the source sector in case it was the same physical sector
+     * as the destination (small directories sharing one sector) and
+     * the write above already changed its in-memory copy out from under
+     * `sector`/`de` -- reload fresh before clearing the old entry. */
+    ata_read_sectors(loc.lba, 1, sector);
+    de = (struct fat_dirent *)(sector + loc.sector_off);
+    de->name[0] = 0xE5;
+    ata_write_sectors(loc.lba, 1, sector);
+    return 1;
+}
+
+/* Creates a new, empty subdirectory of `parent_cluster` -- a fresh
+ * cluster holding standard "." (self) and ".." (parent) entries, plus
+ * the new directory's own entry in `parent_cluster` pointing to it.
+ * ".." uses cluster 0 for a parent that IS the volume root, per FAT32
+ * convention (fat32_parent_cluster() below translates that back).
+ * Returns 1 on success, 0 if the name already exists or the disk is
+ * full. */
+int fat32_mkdir(uint32_t parent_cluster, const char *name_8_3) {
+    if (!mounted) return 0;
+
+    uint8_t raw_name[11];
+    format_name_to_83(name_8_3, raw_name);
+
+    uint8_t sector[ATA_SECTOR_SIZE];
+    struct dirent_loc loc;
+    if (find_dirent(parent_cluster, raw_name, sector, &loc)) return 0; /* already exists */
+
+    uint32_t new_cluster = alloc_chain(1);
+    if (!new_cluster) return 0;
+
+    uint8_t dirsec[ATA_SECTOR_SIZE];
+    memset(dirsec, 0, ATA_SECTOR_SIZE);
+    uint32_t lba = cluster_to_lba(new_cluster);
+    for (uint32_t s = 0; s < sectors_per_cluster; s++) ata_write_sectors(lba + s, 1, dirsec);
+
+    ata_read_sectors(lba, 1, dirsec);
+    struct fat_dirent *dot = (struct fat_dirent *)dirsec;
+    memset(dot, 0, sizeof(*dot));
+    memset(dot->name, ' ', 11);
+    dot->name[0] = '.';
+    dot->attr = ATTR_DIRECTORY;
+    dot->cluster_high = (uint16_t)(new_cluster >> 16);
+    dot->cluster_low = (uint16_t)(new_cluster & 0xFFFF);
+
+    struct fat_dirent *dotdot = (struct fat_dirent *)(dirsec + 32);
+    memset(dotdot, 0, sizeof(*dotdot));
+    memset(dotdot->name, ' ', 11);
+    dotdot->name[0] = '.';
+    dotdot->name[1] = '.';
+    dotdot->attr = ATTR_DIRECTORY;
+    uint32_t parent_for_dotdot = (parent_cluster == root_cluster) ? 0 : parent_cluster;
+    dotdot->cluster_high = (uint16_t)(parent_for_dotdot >> 16);
+    dotdot->cluster_low = (uint16_t)(parent_for_dotdot & 0xFFFF);
+
+    ata_write_sectors(lba, 1, dirsec);
+
+    if (!alloc_dirent_slot(parent_cluster, sector, &loc)) { free_chain(new_cluster); return 0; }
+    struct fat_dirent *de = (struct fat_dirent *)(sector + loc.sector_off);
+    memset(de, 0, sizeof(*de));
+    memcpy(de->name, raw_name, 11);
+    de->attr = ATTR_DIRECTORY;
+    de->cluster_high = (uint16_t)(new_cluster >> 16);
+    de->cluster_low = (uint16_t)(new_cluster & 0xFFFF);
+    de->file_size = 0;
+    ata_write_sectors(loc.lba, 1, sector);
+    return 1;
+}
+
+/* Reads a directory's own ".." entry to find its parent -- lets a
+ * shell/File-Manager implement "cd .."/an Up button generically,
+ * without having to remember a separate parent stack themselves.
+ * Falls back to the root cluster for the root itself or a directory
+ * that has no (or a malformed) ".." entry -- e.g. one that predates
+ * fat32_mkdir, though in practice mtools-created directories already
+ * follow the same convention. */
+uint32_t fat32_parent_cluster(uint32_t dir_cluster) {
+    if (!mounted || dir_cluster == root_cluster || dir_cluster < 2) return root_cluster;
+
+    uint8_t sector[ATA_SECTOR_SIZE];
+    ata_read_sectors(cluster_to_lba(dir_cluster), 1, sector);
+    struct fat_dirent *dotdot = (struct fat_dirent *)(sector + 32);
+    if (dotdot->name[0] != '.' || dotdot->name[1] != '.') return root_cluster;
+
+    uint32_t parent = ((uint32_t)dotdot->cluster_high << 16) | dotdot->cluster_low;
+    return parent < 2 ? root_cluster : parent;
 }

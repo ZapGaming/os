@@ -4,8 +4,9 @@
 #include <kernel/tss.h>
 #include <kernel/usermode.h>
 #include <kernel/paging.h>
+#include <kernel/fpu.h>
 
-extern void switch_task(uint32_t *old_esp_store, uint32_t new_esp);
+extern void switch_task(uint32_t *old_esp_store, uint32_t new_esp, void *old_fpu, void *new_fpu);
 extern void task_trampoline(void);
 
 static struct task tasks[MAX_TASKS];
@@ -35,6 +36,7 @@ static struct task *task_alloc(void) {
     t->user_entry = NULL;
     t->user_stack_top = 0;
     t->page_dir_phys = 0;
+    fpu_get_clean_state(t->fpu_state);
     t->state = TASK_READY;
     task_count++;
     return t;
@@ -51,6 +53,7 @@ void scheduler_init(void) {
     tasks[0].pid = 0;
     tasks[0].state = TASK_RUNNING;
     tasks[0].next = &tasks[0];
+    fpu_get_clean_state(tasks[0].fpu_state);
     current_task = &tasks[0];
     task_count = 1;
 
@@ -142,7 +145,7 @@ void schedule(void) {
      * `next`, using whatever CR3 is already loaded. */
     paging_switch_directory(next->page_dir_phys ? next->page_dir_phys : paging_kernel_directory_phys());
 
-    switch_task(&prev->esp, next->esp);
+    switch_task(&prev->esp, next->esp, prev->fpu_state, next->fpu_state);
 }
 
 int scheduler_task_count(void) {

@@ -22,9 +22,10 @@
 #include <js/dom_binding.h>
 #include <kernel/kheap.h>
 #include <kernel/elf.h>
+#include <gui/shell.h>
 #include <string.h>
 
-#define MAX_WINDOWS   8
+#define MAX_WINDOWS   10
 #define TITLEBAR_H    28
 #define TASKBAR_H     44
 #define FM_ROW_H      16
@@ -32,6 +33,8 @@
 #define FM_PREVIEW_MAX 2048
 #define FM_AUDIO_MAX   (2 * 1024 * 1024)
 #define BR_MAX_URL     96
+#define TERM_SCROLLBACK 4096
+#define TERM_INPUT_MAX  120
 /* Well under http.c's own HTTP_RAW_BUF_SIZE (2MB) -- both have to fit
  * in the 8MB kheap arena at once, alongside anything else already
  * resident (e.g. a WAV file the File Manager has open). */
@@ -56,6 +59,7 @@ typedef struct {
     int is_network;
     int is_file_manager;
     int is_browser;
+    int is_terminal;
     int open;
 } gui_window_t;
 
@@ -141,6 +145,142 @@ static struct dom_node *br_dom_root = NULL;
 static struct css_stylesheet br_stylesheet;
 static int br_stylesheet_valid = 0;
 
+/* Terminal state -- a single instance, same convention as every other
+ * window here. `term_scrollback` is a bounded FIFO of everything ever
+ * printed (the shell's own output, and -- via terminal_route_output(),
+ * called from kernel/syscall.c's SYS_WRITE case -- whatever the one
+ * foreground program it launched writes); term_print() drops the
+ * oldest bytes to make room rather than growing, so drawing just means
+ * wrapping the whole buffer and showing the last N rows (see
+ * draw_terminal()). `term_owner_pid` is the pid (if any) whose
+ * SYS_WRITE output currently routes here instead of just the serial
+ * log -- cleared once that task terminates (polled once a frame, same
+ * pattern as the fullscreen-takeover's fs_owner_pid). */
+static uint32_t term_cwd = 0;
+static char term_scrollback[TERM_SCROLLBACK];
+static int term_sb_len = 0;
+static char term_input[TERM_INPUT_MAX];
+static int term_input_len = 0;
+static int term_focused = 0;
+static int term_owner_pid = -1;
+
+static void term_print(const char *s) {
+    int len = (int)strlen(s);
+    if (len >= TERM_SCROLLBACK) { s += len - (TERM_SCROLLBACK - 1); len = TERM_SCROLLBACK - 1; }
+    if (term_sb_len + len > TERM_SCROLLBACK) {
+        int drop = term_sb_len + len - TERM_SCROLLBACK;
+        if (drop > term_sb_len) drop = term_sb_len;
+        memmove(term_scrollback, term_scrollback + drop, (size_t)(term_sb_len - drop));
+        term_sb_len -= drop;
+    }
+    memcpy(term_scrollback + term_sb_len, s, (size_t)len);
+    term_sb_len += len;
+}
+
+void terminal_route_output(int pid, const char *s) {
+    if (pid == term_owner_pid) term_print(s);
+}
+
+/* Feeds typed characters into the input line -- Enter submits it to
+ * shell_execute() (see gui/shell.c), Backspace edits, everything else
+ * appends. Only consumes keys while term_focused (set by clicking
+ * inside the window body -- see the dispatch loop in gui_run()), same
+ * "clicking anywhere deselects the others" convention as
+ * br_editing_url/fm_editing. */
+static void term_handle_key(char c) {
+    if (!term_focused) return;
+
+    if (c == '\n' || c == '\r') {
+        term_print("> ");
+        term_print(term_input);
+        term_print("\n");
+        if (strcmp(term_input, "clear") == 0) {
+            term_sb_len = 0;
+        } else if (term_input_len > 0) {
+            int pid = shell_execute(term_input, &term_cwd, term_print);
+            if (pid >= 0) term_owner_pid = pid;
+        }
+        term_input_len = 0;
+        term_input[0] = 0;
+    } else if (c == '\b') {
+        if (term_input_len > 0) term_input[--term_input_len] = 0;
+    } else if (c >= 32 && c < 127 && term_input_len < TERM_INPUT_MAX - 1) {
+        term_input[term_input_len++] = c;
+        term_input[term_input_len] = 0;
+    }
+}
+
+static void term_handle_click(void) {
+    term_focused = 1;
+}
+
+/* Wraps `text` (the scrollback) into lines and draws only the last
+ * `max_rows` of them -- a simple "recompute every frame" tail view
+ * rather than a real scrolling viewport, cheap enough at this buffer
+ * size (see TERM_SCROLLBACK) to just redo it at 60fps. */
+static void term_draw_scrollback(int x, int y, int max_width, int max_rows) {
+    int chars_per_line = max_width / 8;
+    if (chars_per_line < 1) chars_per_line = 1;
+    if (chars_per_line > 62) chars_per_line = 62;
+
+    static char lines[48][64];
+    int line_count = 0;
+    char cur[64];
+    int col = 0, li = 0;
+
+    for (int i = 0; i < term_sb_len; i++) {
+        char ch = term_scrollback[i];
+        int flush = (ch == '\n' || col >= chars_per_line);
+        if (flush) {
+            cur[li] = 0;
+            if (line_count < 48) strcpy(lines[line_count++], cur);
+            else {
+                for (int k = 0; k < 47; k++) strcpy(lines[k], lines[k + 1]);
+                strcpy(lines[47], cur);
+            }
+            li = 0; col = 0;
+            if (ch == '\n') continue;
+        }
+        if (li < 63) cur[li++] = ch;
+        col++;
+    }
+    if (li > 0) {
+        cur[li] = 0;
+        if (line_count < 48) strcpy(lines[line_count++], cur);
+        else {
+            for (int k = 0; k < 47; k++) strcpy(lines[k], lines[k + 1]);
+            strcpy(lines[47], cur);
+        }
+    }
+
+    int total = line_count < 48 ? line_count : 48;
+    int start = total > max_rows ? total - max_rows : 0;
+    for (int i = start; i < total; i++) {
+        fb_draw_string(x, y + (i - start) * FM_ROW_H, lines[i], COL_TEXT, 1);
+    }
+}
+
+static void draw_terminal(const gui_window_t *w) {
+    if (term_owner_pid >= 0 && scheduler_task_state(term_owner_pid) == TASK_TERMINATED) {
+        term_owner_pid = -1;
+    }
+
+    int x = w->x + 10;
+    int y = w->y + TITLEBAR_H + 8;
+    int content_w = w->w - 20;
+    int input_row_h = FM_ROW_H + 6;
+    int scrollback_rows = (w->h - TITLEBAR_H - 16 - input_row_h) / FM_ROW_H;
+
+    term_draw_scrollback(x, y, content_w, scrollback_rows);
+
+    int input_y = w->y + w->h - input_row_h;
+    fb_fill_rect(x, input_y, content_w, FM_ROW_H + 2, 0x0F1330);
+    char prompt[TERM_INPUT_MAX + 3];
+    strcpy(prompt, "$ ");
+    strcat(prompt, term_input);
+    fb_draw_string(x + 4, input_y + 3, prompt, term_focused ? 0x8FE3A8 : COL_MUTED, 1);
+}
+
 static int add_window(int x, int y, int w, int h, const char *title,
                        const char *icon_label,
                        const char *l1, const char *l2, uint32_t accent) {
@@ -157,6 +297,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->is_network = 0;
     win->is_file_manager = 0;
     win->is_browser = 0;
+    win->is_terminal = 0;
     win->open = 1;
     window_order[window_count] = idx;
     window_count++;
@@ -225,6 +366,13 @@ void gui_init(void) {
         windows[br].is_browser = 1;
         br_window_idx = br;
         layout_doc_alloc(&br_layout);
+    }
+
+    if (fat32_is_mounted()) {
+        int term = add_window(SX(680), SY(540), 460, 210, "Terminal", "TERM", NULL, NULL, 0x4CD980);
+        windows[term].is_terminal = 1;
+        term_cwd = fat32_root_cluster();
+        term_print("ZapOS terminal -- type 'help' for commands\n");
     }
 }
 
@@ -360,10 +508,6 @@ static void fm_refresh(void) {
     fm_dirty = 0;
 }
 
-static int fm_is_notes_txt(const char *name) {
-    return strcmp(name, "NOTES.TXT") == 0;
-}
-
 static int fm_has_ext(const char *name, const char *ext) {
     int nlen = (int)strlen(name), elen = (int)strlen(ext);
     if (nlen < elen + 1 || name[nlen - elen - 1] != '.') return 0;
@@ -376,10 +520,148 @@ static int fm_has_ext(const char *name, const char *ext) {
     return 1;
 }
 
+/* Any file this small edit-in-place model makes sense for -- plain text
+ * and the source extensions draw_highlighted_text() below knows how to
+ * color. Saving just overwrites the file under its own name (see
+ * fm_save_current_file), so this isn't NOTES.TXT-specific anymore. */
+static int fm_is_editable(const char *name) {
+    return strcmp(name, "NOTES.TXT") == 0 || fm_has_ext(name, "TXT") || fm_has_ext(name, "JS") ||
+           fm_has_ext(name, "PY") || fm_has_ext(name, "C") || fm_has_ext(name, "H") || fm_has_ext(name, "MD");
+}
+
+enum fm_lang { LANG_NONE, LANG_C, LANG_JS, LANG_PY };
+
+static enum fm_lang fm_lang_for_name(const char *name) {
+    if (fm_has_ext(name, "C") || fm_has_ext(name, "H")) return LANG_C;
+    if (fm_has_ext(name, "JS")) return LANG_JS;
+    if (fm_has_ext(name, "PY")) return LANG_PY;
+    return LANG_NONE;
+}
+
+static int is_keyword(enum fm_lang lang, const char *word, int len) {
+    static const char *c_kw[] = {
+        "if", "else", "while", "for", "return", "int", "char", "void", "struct", "static",
+        "const", "unsigned", "long", "short", "float", "double", "break", "continue", "switch",
+        "case", "default", "sizeof", "typedef", "enum", "union", "do", "goto", "NULL", 0
+    };
+    static const char *js_kw[] = {
+        "function", "var", "let", "const", "if", "else", "while", "for", "return", "true",
+        "false", "null", "undefined", "new", "this", "typeof", "break", "continue", "switch",
+        "case", "default", "do", "in", "of", "class", "extends", "try", "catch", "throw", 0
+    };
+    static const char *py_kw[] = {
+        "def", "return", "if", "elif", "else", "for", "while", "in", "import", "class",
+        "True", "False", "None", "and", "or", "not", "break", "continue", "pass", "from",
+        "as", "with", "lambda", "try", "except", "finally", "raise", "yield", "global", "print", 0
+    };
+    const char **list = lang == LANG_C ? c_kw : lang == LANG_JS ? js_kw : lang == LANG_PY ? py_kw : (const char **)0;
+    if (!list) return 0;
+    for (int i = 0; list[i]; i++) {
+        int klen = (int)strlen(list[i]);
+        if (klen == len && memcmp(word, list[i], (size_t)len) == 0) return 1;
+    }
+    return 0;
+}
+
+/* A real, single-pass tokenizing highlighter -- not a fixed palette
+ * swap. Tracks string/line-comment state across wrapped-line
+ * boundaries so a string or comment that happens to wrap still colors
+ * correctly. Known gaps (documented, not silent): only single-line
+ * comments (C/JS "//", Python "#") -- multi-line C-style comments
+ * aren't tracked as a separate state and just get colored token-by-
+ * token like ordinary code; escaped-quote handling only checks for a
+ * single preceding backslash; no Python triple-quoted strings. Returns
+ * the number of rows it actually drew. */
+static int draw_highlighted_text(int x, int y, int max_width, int max_rows, const char *text, enum fm_lang lang) {
+    int chars_per_line = max_width / 8;
+    if (chars_per_line < 1) chars_per_line = 1;
+    if (chars_per_line > 62) chars_per_line = 62;
+
+    int col = 0, row = 0;
+    int in_string = 0;
+    char string_quote = 0;
+    int in_line_comment = 0;
+
+    char run[64];
+    int run_len = 0;
+    uint32_t run_color = COL_TEXT;
+    int run_x = x;
+
+    for (const char *p = text; *p && row < max_rows; p++) {
+        char c = *p;
+
+        if (c == '\n') {
+            if (run_len > 0) { run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0; }
+            in_line_comment = 0;
+            col = 0; row++;
+            run_x = x;
+            continue;
+        }
+        if (col >= chars_per_line) {
+            if (run_len > 0) { run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0; }
+            col = 0; row++;
+            run_x = x;
+            if (row >= max_rows) break;
+        }
+
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            int wlen = 0;
+            while ((p[wlen] >= 'a' && p[wlen] <= 'z') || (p[wlen] >= 'A' && p[wlen] <= 'Z') ||
+                   (p[wlen] >= '0' && p[wlen] <= '9') || p[wlen] == '_') wlen++;
+            uint32_t word_color = is_keyword(lang, p, wlen) ? 0x569CD6 : COL_TEXT;
+            for (int i = 0; i < wlen; i++) {
+                if (col >= chars_per_line) {
+                    if (run_len > 0) { run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0; }
+                    col = 0; row++; run_x = x;
+                    if (row >= max_rows) { wlen = i; break; }
+                }
+                if (run_len > 0 && word_color != run_color) {
+                    run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0;
+                }
+                if (run_len == 0) { run_color = word_color; run_x = x + col * 8; }
+                if (run_len < 63) run[run_len++] = p[i];
+                col++;
+            }
+            if (run_len > 0) { run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0; }
+            p += wlen - 1;
+            continue;
+        }
+
+        uint32_t ch_color = COL_TEXT;
+        if (in_line_comment) {
+            ch_color = 0x6A9955;
+        } else if (in_string) {
+            ch_color = 0xCE9178;
+            if (c == string_quote && (p == text || p[-1] != '\\')) in_string = 0;
+        } else if (c == '"' || c == '\'') {
+            in_string = 1; string_quote = c;
+            ch_color = 0xCE9178;
+        } else if ((lang == LANG_C || lang == LANG_JS) && c == '/' && p[1] == '/') {
+            in_line_comment = 1;
+            ch_color = 0x6A9955;
+        } else if (lang == LANG_PY && c == '#') {
+            in_line_comment = 1;
+            ch_color = 0x6A9955;
+        } else if ((c >= '0' && c <= '9') || (c == '.' && p[1] >= '0' && p[1] <= '9')) {
+            ch_color = 0xB5CEA8;
+        }
+
+        if (run_len > 0 && ch_color != run_color) {
+            run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); run_len = 0;
+        }
+        if (run_len == 0) { run_color = ch_color; run_x = x + col * 8; }
+        if (run_len < 63) run[run_len++] = c;
+        col++;
+    }
+    if (run_len > 0 && row < max_rows) { run[run_len] = 0; fb_draw_string(run_x, y + row * FM_ROW_H, run, run_color, 1); }
+    return row < max_rows ? row + 1 : max_rows;
+}
+
 /* Called when a row in the listing is clicked: navigate into directories,
  * open an audio-preview screen for .WAV files, open a read-only preview
- * for other files, or an editable one for the demo's NOTES.TXT (the
- * only file fat32_write_file knows how to save). */
+ * for other files, or an editable one for recognized text/source
+ * extensions (see fm_is_editable) -- fat32_write_file can save any of
+ * them back under their own name, not just NOTES.TXT. */
 static void fm_open_entry(int index) {
     if (index < 0 || index >= fm_entry_count) return;
     struct fat_dirent_info *e = &fm_entries[index];
@@ -427,7 +709,7 @@ static void fm_open_entry(int index) {
     fm_preview_len = fat32_read_file(e->cluster, e->size, fm_preview_buf, FM_PREVIEW_MAX);
     fm_preview_buf[fm_preview_len] = 0;
     fm_viewing_file = 1;
-    fm_editing = fm_is_notes_txt(e->name);
+    fm_editing = fm_is_editable(e->name);
     fm_dirty = 0;
 }
 
@@ -444,16 +726,20 @@ static void fm_play_audio(void) {
     fm_status_until = pit_ticks() + 300;
 }
 
-static void fm_save_notes(void) {
-    int ok = fat32_write_file(fm_current_dir, "NOTES.TXT", fm_preview_buf, fm_preview_len);
+static void fm_save_current_file(void) {
+    int ok = fat32_write_file(fm_current_dir, fm_preview_name, fm_preview_buf, fm_preview_len);
     strcpy(fm_status_msg, ok ? "Saved -- persists across reboot" : "Save failed");
     fm_status_until = pit_ticks() + 200;
     fm_dirty = 0;
 }
 
-/* Feeds typed characters into the open NOTES.TXT buffer (Enter saves),
- * or -- while an audio file is open -- handles P/S for play/stop.
- * Called from gui_run() unconditionally on every keypress. */
+/* Feeds typed characters into the open file's edit buffer -- Enter
+ * inserts a real newline (so multi-line source files are actually
+ * editable), Ctrl+S (0x13, see drivers/keyboard.c's C0 control-code
+ * mapping) saves -- or, while an audio file is open, P/S for
+ * play/stop. Called from gui_run() unconditionally on every keypress.
+ * Append/backspace-from-the-end only, no cursor movement or inserting
+ * into the middle of the text. */
 static void fm_handle_key(char c) {
     if (fm_viewing_file && fm_is_audio) {
         if (c == 'p' || c == 'P') fm_play_audio();
@@ -465,8 +751,10 @@ static void fm_handle_key(char c) {
         return;
     }
     if (!fm_editing) return;
-    if (c == '\n' || c == '\r') {
-        fm_save_notes();
+    if (c == 0x13) { /* Ctrl+S */
+        fm_save_current_file();
+    } else if (c == '\n' || c == '\r') {
+        if (fm_preview_len < FM_PREVIEW_MAX) { fm_preview_buf[fm_preview_len++] = '\n'; fm_dirty = 1; }
     } else if (c == '\b') {
         if (fm_preview_len > 0) { fm_preview_len--; fm_dirty = 1; }
     } else if (c >= 32 && c < 127 && fm_preview_len < FM_PREVIEW_MAX) {
@@ -554,10 +842,13 @@ static void draw_file_manager(const gui_window_t *w) {
 
         if (fm_editing) {
             fb_draw_string(x, y + 34,
-                           fm_dirty ? "editing -- press Enter to save" : "press Enter to save, Backspace to edit",
+                           fm_dirty ? "editing -- Ctrl+S to save" : "Ctrl+S to save, Backspace to edit",
                            COL_MUTED, 1);
         }
-        draw_wrapped_text(x, y + 52, content_w, (w->h - TITLEBAR_H - 70) / FM_ROW_H, fm_preview_buf, COL_TEXT);
+        enum fm_lang lang = fm_lang_for_name(fm_preview_name);
+        int preview_rows = (w->h - TITLEBAR_H - 70) / FM_ROW_H;
+        if (lang != LANG_NONE) draw_highlighted_text(x, y + 52, content_w, preview_rows, fm_preview_buf, lang);
+        else draw_wrapped_text(x, y + 52, content_w, preview_rows, fm_preview_buf, COL_TEXT);
         if (pit_ticks() < fm_status_until) {
             fb_draw_string(x, w->y + w->h - 18, fm_status_msg, 0x8FE3A8, 1);
         }
@@ -1134,6 +1425,7 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->is_network) draw_network(w);
     if (w->is_file_manager) draw_file_manager(w);
     if (w->is_browser) draw_browser(w);
+    if (w->is_terminal) draw_terminal(w);
 }
 
 /* Geometry for the taskbar icon of windows[slot] -- shared between drawing
@@ -1273,11 +1565,12 @@ void gui_run(void) {
                         break;
                     }
                 }
-                /* Clicking anywhere deselects both text-input widgets; the
+                /* Clicking anywhere deselects every text-input widget; the
                  * specific click handler below re-focuses its own if the
                  * click actually landed on it. */
                 br_editing_url = 0;
                 if (fm_viewing_file) fm_editing = 0;
+                term_focused = 0;
 
                 if (!hit_titlebar) {
                     for (int oi = window_count - 1; oi >= 0; oi--) {
@@ -1288,6 +1581,7 @@ void gui_run(void) {
                             bring_to_front(oi);
                             if (w->is_file_manager) fm_handle_click(w, my);
                             else if (w->is_browser) br_handle_click(w, mx, my);
+                            else if (w->is_terminal) term_handle_click();
                             break;
                         }
                     }
@@ -1311,6 +1605,7 @@ void gui_run(void) {
         for (char c = keyboard_getchar(); c; c = keyboard_getchar()) {
             fm_handle_key(c);
             br_handle_key(c);
+            term_handle_key(c);
         }
 
         static int scroll_cooldown = 0;

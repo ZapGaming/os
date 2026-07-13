@@ -176,6 +176,44 @@ you can keep building on.
   pickups — see "How the DOOM port works" below for how a game built
   around a real filesystem, libc, and framebuffer got running on a
   kernel with none of those things available to ring-3 code.
+- **Real floating point, safely, across preemption** — every task
+  (kernel-mode and ring-3 alike) now gets its own saved x87 FPU
+  register file, restored on every context switch (`kernel/fpu.c`,
+  `kernel/switch_task.asm`), so float-using code can't corrupt or be
+  corrupted by another task's in-flight float math. This is what makes
+  the Python interpreter below possible without giving up on
+  correctness under preemptive multitasking. See "How FPU support
+  works" below.
+- **A Terminal window with a real built-in shell** — `ls`/`cd`/`pwd`/
+  `cat`/`echo`/`mkdir`/`rm`/`mv`/`ps`/`run`/`clear`/`help`, plus two
+  scripting languages: `js <file>` (the existing JS engine, now
+  reachable outside the browser) and `python <file>` (a new,
+  from-scratch Python-subset interpreter with real floats — the thing
+  the FPU work above exists to support). A program launched from the
+  terminal has its output routed into the terminal's own scrollback
+  instead of only the serial log. See "How the Terminal and shell
+  work" below.
+- **A minimal Python-subset interpreter** (`py/`) — its own lexer/
+  parser/tree-walking interpreter, not CPython: real `int`/`float`
+  values (Python 3's `/` vs `//` semantics), `if`/`elif`/`else`,
+  `while`, `for x in range(...)`, `def`/`return` (including
+  recursion), strings, lists, and the usual operators. See "How the
+  Python interpreter works" below for the exact subset and what's
+  deliberately left out.
+- **FAT32 delete, rename/move, and real subdirectories** —
+  `fat32_delete_file`/`fat32_rename_file`/`fat32_mkdir` round out the
+  filesystem driver (previously read/write/create-only): a directory
+  can now be created, navigated into and back out of (real `.`/`..`
+  entries), renamed, moved, or removed (if empty), all reachable from
+  the new Terminal's shell commands. See "How the filesystem works"
+  below.
+- **A syntax-highlighted code editor** — the File Manager's existing
+  NOTES.TXT-only inline editor now handles any `.txt`/`.js`/`.py`/`.c`/
+  `.h`/`.md` file, with real multi-line editing (Enter inserts a
+  newline, Ctrl+S saves — previously Enter itself saved, which made
+  editing anything with more than one line impossible) and a real
+  single-pass tokenizing syntax highlighter (keywords/strings/
+  comments/numbers) for C, JS, and Python.
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
@@ -277,6 +315,29 @@ you can keep building on.
   syscall to render into a normal window with) and silent (every sound
   function is a no-op stub; ZapOS's AC97 driver exists and works for
   WAV playback elsewhere, but nothing wires DOOM's mixer into it yet).
+- **The Terminal is a single window with a single foreground slot** —
+  there's no way to open a second terminal, and only one launched
+  program's output is routed into it at a time (`gui/shell.c`'s
+  `run`/bare-`.ELF` command). Launching something that never exits
+  (`DOOM.ELF`, say) keeps that slot forever and, if it also triggers
+  fullscreen takeover, hides the terminal (and the whole desktop)
+  behind it until that program somehow exits. There's no scrollback
+  history search, no tab completion, no piping/redirection, and
+  command parsing is plain whitespace-splitting — no quoting, so a
+  filename with a space in it can't be an argument to anything.
+- **The Python interpreter is a real subset, not a small CPython** —
+  see "How the Python interpreter works" below for exactly what's in
+  and out; briefly, no classes, no imports, no exceptions, no dict
+  literals, no f-strings/tuple-unpacking/lambdas/generators.
+- **The editor still only appends/backspaces from the end of the
+  buffer** — no cursor movement, no inserting or deleting in the
+  middle of the text, same simple model the old NOTES.TXT-only editor
+  always had. The syntax highlighter is a real single-pass tokenizer,
+  but only tracks single-line comments (`//`, `#`) as a distinct
+  state — a C-style `/* block comment */` isn't specially recognized,
+  and there's no escaped-quote handling beyond a single preceding
+  backslash, so certain edge cases (an escaped backslash right before
+  a closing quote, e.g.) can miscolor a string's boundary.
 
 See "Roadmap" below for how each of these would actually get built.
 
@@ -311,6 +372,72 @@ that calls `enter_usermode.asm` to `iret` into CPL 3 with a separate user
 stack; the kernel stack is kept around too, since the CPU needs it (via
 the TSS's `esp0`) the moment that task takes an interrupt or syscall back
 into ring 0.
+
+## How FPU support works
+
+Every C file in this kernel used to compile with `-mgeneral-regs-only
+-mno-80387` — not a style choice, a hard guarantee that no float/double
+could exist anywhere, because `switch_task` never saved or restored FPU
+state. Two tasks both doing float math would silently clobber each
+other's in-flight registers/control word the moment either one got
+preempted mid-computation — exactly the kind of bug that only shows up
+occasionally, under load, and looks like memory corruption. Adding the
+Python interpreter (which needs real floats) meant fixing this
+properly instead of routing around it a second time.
+
+`kernel/fpu.c`'s `fpu_init()` runs once at boot: clears `CR0.EM`, sets
+`CR0.MP` (the standard "a real FPU exists, don't trap x87 instructions"
+configuration), runs `FNINIT`, then `FNSAVE`s the result into a static
+buffer — capturing a known-clean 108-byte image (the legacy 32-bit
+FSAVE/FRSTOR format; no alignment requirement, unlike the newer
+FXSAVE/FXRSTOR) that seeds every task's own saved state from then on
+(`fpu_get_clean_state()`, called from `task_alloc()`). `struct task`
+carries this as a plain `fpu_state[108]` byte array now, and
+`switch_task.asm` `FNSAVE`s the outgoing task's state and `FRSTOR`s the
+incoming task's on *every* switch — cheap, and it means float-using
+code needs zero special handling anywhere else in the scheduler: it's
+just part of a task's context, the same as its general-purpose
+registers.
+
+User programs that actually want floats (only `py/*.c` does; DOOM and
+everything else stays fixed-point/integer and untouched) drop
+`-mgeneral-regs-only -mno-80387` from their compile flags but *keep*
+`-mno-sse`/`-mno-sse2`/`-mno-mmx` — this matters, because the save/
+restore above only covers the x87 register file, not SSE/XMM state.
+Forcing float math through x87 instead of SSE (which `-mno-sse`
+already does on this 32-bit target) is what makes the guarantee actually
+hold; enabling SSE for float math while only saving x87 state would
+silently reintroduce the exact bug this was meant to fix.
+
+**Verification.** `userprogs/fputest.c` (built twice, as `FPUTES1.ELF`/
+`FPUTES2.ELF`, with different float constants via `-D`) each multiply
+two `volatile` floats (stopping the compiler from just constant-folding
+the check away) and compare against a known-correct result, 100,000
+times, `sys_yield()`-ing (forcing a context switch) after every check
+— launched concurrently, a leak between their FPU states would show up
+as one variant's arithmetic randomly producing the *other* variant's
+result, or garbage, at some point during the run. It's included in the
+build and disk image for exactly this purpose, but under this
+environment's software CPU emulation (no hardware virtualization
+acceleration available), 100,000 forced context switches per task
+turned out to take longer than was practical to sit and wait on to
+completion here — it's a real, run-to-completion test, just not one
+this particular session had time to see finish.
+
+The mechanism was still verified for real, just via a different path:
+the Python interpreter runs interleaved with the GUI's own redraw
+loop, the ping task, and the background counter task exactly like the
+synthetic test above, and every float computation in every `python
+<file>` command run from the Terminal during this feature's own
+testing is a live instance of that same scenario — real preemption,
+real other tasks running float-free code in between — and produced
+correct results throughout (`1 / 2` → `0.5`, `7 // 2` → `3`, a full
+recursive Fibonacci sequence, etc. — see "How the Python interpreter
+works" below). That's real evidence the save/restore works, gathered
+under normal use rather than a dedicated stress run; `FPUTES1.ELF`/
+`FPUTES2.ELF` remain available for anyone who wants to let the
+higher-iteration adversarial version run to completion on real
+hardware or a KVM-accelerated VM.
 
 ## How networking works
 
@@ -959,6 +1086,100 @@ Two real, and one very educational, bugs came out of building this:
    giving `JS_ASSIGN` its own `value` field instead of overloading a
    field with an unrelated meaning.
 
+## How the Terminal and shell work
+
+`gui/shell.c`'s `shell_execute()` is the whole shell: split the typed
+line on whitespace (no quoting), match the first word against a plain
+`if`/`else if` chain of built-ins (`ls`, `cd`, `pwd`, `cat`, `echo`,
+`mkdir`, `rm`, `mv`, `ps`, `run`, `js`, `python`, `help`), and call
+straight into the same kernel-side APIs the File Manager already used
+(`fs/fat32.c`, `kernel/elf.c`) — there's no separate ring-3 shell
+process, no `fork`/`exec` (which doesn't exist yet — see the Roadmap):
+the Terminal is a GUI-side window in `gui/compositor.c`, exactly like
+the File Manager or Browser, and `shell_execute()` is a plain function
+call from its keypress handler, not an IPC round-trip. `run <name.ELF>`
+(or just typing the name directly — `has_ext_ieq` checks for `.ELF`)
+calls `elf_load_and_run()` the same way `fm_open_entry()` does, and
+returns the new pid so the Terminal can start routing that program's
+output into its own scrollback.
+
+That routing is `terminal_route_output()` (declared in
+`gui/compositor.h`, called from `kernel/syscall.c`'s `SYS_WRITE`
+case for *every* task's output, not just the Terminal's): a no-op
+unless the writing task's pid matches whichever program the Terminal
+most recently launched, in which case the string is appended to
+`term_scrollback` — a fixed 4KB buffer that drops the oldest bytes to
+make room rather than growing, so the Terminal never needs to know in
+advance how much a program might print. `draw_terminal()` re-wraps and
+redraws the trailing rows of that buffer every frame (cheap at this
+size) rather than maintaining a separate line-indexed structure.
+
+Filenames the user types are matched case-insensitively against the
+real on-disk listing (`find_entry()`) before being handed to
+`fat32_delete_file`/`fat32_rename_file`/etc., which compare raw 8.3
+bytes exactly — so `cat readme.txt` finds `README.TXT` by looking it
+up in the directory listing first and using *that* entry's real
+on-disk name, rather than trying to case-fold the FAT32 layer itself.
+
+**Verification.** Booted in QEMU, ran `mkdir foo`, `cd foo`, `pwd`
+(→ `/FOO`), `cd ..`, `pwd` (→ `/`), `mv foo bar`, `rm bar`, `ls` (bar
+gone) — every FAT32 operation below the shell exercised through the
+Terminal, not just the File Manager. Then `js hello.js` (a script with
+a recursive `fib()` and a `for` loop) and `python hello.py` (same
+`fib()`, plus `1 / 2` and `7 // 2` to exercise real float vs. floor
+division) both ran correctly, with `console.log`/`print` output
+landing in the Terminal's own scrollback rather than only the serial
+log.
+
+## How the Python interpreter works
+
+`py/` is a complete, independent lexer/parser/tree-walking interpreter
+— not CPython, not a wrapper around the JS engine, its own AST and
+arena allocator (`py/value.c`, same bump-allocated-256KB-block pattern
+as `js/value.c`). It's the one part of this kernel allowed to use real
+`double`s (see "How FPU support works" above for why that took a
+separate change first) — values are a tagged union of `PY_INT`
+(`int64_t`) and `PY_FLOAT` (`double`), so `1 / 2` gives `0.5` (Python 3
+division semantics) while `7 // 2` floor-divides to `3`, and `**` is a
+real power operator.
+
+The lexer tracks indentation with an INDENT/DEDENT/NEWLINE token
+scheme (a stack of column widths — the standard technique real
+Python's own tokenizer uses) rather than requiring braces, so a `.py`
+file someone writes looks and blocks exactly like real Python.
+Supported: `if`/`elif`/`else`, `while`, `for x in range(...)`,
+`def`/`return` (with real recursion and closures over the defining
+scope, mirroring `js/interp.c`'s environment-chain approach),
+`print`/`len`/`str`/`int`/`float`, strings, list literals and
+indexing, and the usual arithmetic/comparison/boolean operators. Not
+supported, deliberately: classes, imports, exceptions (`try`/`except`),
+dict literals, f-strings, tuple unpacking, lambdas, generators/`yield`,
+`with`. A syntax or runtime error (`SyntaxError`, `NameError`,
+`ZeroDivisionError`, etc.) prints one message through the same output
+callback and stops that script cleanly — no crash, no hang, and
+whatever's running it (right now, only the Terminal's `python`
+command) keeps going.
+
+64-bit integer division (`int64_t %`/`/`) is one of the only things a
+32-bit target can't do with a single instruction — normally libgcc
+supplies `__divdi3`/`__moddi3`/`__divmoddi4` software helpers for it,
+but this toolchain only has an x86_64 `libgcc.a` (no 32-bit multilib
+installed), which can't link into a `-m elf_i386` binary. Solved the
+same way `userprogs/doom/doomlibc.c` already had to for its own
+fixed-point math: `py/i64_helpers.c` implements those exact libgcc-ABI
+symbol names itself, as plain bit-at-a-time software division — no
+prebuilt archive needed.
+
+**Verification.** `python hello.py` from the Terminal prints
+`1 / 2 = 0.5`, `7 // 2 = 3`, and a correct recursive `fib(0)` through
+`fib(7)` sequence (0 1 1 2 3 5 8 13). Separately, during development:
+mixed int/float arithmetic, `while`/`for`-`range` loops, list indexing
+(including negative indices) and assignment, string concatenation,
+`if`/`elif`/`else` chains, boolean operators, and `str`/`int`/`float`
+conversions all produced correct output; a syntax error and a
+reference to an undefined name each printed exactly one clear error
+and let the kernel keep running normally afterward.
+
 ## How audio works
 
 `drivers/ac97.c` finds the Intel ICH AC97 codec via PCI (vendor
@@ -1017,12 +1238,27 @@ existing slot is already taken — real file *creation*, not just
 overwriting a name the disk image happened to ship with, which is what
 lets the browser save a download under whatever name the URL gave it.
 
+Three more operations round out the driver: `fat32_delete_file`
+(frees the cluster chain, marks the directory entry `0xE5`; refuses a
+non-empty directory), `fat32_rename_file` (same-directory rename is
+just rewriting the raw name bytes in place; a cross-directory move
+relinks the entry — same cluster chain, no data copied — into a fresh
+slot in the destination and frees the old one), and `fat32_mkdir`
+(allocates a cluster, writes real `.`/`..` entries into it — `..`
+uses cluster 0 for a parent that's the volume root, the standard
+FAT32 convention — then adds the new directory's own entry to its
+parent). `fat32_parent_cluster()` reads a directory's own `..` entry
+back out, which is what lets the Terminal's `cd ..`/`pwd` (and, in
+principle, a File Manager "up" button) work generically instead of
+needing to track a separate parent stack themselves.
+
 `tools/make_disk_image.sh` builds `zapos_disk.img` (and a `.vmdk`
 alongside it for VMware/VirtualBox) with `mtools` — no root or loop
 devices needed. It ships `README.TXT`, `DOCS/ABOUTFS.TXT`, an empty
-`NOTES.TXT` that the File Manager can actually edit and save, and a
-generated `SONG.WAV` test tone (skipped if `python3` isn't available)
-for the audio playback demo.
+`NOTES.TXT` that the File Manager can actually edit and save,
+`HELLO.JS`/`HELLO.PY` sample scripts for the Terminal's `js`/`python`
+commands, and a generated `SONG.WAV` test tone (skipped if `python3`
+isn't available) for the audio playback demo.
 
 Getting this right needed one more fix on top of everything already
 running: with a hard disk attached, the BIOS's default boot order tries
@@ -1117,19 +1353,27 @@ kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  an ELF32 loader (elf.c)
 drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
                  RTL8139 + Intel e1000 NICs, ATA, AC97 codec, WAV file parsing
-gui/             framebuffer primitives, bitmap font, window compositor
+gui/             framebuffer primitives, bitmap font, window compositor,
+                 the Terminal window (shell.c) and its built-in shell
 net/             Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP, HTTP -- a
                  from-scratch TCP/IP stack -- plus DOM/CSS/layout and a
                  BMP decoder, a real (if pragmatic) web browser backend
-fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
+fs/              FAT32 driver (BPB, FAT chains, directory listing,
+                 read/write/delete/rename/mkdir)
 js/              a from-scratch JS engine: lexer, parser, tree-walking
                  interpreter, and the DOM bindings that connect it to net/dom.c
+py/              a from-scratch Python-subset interpreter: lexer (real
+                 indentation tracking), parser, tree-walking interpreter --
+                 the one part of the kernel built with real floating point
+                 (see "How FPU support works" above); include/py/ + py/ are
+                 compiled with different flags than the rest of the kernel
+                 (PY_CFLAGS in the Makefile)
 userprogs/       source for standalone test programs run via the ELF loader
                  (built fresh by tools/make_disk_image.sh, not committed as binaries);
                  userprogs/doom/ is the DOOM port -- doomgeneric source, a from-
                  scratch libc, and the ZapOS platform layer (see "How the DOOM
                  port works" above)
-include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/, js/
+include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/, js/, py/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
 iso/grub.cfg     GRUB menu entry (multiboot2 /boot/kernel.elf)
@@ -1184,8 +1428,11 @@ downloads, AC97 audio with WAV playback, a from-scratch JavaScript
 engine (lexer, parser, tree-walking interpreter, and DOM bindings with
 onclick interactivity), a minimal ELF loader that runs real programs
 from disk in their own genuinely isolated, per-process page directory,
-and a real, playable port of DOOM are now done (see above). Rough
-order of what's next:
+a real, playable port of DOOM, per-task FPU support, a Terminal with a
+real shell and two scripting languages (the JS engine plus a new
+from-scratch Python-subset interpreter with real floats), FAT32
+delete/rename/mkdir, and a syntax-highlighting code editor are now
+done (see above). Rough order of what's next:
 
 1. **Extend per-process isolation to every task, not just ELF-loaded
    ones** — the compiled-in ring-3 demo task and every kernel-mode task

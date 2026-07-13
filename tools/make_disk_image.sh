@@ -37,10 +37,40 @@ EOF
 
 : > "$STAGE/NOTES.TXT"
 
+# Sample scripts for the Terminal's "js"/"python" builtins (see
+# gui/shell.c) -- exercise a recursive function, a loop, and (for
+# Python specifically) real float division, to make sure a fresh disk
+# image always has something to try both interpreters on immediately.
+cat > "$STAGE/HELLO.JS" <<'EOF'
+function fib(n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+console.log("Hello from the JS engine!");
+for (var i = 0; i < 8; i++) {
+    console.log("fib(" + i + ") = " + fib(i));
+}
+EOF
+
+cat > "$STAGE/HELLO.PY" <<'EOF'
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+print("Hello from the Python interpreter!")
+print("1 / 2 =", 1 / 2)
+print("7 // 2 =", 7 // 2)
+for i in range(8):
+    print("fib(" + str(i) + ") =", fib(i))
+EOF
+
 mmd -i "$IMG" ::/DOCS
 mcopy -i "$IMG" "$STAGE/README.TXT" ::/README.TXT
 mcopy -i "$IMG" "$STAGE/NOTES.TXT" ::/NOTES.TXT
 mcopy -i "$IMG" "$STAGE/ABOUTFS.TXT" ::/DOCS/ABOUTFS.TXT
+mcopy -i "$IMG" "$STAGE/HELLO.JS" ::/HELLO.JS
+mcopy -i "$IMG" "$STAGE/HELLO.PY" ::/HELLO.PY
 
 # A short 48kHz/16-bit/stereo test tone for the File Manager's audio
 # playback (net/ac97.c only supports that exact format -- no
@@ -95,6 +125,26 @@ if command -v gcc >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
   ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/EVIL.ELF" "$STAGE/evil.o"
   mcopy -i "$IMG" "$STAGE/EVIL.ELF" ::/EVIL.ELF
   echo "Added EVIL.ELF (misbehaving program to test isolation containment)"
+
+  # Two float-arithmetic programs (same source, userprogs/fputest.c,
+  # built twice with different constants) that prove the scheduler's
+  # per-task FPU save/restore (kernel/fpu.c) actually isolates FPU state
+  # between tasks -- unlike TEST/EVIL/DOOM, these are compiled WITHOUT
+  # -mgeneral-regs-only/-mno-80387, since they need real x87 float math.
+  gcc -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -O2 \
+      -mno-sse -mno-sse2 -mno-mmx \
+      -DFPUTEST_NAME='"FPUTEST1"' -DFPUTEST_A=3.5f -DFPUTEST_B=2.0f -DFPUTEST_EXPECT=7 \
+      -c userprogs/fputest.c -o "$STAGE/fputest1.o"
+  ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/FPUTES1.ELF" "$STAGE/fputest1.o"
+  mcopy -i "$IMG" "$STAGE/FPUTES1.ELF" ::/FPUTES1.ELF
+
+  gcc -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -O2 \
+      -mno-sse -mno-sse2 -mno-mmx \
+      -DFPUTEST_NAME='"FPUTEST2"' -DFPUTEST_A=9.0f -DFPUTEST_B=-3.0f -DFPUTEST_EXPECT=-27 \
+      -c userprogs/fputest.c -o "$STAGE/fputest2.o"
+  ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/FPUTES2.ELF" "$STAGE/fputest2.o"
+  mcopy -i "$IMG" "$STAGE/FPUTES2.ELF" ::/FPUTES2.ELF
+  echo "Added FPUTES1.ELF/FPUTES2.ELF (float cross-contamination test pair)"
 
   # A real, complete port of DOOM (doomgeneric, see userprogs/doom/) --
   # freestanding, no FPU, its own libc (doomlibc.c), and the shareware

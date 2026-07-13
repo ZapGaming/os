@@ -31,6 +31,7 @@ static void syscall_handler(struct registers *regs) {
         case SYS_WRITE: {
             const char *str = (const char *)regs->ebx;
             serial_printf("[pid %d syscall] %s", scheduler_current()->pid, str);
+            terminal_route_output(scheduler_current()->pid, str);
             copy_bounded(last_message, str, MSG_BUF_SIZE);
             message_count++;
             regs->eax = strlen(str);
