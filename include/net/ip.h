@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 #define IP_PROTO_ICMP 1
+#define IP_PROTO_TCP  6
+#define IP_PROTO_UDP  17
 
 struct ip_header {
     uint8_t version_ihl;

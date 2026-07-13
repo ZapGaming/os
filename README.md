@@ -37,12 +37,25 @@ you can keep building on.
   a live-incrementing counter from a background kernel task, and the
   actual string the ring-3 task sent via syscall.
 - **Networking**: PCI enumeration, an RTL8139 driver (IRQ-driven RX ring +
-  TX descriptors), and a real minimal stack — Ethernet, ARP (request/reply,
-  with a cache), IPv4 (with header checksums), and ICMP echo. A background
-  task resolves the gateway and pings it once a second; the GUI's
-  "Network" window shows the NIC's real MAC, our IP, the resolved gateway,
-  and live ping stats. Verified against a real packet capture (see "How
-  networking works" below) — the gateway's replies genuinely round-trip.
+  TX descriptors), and a real stack built up in layers — Ethernet, ARP
+  (request/reply, with a cache), IPv4 (with header checksums *and*
+  gateway routing for off-subnet destinations), ICMP echo, UDP, a DNS
+  resolver (A records, over UDP/53), and a client-only TCP (active-open
+  connect/send/recv/close with a real handshake and stop-and-wait
+  retransmission). A background task resolves the gateway and pings it
+  once a second; the GUI's "Network" window shows the NIC's real MAC,
+  our IP, the resolved gateway, and live ping stats. Verified against a
+  real packet capture (see "How networking works" below) — the gateway's
+  replies genuinely round-trip.
+- **A real (if minimal) web browser**: an HTTP/1.1 client on top of TCP
+  (handles both `Content-Length` and chunked transfer-encoding), and a
+  "reader mode" HTML interpreter — no CSS, no layout boxes, but it walks
+  real tag soup and produces styled, wrapped text (headings, bold, links,
+  lists, entity decoding, `<script>`/`<style>` skipping). The GUI's
+  "Browser" window has a real address bar you type a URL into; press
+  Enter and it resolves DNS, opens a TCP connection, fetches the page,
+  and renders it. Verified end-to-end against a real, live website (see
+  "How the browser works" below).
 - **Filesystem**: an ATA PIO disk driver and a real FAT32 driver (BPB
   parsing, FAT-chain walking, directory listing, file read *and* write)
   on a separate 64MB disk image. The GUI's "File Manager" window browses
@@ -56,17 +69,20 @@ you can keep building on.
 ## What's stubbed / not yet built
 
 - **Audio**: no sound driver yet.
-- **A real web browser**: no TCP, no HTTP client, no HTML/CSS renderer —
-  all prerequisites for an actual browser and each a substantial project
-  on its own. See the roadmap for how this builds on what exists now.
+- **The browser has no CSS layout**: it's reader-mode only — a flat,
+  top-to-bottom list of styled text lines, no boxes/floats/tables/images.
+  Links are drawn styled but aren't clickable (no navigation on click
+  yet), there's no HTTPS (plain HTTP only — no TLS), the fetch is
+  synchronous and blocks GUI redraws while it runs, and only one TCP
+  connection can be open at a time.
 - **Filesystem writes are constrained**: `fat32_write_file` can only
   overwrite a file that already exists in a directory (it doesn't create
   new directory entries or grow a directory) — the shipped disk image
   pre-creates `NOTES.TXT` as an empty placeholder for exactly this reason.
-- **Networking is Ethernet/ARP/IPv4/ICMP only**: no UDP or TCP yet, no DHCP
-  (the IP config is static, matching QEMU's default SLIRP network so
-  `make run` just works), and incoming packet checksums aren't validated
-  (outgoing ones are computed correctly).
+- **No DHCP**: the IP config is static, matching QEMU's default SLIRP
+  network so `make run` just works. Incoming packet checksums aren't
+  validated (outgoing ones are computed correctly). TCP is client-only
+  (active-open) — there's no listening/server side.
 - **Real process isolation**: every task (kernel and ring-3) shares the
   same identity-mapped address space — there's no per-process page
   directory yet, so a user task *could* read/write kernel memory or
@@ -150,6 +166,58 @@ consequences of preemption happening on *every* PIT tick, unconditionally:
    see `pending_outstanding` still 0, and silently drop a perfectly valid
    reply. Fixed by setting that state *before* sending.
 
+## How the browser works
+
+`net/udp.c` adds a small port-based dispatch table (`udp_register_handler`)
+on top of IPv4; `net/dns.c` uses it to send an A-record query to QEMU
+SLIRP's built-in resolver (`<gateway-subnet>.3`, e.g. `10.0.2.3`) and
+blocks (with a timeout, via `pit_ticks()`) waiting for the reply,
+including handling DNS name compression pointers in the response.
+`net/tcp.c` is a single-connection, client-only, active-open state
+machine (`SYN_SENT` → `ESTABLISHED` → `FIN_WAIT1/2` → `LAST_ACK`) with
+stop-and-wait retransmission — send a segment, wait for its ACK before
+sending the next one, no windowing or congestion control. `net/http.c`
+drives that to do an HTTP/1.1 GET, and understands both `Content-Length`
+and chunked transfer-encoding responses. `net/html.c` is a "reader mode"
+interpreter, not a layout engine: it walks the tag stream recognizing a
+pragmatic subset (headings, paragraphs, bold/strong, links, lists, line
+breaks), skips `<script>`/`<style>` bodies outright, decodes the common
+HTML entities, and emits a flat list of styled text lines. The GUI's
+Browser window (`gui/compositor.c`) just draws that list top to bottom,
+word-wrapping each line to the window's actual pixel width.
+
+Two real bugs surfaced while getting this to work end-to-end against a
+live site (`example.com`), both caught by actually fetching a real page
+rather than trusting a synthetic test:
+
+1. **DNS silently failed.** `ip_send()` originally only checked the ARP
+   *cache* for the next hop and gave up if it missed — fine for the
+   gateway (which gets ARP'd by the ping task) but nothing had ever
+   ARP'd the DNS server's IP, so every DNS query silently failed to even
+   go out. Fixed with `ip_resolve_next_hop()`, which actively sends ARP
+   *requests* and retries (5 attempts, 200ms apart) before giving up.
+   This also let `kernel/ping_task.c` drop its own now-redundant manual
+   ARP loop, since `ip_send()` handles it for every caller now. The same
+   fix made off-subnet routing work in general: `ip_send()` now routes
+   through the gateway for any destination outside our `/24`, which is
+   what let TCP reach a real internet host instead of only local IPs.
+2. **Styled text lost its style, and long lines got silently cut off.**
+   In `net/html.c`, closing a `<b>`/`<a>` tag reset the current style
+   *before* the text accumulated under the old style was flushed to a
+   line, so bold/link text rendered as plain. Fixed by flushing first,
+   then changing the depth counter. Separately, `append_char()` just
+   stopped writing past a fixed 100-character line buffer, silently
+   truncating any longer paragraph. Fixed by having it auto-flush and
+   continue on a fresh (same-styled) line instead of dropping data.
+
+A third bug was purely in the GUI layer: `draw_browser` was drawing each
+HTML line directly, and the HTML parser's own 100-character wrap is
+wider than the Browser window's ~380px content area, so long lines
+overflowed past the window's right edge. Fixed by reusing the File
+Manager's `draw_wrapped_text` helper (changed to return the row count it
+drew) so the Browser can correctly advance past HTML lines that wrap
+into multiple on-screen rows.
+
 ## How the filesystem works
 
 `drivers/ata.c` drives the primary IDE channel with plain PIO (IDENTIFY,
@@ -232,7 +300,8 @@ kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  scheduler + context switch, TSS, ring-3 entry, syscalls
 drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC, ATA
 gui/             framebuffer primitives, bitmap font, window compositor
-net/             Ethernet, ARP, IPv4, ICMP -- a minimal from-scratch TCP/IP stack
+net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP, HTML --
+                 a from-scratch TCP/IP stack plus a reader-mode web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
 include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
@@ -267,9 +336,10 @@ ISO, which the kernel never reads back from.
 
 ## Roadmap: making this an "everyday OS"
 
-Preemptive multitasking, ring-3 user mode, syscalls, basic networking
-(Ethernet/ARP/IPv4/ICMP, ping working), and a real read/write FAT32
-filesystem are now done (see above). Rough order of what's next:
+Preemptive multitasking, ring-3 user mode, syscalls, a full
+Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write FAT32
+filesystem, and a working (if CSS-less) web browser are now done (see
+above). Rough order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -281,23 +351,16 @@ filesystem are now done (see above). Rough order of what's next:
    directories both in place, the natural next step is a minimal ELF
    loader plus `fork`/`exec`-style syscalls, so user programs can be
    files on `zapos_disk.img` instead of demo functions in `kernel.c`.
-3. **UDP + TCP + DHCP** — the Ethernet/ARP/IPv4/ICMP foundation is there;
-   UDP is a small addition (no connection state), TCP is the real work
-   (connection state machine, retransmission, windowing), and DHCP would
-   replace the current static IP config with a real handshake.
-4. **A real web browser** — the actual next-big-thing target, and it's
-   large enough to deserve its own multi-session build once #3 lands:
-   - an HTTP/1.1 client on top of TCP
-   - an HTML parser (even a simplified subset) and a CSS box-model layout
-     engine
-   - wiring that layout tree into the existing framebuffer primitives
-     (`gui/framebuffer.c` already has rects/text/gradients — enough to
-     paint a basic page once there's a layout tree telling it where)
-   - a browser "app" window in the compositor, using #2 above so it's a
-     real loaded program rather than another hardcoded kernel task
-   A JS engine is out of scope even after all that — a static-HTML/CSS
-   renderer that can fetch and display a real page over TCP is already a
-   substantial, multi-session project by itself.
+3. **A CSS box-model layout engine for the browser** — the current
+   browser is reader-mode only (styled text, no boxes); a real layout
+   tree (block/inline boxes, at least a handful of CSS properties) is
+   the natural next step now that fetch/parse/TCP/DNS are all working.
+   Clickable links (real navigation) and HTTPS (a TLS client — a
+   substantial project on its own) would go with it.
+4. **DHCP + concurrent connections** — replace the static IP config with
+   a real DHCP handshake, and lift TCP's single-static-connection
+   limitation so multiple sockets can be open at once (needed before the
+   browser can, e.g., fetch a page and its images concurrently).
 5. **A real windowing API** — right now windows are hardcoded in
    `gui/compositor.c`; user-mode processes (the eventual browser
    included) need a message-passing syscall API to create/draw into

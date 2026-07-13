@@ -23,6 +23,8 @@ int net_is_up(void);
 const uint8_t *net_get_mac(void);
 uint32_t net_get_ip(void);
 uint32_t net_get_gateway_ip(void);
+uint32_t net_get_netmask(void);
+int net_is_local(uint32_t ip);
 
 /* RFC 1071 internet checksum over `len` bytes (odd trailing byte handled). */
 uint16_t net_checksum(const void *data, int len);

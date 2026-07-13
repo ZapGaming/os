@@ -9,15 +9,20 @@
 #include <net/net.h>
 #include <net/arp.h>
 #include <net/icmp.h>
+#include <net/dns.h>
+#include <net/http.h>
+#include <net/html.h>
 #include <fs/fat32.h>
 #include <string.h>
 
-#define MAX_WINDOWS   7
+#define MAX_WINDOWS   8
 #define TITLEBAR_H    28
 #define TASKBAR_H     44
 #define FM_ROW_H      16
 #define FM_MAX_ENTRIES 24
 #define FM_PREVIEW_MAX 2048
+#define BR_MAX_URL     96
+#define BR_BODY_MAX    16384
 
 typedef struct {
     int x, y, w, h;
@@ -28,6 +33,7 @@ typedef struct {
     int is_process_monitor;
     int is_network;
     int is_file_manager;
+    int is_browser;
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -59,6 +65,14 @@ static uint32_t fm_status_until = 0;
 
 static void fm_refresh(void);
 
+/* Browser state -- a single instance, one page loaded at a time. */
+static char br_url[BR_MAX_URL] = "example.com/";
+static int br_url_len = 12;
+static int br_editing_url = 0;
+static int br_scroll = 0;
+static char br_status_msg[64] = "Type a URL and press Enter";
+static struct html_doc br_doc;
+
 static int add_window(int x, int y, int w, int h, const char *title,
                        const char *l1, const char *l2, uint32_t accent) {
     int idx = window_count;
@@ -71,6 +85,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->is_process_monitor = 0;
     win->is_network = 0;
     win->is_file_manager = 0;
+    win->is_browser = 0;
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -106,6 +121,11 @@ void gui_init(void) {
         windows[fm].is_file_manager = 1;
         fm_current_dir = fat32_root_cluster();
         fm_refresh();
+    }
+
+    if (net_is_up()) {
+        int br = add_window(600, 60, 400, 400, "Browser", NULL, NULL, 0x62D8FF);
+        windows[br].is_browser = 1;
     }
 }
 
@@ -270,7 +290,10 @@ static void fm_handle_key(char c) {
     fm_preview_buf[fm_preview_len] = 0;
 }
 
-static void draw_wrapped_text(int x, int y, int max_width, int max_rows, const char *text, uint32_t color) {
+/* Wraps `text` to fit max_width pixels, drawing each wrapped row starting
+ * at (x,y). Returns how many rows it actually drew (0 for empty text),
+ * so callers stacking multiple wrapped blocks know how far to advance. */
+static int draw_wrapped_text(int x, int y, int max_width, int max_rows, const char *text, uint32_t color) {
     int chars_per_line = max_width / 8;
     if (chars_per_line < 1) chars_per_line = 1;
     if (chars_per_line > 62) chars_per_line = 62;
@@ -290,7 +313,9 @@ static void draw_wrapped_text(int x, int y, int max_width, int max_rows, const c
     if (li > 0 && row < max_rows) {
         line[li] = 0;
         fb_draw_string(x, y + row * FM_ROW_H, line, color, 1);
+        row++;
     }
+    return row;
 }
 
 static void fm_handle_click(const gui_window_t *w, int my) {
@@ -298,7 +323,7 @@ static void fm_handle_click(const gui_window_t *w, int my) {
     int rel_y = my - (w->y + TITLEBAR_H + 12);
 
     if (fm_viewing_file) {
-        if (rel_y >= 0 && rel_y < FM_ROW_H) fm_viewing_file = 0; /* "<- back" row */
+        if (rel_y >= 0 && rel_y < FM_ROW_H) { fm_viewing_file = 0; fm_editing = 0; } /* "<- back" row */
         return;
     }
     int row = (rel_y - 18) / FM_ROW_H;
@@ -349,6 +374,113 @@ static void draw_file_manager(const gui_window_t *w) {
     }
 }
 
+/* Splits "example.com/path" (an optional "http://" prefix is skipped)
+ * into a host and a path; defaults the path to "/". */
+static void br_parse_url(const char *url, char *host_out, int host_cap, char *path_out, int path_cap) {
+    const char *p = url;
+    if (p[0] == 'h' && p[1] == 't' && p[2] == 't' && p[3] == 'p' &&
+        p[4] == ':' && p[5] == '/' && p[6] == '/') {
+        p += 7;
+    }
+    int i = 0;
+    while (*p && *p != '/' && i < host_cap - 1) host_out[i++] = *p++;
+    host_out[i] = 0;
+
+    if (*p == '/') {
+        int j = 0;
+        while (*p && j < path_cap - 1) path_out[j++] = *p++;
+        path_out[j] = 0;
+    } else {
+        strcpy(path_out, "/");
+    }
+}
+
+/* Runs synchronously on the GUI's own task -- the screen won't redraw
+ * until this returns (a few seconds for a small page). A real async
+ * fetch would need a dedicated task and a way to hand the result back;
+ * out of scope for this pass. */
+static void br_fetch(void) {
+    char host[64], path[64];
+    br_parse_url(br_url, host, sizeof(host), path, sizeof(path));
+
+    static char body[BR_BODY_MAX];
+    int status;
+    uint32_t body_len;
+
+    if (!http_get(host, 80, path, &status, body, sizeof(body) - 1, &body_len)) {
+        strcpy(br_status_msg, "Failed to load (DNS/TCP error)");
+        br_doc.line_count = 0;
+        br_doc.title[0] = 0;
+        return;
+    }
+    body[body_len] = 0;
+    html_parse(body, body_len, &br_doc);
+    br_scroll = 0;
+
+    char numbuf[12];
+    utoa((unsigned int)status, numbuf);
+    strcpy(br_status_msg, status >= 200 && status < 300 ? "OK " : "HTTP ");
+    strcat(br_status_msg, numbuf);
+}
+
+static void br_handle_click(const gui_window_t *w, int my) {
+    int rel_y = my - (w->y + TITLEBAR_H + 8);
+    br_editing_url = (rel_y >= 0 && rel_y < 20);
+}
+
+static void br_handle_key(char c) {
+    if (!br_editing_url) return;
+    if (c == '\n' || c == '\r') {
+        br_fetch();
+    } else if (c == '\b') {
+        if (br_url_len > 0) br_url_len--;
+    } else if (c >= 32 && c < 127 && br_url_len < BR_MAX_URL - 1) {
+        br_url[br_url_len++] = c;
+    }
+    br_url[br_url_len] = 0;
+}
+
+static void draw_browser(const gui_window_t *w) {
+    int x = w->x + 10;
+    int y = w->y + TITLEBAR_H + 8;
+    int inner_w = w->w - 20;
+
+    fb_fill_rect(x, y, inner_w, 20, 0x0D131C);
+    fb_draw_rect(x, y, inner_w, 20, br_editing_url ? 0x62D8FF : 0x3A4270);
+    fb_draw_string(x + 4, y + 6, br_url, COL_TEXT, 1);
+
+    fb_draw_string(x, y + 26, br_status_msg, COL_MUTED, 1);
+
+    if (!net_is_up()) {
+        fb_draw_string(x, y + 44, "no NIC detected", 0xE05252, 1);
+        return;
+    }
+
+    int content_y = y + 46;
+    int content_h = w->y + w->h - content_y - 8;
+    int max_rows = content_h / FM_ROW_H;
+    if (max_rows < 1) max_rows = 1;
+
+    if (br_scroll > br_doc.line_count - 1) br_scroll = br_doc.line_count - 1;
+    if (br_scroll < 0) br_scroll = 0;
+
+    int display_row = 0;
+    for (int li = br_scroll; li < br_doc.line_count && display_row < max_rows; li++) {
+        const struct html_line *line = &br_doc.lines[li];
+        if (line->text[0] == 0) { display_row++; continue; } /* blank spacer line */
+
+        uint32_t color;
+        switch (line->style) {
+            case HTML_STYLE_HEADING: color = 0xF2C14E; break;
+            case HTML_STYLE_LINK:    color = 0x62D8FF; break;
+            case HTML_STYLE_BOLD:    color = 0xFFFFFF; break;
+            default:                 color = COL_TEXT; break;
+        }
+        display_row += draw_wrapped_text(x, content_y + display_row * FM_ROW_H, inner_w,
+                                          max_rows - display_row, line->text, color);
+    }
+}
+
 static void draw_shadow(int x, int y, int w, int h) {
     int offset = 8;
     for (int i = 0; i < offset; i++) {
@@ -386,6 +518,7 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->is_process_monitor) draw_process_monitor(w);
     if (w->is_network) draw_network(w);
     if (w->is_file_manager) draw_file_manager(w);
+    if (w->is_browser) draw_browser(w);
 }
 
 static void draw_taskbar(void) {
@@ -442,6 +575,12 @@ void gui_run(void) {
                     break;
                 }
             }
+            /* Clicking anywhere deselects both text-input widgets; the
+             * specific click handler below re-focuses its own if the
+             * click actually landed on it. */
+            br_editing_url = 0;
+            if (fm_viewing_file) fm_editing = 0;
+
             if (!hit_titlebar) {
                 for (int oi = window_count - 1; oi >= 0; oi--) {
                     int wi = window_order[oi];
@@ -449,6 +588,7 @@ void gui_run(void) {
                     if (mx >= w->x && mx < w->x + w->w && my >= w->y + TITLEBAR_H && my < w->y + w->h) {
                         bring_to_front(oi);
                         if (w->is_file_manager) fm_handle_click(w, my);
+                        else if (w->is_browser) br_handle_click(w, my);
                         break;
                     }
                 }
@@ -470,6 +610,19 @@ void gui_run(void) {
 
         for (char c = keyboard_getchar(); c; c = keyboard_getchar()) {
             fm_handle_key(c);
+            br_handle_key(c);
+        }
+
+        static int scroll_cooldown = 0;
+        if (scroll_cooldown > 0) {
+            scroll_cooldown--;
+        } else if (keyboard_key_pressed(0x48)) { /* up arrow */
+            br_scroll--;
+            if (br_scroll < 0) br_scroll = 0;
+            scroll_cooldown = 4;
+        } else if (keyboard_key_pressed(0x50)) { /* down arrow */
+            br_scroll++;
+            scroll_cooldown = 4;
         }
 
         draw_frame(mx, my);

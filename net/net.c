@@ -7,6 +7,7 @@
  * guest 10.0.2.15, gateway/host 10.0.2.2. No DHCP client yet. */
 static uint32_t our_ip = 0;
 static uint32_t gateway_ip = 0;
+static uint32_t netmask = 0;
 static uint8_t our_mac[6];
 static int is_up = 0;
 
@@ -16,6 +17,7 @@ int net_init(void) {
     rtl8139_get_mac(our_mac);
     our_ip = ip_make(10, 0, 2, 15);
     gateway_ip = ip_make(10, 0, 2, 2);
+    netmask = ip_make(255, 255, 255, 0);
 
     rtl8139_set_rx_handler(eth_handle_frame);
     is_up = 1;
@@ -31,6 +33,11 @@ int net_is_up(void) { return is_up; }
 const uint8_t *net_get_mac(void) { return our_mac; }
 uint32_t net_get_ip(void) { return our_ip; }
 uint32_t net_get_gateway_ip(void) { return gateway_ip; }
+uint32_t net_get_netmask(void) { return netmask; }
+
+int net_is_local(uint32_t ip) {
+    return (ip & netmask) == (our_ip & netmask);
+}
 
 uint16_t net_checksum(const void *data, int len) {
     const uint8_t *bytes = (const uint8_t *)data;
