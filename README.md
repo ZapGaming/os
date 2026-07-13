@@ -67,6 +67,13 @@ you can keep building on.
   our IP, the resolved gateway, and live ping stats. Verified against a
   real packet capture (see "How networking works" below) — the gateway's
   replies genuinely round-trip.
+- **A real DHCP client** (`net/dhcp.c`): a genuine DISCOVER → OFFER →
+  REQUEST → ACK handshake (RFC 2131) over raw broadcast Ethernet frames,
+  replacing the old hardcoded static IP. Runs once at boot, right after
+  interrupts are enabled; if no DHCP server answers within a few
+  retries, it just leaves the static fallback config in place, so
+  `make run` still works out of the box either way. See "How DHCP
+  works" below.
 - **A real web browser with a CSS box-model layout engine**: an HTTP/1.1
   client on top of TCP (handles both `Content-Length` and chunked
   transfer-encoding), a real DOM tree parser (`net/dom.c`), a CSS parser
@@ -134,6 +141,13 @@ you can keep building on.
   filesystem works"). The listing also shows a live item count and
   color-codes/tags entries by type (directories, `.WAV` audio, plain
   files).
+- **Running real programs from disk**: a minimal ELF32 loader
+  (`kernel/elf.c`) that validates and loads a static (`ET_EXEC`) i386
+  executable's `PT_LOAD` segments and launches it as a genuine ring-3
+  task — the File Manager runs any `.ELF` file the same way it opens a
+  `.WAV` or text file (click it; `[ELF]`-tagged in the listing). See
+  "How the ELF loader works" below for what makes this safe (or rather,
+  not fully safe yet) given there's no per-process memory isolation.
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
@@ -181,17 +195,22 @@ you can keep building on.
   can create and overwrite, but there's no way to remove a directory
   entry or grow a file's directory *tree* (only its own cluster chain
   and, for the immediate parent, one additional directory cluster).
-- **No DHCP**: the IP config is static, matching QEMU's default SLIRP
-  network so `make run` just works. Incoming packet checksums aren't
-  validated (outgoing ones are computed correctly). TCP is client-only
-  (active-open), single-connection (no concurrent sockets) — there's no
-  listening/server side.
+- **Incoming packet checksums aren't validated** (outgoing ones are
+  computed correctly). TCP is client-only (active-open), single-
+  connection (no concurrent sockets) — there's no listening/server side.
 - **Real process isolation**: every task (kernel and ring-3) shares the
   same identity-mapped address space — there's no per-process page
   directory yet, so a user task *could* read/write kernel memory or
   another task's memory. The ring-3 mechanics (privilege transitions,
   syscalls, faulting on privileged instructions) are real; the memory
-  protection between processes is not, yet.
+  protection between processes is not, yet. The ELF loader's only
+  defense given that gap is a fixed address window
+  (`kernel/elf.c`'s `USER_LOAD_MIN`/`MAX`, 64MB-240MB) that every loaded
+  program's segments are bounds-checked against before anything is
+  copied — it stops a program from *accidentally* colliding with the
+  kernel's own memory, but does nothing to stop one from deliberately
+  reading/writing outside its own segments, since it's still the same
+  address space as everything else.
 - **Process lifecycle**: exited tasks are marked terminated and skipped by
   the scheduler, but their stack memory is never freed, and there's no
   `wait()`/parent-child relationship, exit codes, or process reaping.
@@ -258,12 +277,14 @@ calls `net_send_frame()`, which dispatches to whichever driver
 initialized successfully, and the GUI's "Network" window displays
 `net_get_driver_name()` rather than a hardcoded label. `net/` layers
 Ethernet → ARP → IPv4 → ICMP on top of whichever NIC is active, each in
-its own file, dispatching by ethertype/protocol number. The IP config
-(`10.0.2.15`, gateway `10.0.2.2`) is static and matches QEMU SLIRP's
-defaults, so there's no DHCP client yet — this also means a real VMware
-network (not QEMU's SLIRP) would need this static config to happen to
-fit whatever network VMware bridges/NATs to, until a real DHCP client
-exists (see the roadmap).
+its own file, dispatching by ethertype/protocol number. `net_init()`
+starts every consumer off with a static fallback config
+(`10.0.2.15`/gateway `10.0.2.2`, matching QEMU SLIRP's defaults) so
+nothing has to wait on a network round-trip just to boot; a real DHCP
+handshake (see "How DHCP works" below) then runs once interrupts are on
+and upgrades that config in place if a server answers, which is what
+makes this actually work on a real (non-SLIRP) network like VMware's,
+not just QEMU's default setup.
 
 Verifying this actually worked took a real packet capture (`tcpdump -r`
 on a `-object filter-dump` pcap), which is worth calling out because it
@@ -292,6 +313,95 @@ consequences of preemption happening on *every* PIT tick, unconditionally:
    independently of whichever task is current) could get serviced first,
    see `pending_outstanding` still 0, and silently drop a perfectly valid
    reply. Fixed by setting that state *before* sending.
+
+## How DHCP works
+
+`net/dhcp.c` runs a real RFC 2131 handshake — DISCOVER, then REQUEST
+once an OFFER comes back, waiting (with a timeout) for an ACK — up to
+three attempt cycles before giving up. It deliberately doesn't go
+through `ip_send()`/`udp_send()`: both assume a usable source IP and an
+ARP-resolvable unicast destination, neither of which exist before a
+lease does, so DHCP hand-builds its own Ethernet+IP+UDP+DHCP frames and
+sends them straight to `eth_send()` with the all-ones broadcast MAC as
+the destination, skipping ARP and routing entirely. The blocking
+wait-for-reply loop is the same pattern `net/dns.c` already used
+(register a UDP port handler, send, then `hlt` in a loop bounded by
+`pit_ticks()`), which is also why `net_dhcp_negotiate()` can't run
+until *after* `sti` — `net_init()` itself runs earlier, with interrupts
+still off, so it only ever sets up the static fallback, never DHCP.
+
+Two bugs got caught by reasoning through the concurrency model before
+they ever had a chance to show up in testing, rather than by observing
+a failure:
+
+1. **A stale gateway in the ping task.** `ping_task_entry()` originally
+   read `net_get_gateway_ip()` once before its loop. But `ping_task` is
+   `task_create()`d *before* `net_dhcp_negotiate()` runs, and the
+   scheduler is already preempting by the time DHCP's blocking call
+   executes — so a DHCP-negotiated gateway that arrived after the ping
+   task's first (and only) read would've been silently invisible to it
+   forever. Fixed by re-reading the gateway fresh every loop iteration.
+2. **Stale options bleeding across retry attempts.** The parsed OFFER
+   fields (subnet mask, router, DNS server, server id) are module-level
+   statics, reused across the up-to-three DISCOVER→REQUEST attempts in
+   `net_dhcp_negotiate()`. If attempt 1 got as far as an OFFER but never
+   completed the REQUEST/ACK round-trip, and attempt 2 got a lease from
+   a *different* server, that second server's ACK might not repeat
+   every option — silently leaving attempt 1's stale values mixed into
+   the lease actually accepted. Fixed by resetting all four fields to 0
+   at the top of every attempt.
+
+Verified end-to-end in QEMU against both the RTL8139 and e1000 drivers:
+the serial log shows `dhcp: leased 10.0.2.15 gateway=10.0.2.2
+mask=255.255.255.0` on the first DISCOVER in both cases (QEMU SLIRP's
+DHCP-assigned address happens to be identical to the old static
+fallback, so this also confirms zero regression), pings kept working
+with zero drops after negotiation, and a full browser fetch (external
+CSS + an image, over both drivers) rendered identically before and
+after switching from the static config to a negotiated one.
+
+## How the ELF loader works
+
+`kernel/elf.c` parses a 32-bit ELF header and program header table
+already sitting in memory (read whole off the FAT32 disk by the File
+Manager) and is deliberately narrow about what it accepts: only a
+static `ET_EXEC` (no PIE/shared/relocatable), 32-bit little-endian,
+`EM_386` executable, with every `PT_LOAD` segment's `p_vaddr`/`p_memsz`
+(and the entry point) bounds-checked against a fixed window
+(`USER_LOAD_MIN`/`USER_LOAD_MAX`, 64MB-240MB) before anything is
+touched. That window, not a real memory-protection mechanism, is what
+keeps a loaded program from colliding with the kernel's own image —
+there's no per-process page directory yet (see the roadmap and the
+"Real process isolation" limitation above), so every task, including
+one loaded from an arbitrary file, still shares the same identity-
+mapped 4 GiB address space. 64MB was picked because the kernel's own
+static footprint (code, data, and its 32MB heap arena) measures to
+`kernel_end ≈ 33.24 MiB` (`nm build/kernel.elf`); 240MB leaves headroom
+under the 256MB QEMU is run with. A user program's own linker script
+has to target that same base by convention (see `userprogs/user.ld`) —
+the loader only *checks* the range, it doesn't relocate anything into
+it.
+
+Once validated, each `PT_LOAD` segment's file bytes are `memcpy`'d to
+its `p_vaddr` (a real pointer, since the address space is identity-
+mapped) and any BSS tail beyond `p_filesz` is zeroed, then
+`task_create_user()` starts a new ring-3 task at the ELF's entry point
+— the exact same mechanism the compiled-in demo task uses, since a C
+function pointer doesn't care whether the code it points to was linked
+into the kernel image or loaded from disk at runtime.
+
+`userprogs/hello.c` is the test program exercising this: a few lines
+using the same `int 0x80` `sys_write`/`sys_yield`/`sys_exit` ABI as
+`kernel/demo_user_task.c`, linked at the loader's base address by
+`userprogs/user.ld` and built fresh by `tools/make_disk_image.sh` (same
+freestanding flags as the kernel itself) into `TEST.ELF` on the disk
+image, not committed as a binary. Clicking it in the File Manager
+(tagged `[ELF]` in the listing) reads it via `fat32_read_file`, calls
+`elf_load_and_run()`, and shows "Launched as pid N" (or a failure
+reason) in the status line — verified in QEMU: the serial log shows
+`elf: loaded, entry=4000000 pid=4` followed by the program's own five
+`sys_write` lines and a clean `scheduler: task pid=4 exited`, with ping
+traffic and every other task continuing uninterrupted throughout.
 
 ## How the browser works
 
@@ -659,15 +769,16 @@ things to know if you hit trouble in a different VM:
   of the box; VMware's virtual "E1000" NIC is also detected and works
   at the hardware level (verified against QEMU's own `-device e1000` as
   a stand-in, since a real VMware install isn't available to test
-  against directly here) — **but** the IP config is still the static
-  `10.0.2.15`/gateway `10.0.2.2` that matches QEMU SLIRP specifically,
-  with no DHCP client yet, so on a real VMware network (which typically
-  hands out a different subnet, e.g. `192.168.x.x`) the NIC will come
-  up but ARP/ping/the browser won't actually reach anything unless
-  VMware's virtual network is configured to match that subnet, or until
-  a DHCP client exists (see the roadmap). Some tools don't attach a NIC
-  at all — ZapOS handles that gracefully (the Network window just shows
-  "no NIC detected"), it's not an error.
+  against directly here). A real DHCP handshake now runs at boot (see
+  "How DHCP works" above), so on a real VMware network (which typically
+  hands out a different subnet than QEMU's `10.0.2.x`, e.g.
+  `192.168.x.x`) the NIC should get a correct, server-assigned address
+  automatically instead of needing to match a hardcoded static one — if
+  no DHCP server answers, it falls back to the old static
+  `10.0.2.15`/gateway `10.0.2.2` config, which only actually works on
+  QEMU SLIRP. Some tools don't attach a NIC at all — ZapOS handles that
+  gracefully (the Network window just shows "no NIC detected"), it's
+  not an error.
 - Audio needs an **AC97** sound device attached. If the VM tool has no
   audio backend configured at all, the AC97 device itself may still not
   even be exposed to the guest depending on the tool — ZapOS handles a
@@ -715,16 +826,19 @@ whatever your host supports in place of the codec-only `-device AC97`.
 boot/            multiboot2 header + real assembly entry point
 kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  manager, kernel heap, multiboot info parser, serial console,
-                 scheduler + context switch, TSS, ring-3 entry, syscalls
+                 scheduler + context switch, TSS, ring-3 entry, syscalls,
+                 an ELF32 loader (elf.c)
 drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
                  RTL8139 + Intel e1000 NICs, ATA, AC97 codec, WAV file parsing
 gui/             framebuffer primitives, bitmap font, window compositor
-net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
+net/             Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP, HTTP -- a
                  from-scratch TCP/IP stack -- plus DOM/CSS/layout and a
                  BMP decoder, a real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
 js/              a from-scratch JS engine: lexer, parser, tree-walking
                  interpreter, and the DOM bindings that connect it to net/dom.c
+userprogs/       source for standalone test programs run via the ELF loader
+                 (built fresh by tools/make_disk_image.sh, not committed as binaries)
 include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/, js/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
@@ -759,31 +873,32 @@ ISO, which the kernel never reads back from.
 ## Roadmap: making this an "everyday OS"
 
 Preemptive multitasking, ring-3 user mode, syscalls, a full
-Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write/create FAT32
-filesystem, a web browser with a real (if pragmatic) CSS box-model
+Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP stack, a real read/write/create
+FAT32 filesystem, a web browser with a real (if pragmatic) CSS box-model
 layout engine — including external stylesheets, images, and a
 simplified float/width/height model — clickable links and images, and
-file downloads, AC97 audio with WAV playback, and a from-scratch
-JavaScript engine (lexer, parser, tree-walking interpreter, and DOM
-bindings with onclick interactivity) are now done (see above). Rough
-order of what's next:
+file downloads, AC97 audio with WAV playback, a from-scratch JavaScript
+engine (lexer, parser, tree-walking interpreter, and DOM bindings with
+onclick interactivity), and a minimal ELF loader that runs real programs
+from disk are now done (see above). Rough order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
    mechanics work" into "processes are actually isolated," and is a
-   prerequisite for loading untrusted code (like a future browser binary)
-   safely.
-2. **Loading programs from disk** — right now every task is compiled
-   into the kernel image; with a filesystem and per-process page
-   directories both in place, the natural next step is a minimal ELF
-   loader plus `fork`/`exec`-style syscalls, so user programs can be
-   files on `zapos_disk.img` instead of demo functions in `kernel.c`.
+   prerequisite for safely running untrusted code — including the ELF
+   loader, which today only checks a loaded program's segments against a
+   fixed address window (see "How the ELF loader works" above), not real
+   isolation.
+2. **`fork`/`exec`-style process management** — the ELF loader (see
+   above) can already load and run a program from disk, but there's
+   still no way for a running program to launch another one itself, no
+   process hierarchy/exit codes, and (see "Process lifecycle" above) no
+   reaping of exited tasks' resources.
 3. **HTTPS** — a TLS client is a substantial project on its own
    (certificate parsing/validation, at minimum a static-RSA or ECDHE
    cipher suite), but it's the single biggest thing keeping the browser
    from reaching most of the real web.
-4. **DHCP + concurrent connections** — replace the static IP config with
-   a real DHCP handshake, and lift TCP's single-static-connection
+4. **Concurrent TCP connections** — lift TCP's single-static-connection
    limitation so multiple sockets can be open at once (needed before the
    browser can, e.g., fetch a page and its images concurrently, or fetch
    asynchronously without blocking GUI redraws).

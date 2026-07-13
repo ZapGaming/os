@@ -74,6 +74,21 @@ else
   echo "python3 not found -- skipping SONG.WAV test asset"
 fi
 
+# A tiny standalone ELF32 executable for the File Manager's "run .ELF"
+# feature (kernel/elf.c), built fresh here rather than committed as a
+# binary asset -- same freestanding flags as the kernel itself, linked
+# at the loader's fixed user-program base (userprogs/user.ld).
+if command -v gcc >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
+  gcc -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -O2 \
+      -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mgeneral-regs-only \
+      -c userprogs/hello.c -o "$STAGE/hello.o"
+  ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/TEST.ELF" "$STAGE/hello.o"
+  mcopy -i "$IMG" "$STAGE/TEST.ELF" ::/TEST.ELF
+  echo "Added TEST.ELF (sample ELF32 program for the File Manager to run)"
+else
+  echo "gcc/ld not found -- skipping TEST.ELF test asset"
+fi
+
 echo "Built $IMG"
 mdir -i "$IMG" ::
 

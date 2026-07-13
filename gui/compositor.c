@@ -21,6 +21,7 @@
 #include <js/js.h>
 #include <js/dom_binding.h>
 #include <kernel/kheap.h>
+#include <kernel/elf.h>
 #include <string.h>
 
 #define MAX_WINDOWS   8
@@ -371,6 +372,23 @@ static void fm_open_entry(int index) {
     fm_close_audio();
     strcpy(fm_preview_name, e->name);
 
+    if (fm_has_ext(e->name, "ELF")) {
+        uint8_t *buf = (uint8_t *)kmalloc(e->size > 0 ? e->size : 1);
+        uint32_t got = buf ? fat32_read_file(e->cluster, e->size, buf, e->size) : 0;
+        int pid = buf ? elf_load_and_run(buf, got) : -1;
+        if (buf) kfree(buf);
+        if (pid >= 0) {
+            char numbuf[12];
+            strcpy(fm_status_msg, "Launched as pid ");
+            utoa((unsigned int)pid, numbuf);
+            strcat(fm_status_msg, numbuf);
+        } else {
+            strcpy(fm_status_msg, "Failed to launch (see serial log)");
+        }
+        fm_status_until = pit_ticks() + 300;
+        return;
+    }
+
     if (fm_has_ext(e->name, "WAV")) {
         uint32_t cap = e->size < FM_AUDIO_MAX ? e->size : FM_AUDIO_MAX;
         fm_audio_buf = (uint8_t *)kmalloc(cap > 0 ? cap : 1);
@@ -545,6 +563,9 @@ static void draw_file_manager(const gui_window_t *w) {
             if (fm_has_ext(fm_entries[i].name, "WAV")) {
                 strcpy(line, "[WAV] ");
                 color = 0x8FE3A8;
+            } else if (fm_has_ext(fm_entries[i].name, "ELF")) {
+                strcpy(line, "[ELF] ");
+                color = 0xE0B85C;
             } else {
                 line[0] = 0;
                 color = COL_TEXT;
@@ -555,6 +576,9 @@ static void draw_file_manager(const gui_window_t *w) {
             strcat(line, "B");
         }
         fb_draw_string(x, y + 18 + i * FM_ROW_H, line, color, 1);
+    }
+    if (pit_ticks() < fm_status_until) {
+        fb_draw_string(x, w->y + w->h - 18, fm_status_msg, 0x8FE3A8, 1);
     }
 }
 
