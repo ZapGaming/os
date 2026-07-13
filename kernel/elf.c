@@ -56,8 +56,10 @@ struct elf32_phdr {
 /* The stack lives at a fixed offset near the top of the same window,
  * comfortably above where any realistically-sized program's own
  * segments (which start at USER_LOAD_MIN and grow upward) would reach
- * -- checked explicitly below rather than just assumed. */
-#define USER_STACK_TOP (USER_LOAD_MIN + 0x00F00000u) /* 15MB into the window */
+ * -- checked explicitly below rather than just assumed. 160MB gives
+ * DOOM's ~48MB static heap arena (see userprogs/doom/doomlibc.c) and
+ * embedded WAD plenty of room alongside code/data. */
+#define USER_STACK_TOP (USER_LOAD_MIN + 0x0A000000u) /* 160MB into the window */
 
 #define PAGE_SIZE 4096u
 static uint32_t page_floor(uint32_t x) { return x & ~(PAGE_SIZE - 1); }

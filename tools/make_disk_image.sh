@@ -95,8 +95,34 @@ if command -v gcc >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
   ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/EVIL.ELF" "$STAGE/evil.o"
   mcopy -i "$IMG" "$STAGE/EVIL.ELF" ::/EVIL.ELF
   echo "Added EVIL.ELF (misbehaving program to test isolation containment)"
+
+  # A real, complete port of DOOM (doomgeneric, see userprogs/doom/) --
+  # freestanding, no FPU, its own libc (doomlibc.c), and the shareware
+  # IWAD linked directly into the binary's .data section (ld -r -b
+  # binary) so it needs no file-read syscall at all. Built the same way
+  # as TEST.ELF/EVIL.ELF, just with many more source files and its own
+  # include shims (userprogs/doom/zapos/).
+  if [ -f userprogs/doom/doom1.wad ]; then
+    DOOMDIR=userprogs/doom
+    DOOMOBJDIR="$STAGE/doomobj"
+    mkdir -p "$DOOMOBJDIR"
+    DOOMFLAGS="-m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
+      -fno-builtin -nostdlib -nostdinc -O1 \
+      -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mgeneral-regs-only \
+      -I$DOOMDIR -I$DOOMDIR/zapos -isystem $(gcc -m32 -print-file-name=include)"
+    for f in "$DOOMDIR"/*.c; do
+      base=$(basename "$f" .c)
+      gcc $DOOMFLAGS -c "$f" -o "$DOOMOBJDIR/$base.o"
+    done
+    (cd "$DOOMDIR" && ld -m elf_i386 -r -b binary -o "$DOOMOBJDIR/wad.o" doom1.wad)
+    ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/DOOM.ELF" "$DOOMOBJDIR"/*.o
+    mcopy -i "$IMG" "$STAGE/DOOM.ELF" ::/DOOM.ELF
+    echo "Added DOOM.ELF (full DOOM port, shareware WAD embedded)"
+  else
+    echo "userprogs/doom/doom1.wad not found -- skipping DOOM.ELF"
+  fi
 else
-  echo "gcc/ld not found -- skipping TEST.ELF/EVIL.ELF test assets"
+  echo "gcc/ld not found -- skipping TEST.ELF/EVIL.ELF/DOOM.ELF test assets"
 fi
 
 echo "Built $IMG"

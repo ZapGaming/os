@@ -39,6 +39,15 @@ void schedule(void);
 int scheduler_task_count(void);
 struct task *scheduler_current(void);
 
+/* Returns the task state for `pid`, or TASK_TERMINATED if no such pid
+ * was ever created -- lets a long-lived kernel data structure (the
+ * GUI's fullscreen-takeover mode, specifically) check whether the task
+ * that asked for it is still alive without holding a dangling
+ * struct task* across that task's exit and slot reuse... except task
+ * slots are never actually reused today (see the README), so this is
+ * mostly just "did pid N ever finish." */
+enum task_state scheduler_task_state(int pid);
+
 /* Marks the current task terminated and never returns -- used both for
  * a normal SYS_EXIT syscall and (see kernel/exceptions.c) to contain a
  * ring-3 task that just faulted, instead of halting the whole kernel. */

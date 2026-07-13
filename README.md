@@ -169,6 +169,13 @@ you can keep building on.
   `[ELF]`-tagged in the listing). See "How the ELF loader works" below
   for exactly what is and isn't isolated (the compiled-in demo task
   still isn't, deliberately).
+- **A real port of DOOM** — the actual id Software game (via the
+  `doomgeneric` source tree), not a lookalike, running as `DOOM.ELF`
+  through the same File Manager / ELF loader path as any other program.
+  Full renderer, fixed-point math, WAD-driven assets, HUD, combat, item
+  pickups — see "How the DOOM port works" below for how a game built
+  around a real filesystem, libc, and framebuffer got running on a
+  kernel with none of those things available to ring-3 code.
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
@@ -263,6 +270,13 @@ you can keep building on.
   ever, for the life of one boot -- a long-running system that kept
   launching ELF programs would eventually run out of task slots even
   though their memory is being reclaimed correctly).
+
+- **DOOM has no sound and no windowed mode** — see "How the DOOM port
+  works" for the full scope. It's fullscreen-only (takes over the
+  whole screen, since there's no general per-window pixel-buffer
+  syscall to render into a normal window with) and silent (every sound
+  function is a no-op stub; ZapOS's AC97 driver exists and works for
+  WAV playback elsewhere, but nothing wires DOOM's mixer into it yet).
 
 See "Roadmap" below for how each of these would actually get built.
 
@@ -519,6 +533,93 @@ was the deliberate call. There's also still no isolation *between*
 two kernel-mode tasks (the background counter, the ping task, the
 GUI) — none of them run untrusted code, so that gap doesn't matter the
 way it would for ELF-loaded ones.
+
+## How the DOOM port works
+
+`userprogs/doom/` is [doomgeneric](https://github.com/ozkl/doomgeneric)
+(a fork of the real DOOM source tree, GPL-2.0, restructured so a port
+only has to implement six platform functions) minus every platform
+frontend and sound backend it ships with, plus a from-scratch libc
+(`doomlibc.c`) and a ZapOS platform layer (`doomgeneric_zapos.c`,
+`i_video_zapos.c`, `i_sound_zapos.c`) written for this port. It builds
+into `DOOM.ELF` and runs exactly like `TEST.ELF` — click it in the File
+Manager — with the shareware IWAD linked directly into the binary.
+
+**No FPU, at all.** The kernel (and every user program) is built
+`-mgeneral-regs-only -mno-sse -mno-80387`, which makes any `float`/
+`double` a hard compile error the instant it's *declared or called*,
+never mind executed — the ABI itself needs FPU/SSE registers to pass
+or return one. DOOM's renderer and game logic turned out to already be
+entirely fixed-point at runtime (`tables.c`'s precomputed trig tables
+replace the `#if 0`-guarded `sin`/`cos`/`atan` calls in `r_main.c`), so
+the only real float usage was in code this port doesn't need at all:
+every sound backend (excluded wholesale) and a handful of
+config-system/UI conveniences — `mouse_acceleration`, `v_video.c`'s
+mouse-speed-box display, `g_game.c`'s demo-timing fps readout — which
+got stubbed or rewritten in integer math rather than ported.
+
+**No filesystem, no config files, no libc.** Three things made this
+tractable instead of requiring real file I/O syscalls:
+- The shareware `doom1.wad` is linked straight into `DOOM.ELF`'s data
+  section (`ld -r -b binary`, giving `_binary_doom1_wad_start/end`
+  symbols) and served by a from-scratch `wad_file_class_t` backend
+  (`w_file_zapos.c`) that just points at that embedded blob — no
+  `open`/`read` syscall exists or needs to.
+- `d_iwad.c` and `m_config.c` (IWAD path resolution and the
+  float-laden generic config-variable system, respectively) are
+  replaced with minimal stubs — safe because `D_IdentifyVersion()`
+  auto-detects the actual game version from the WAD's real lump names
+  (`E1M1`, `MAP01`, ...), not from whatever path `D_FindIWAD` returns,
+  and there's nowhere to persist a config file to anyway.
+- `doomlibc.c` is a ~600-line freestanding libc built for exactly what
+  DOOM's source calls: a first-fit `malloc` over a static 48MB arena
+  (sized well past DOOM's own 16MB zone allocator plus WAD lump
+  caching), the string/mem functions, and a `printf` family with a
+  custom `vsnprintf` — including integer-conversion *precision*
+  (`"%.3d"`), which turned out to matter: `hu_stuff.c` builds HUD font
+  lump names as `STCFN%.3d`, and an early version of this without
+  precision support produced `STCFN33` instead of `STCFN033`, which
+  silently failed the lump lookup. `stdio`/`FILE*` calls (`fopen` etc.)
+  are honest, permanent failures, not TODOs — there's no file to open.
+
+**No display, no keyboard, from ring 3.** ZapOS's GUI is a windowed
+desktop with no general "give me a window's pixels" syscall, so DOOM
+gets a dedicated one instead: `SYS_BLIT` (`kernel/syscall.c`) copies a
+caller-owned `320x200` `uint32_t` buffer into a kernel-owned staging
+buffer and flips the compositor into fullscreen-takeover mode
+(`gui/compositor.c`'s `draw_frame()` checks a `fs_active` flag first
+and, when set, scales/letterboxes that buffer to the real screen
+instead of drawing the desktop) until the owning task exits. Input
+works the same way in reverse: `drivers/keyboard.c` already had an
+ASCII character ring for text input, but DOOM needs raw press/release
+*scancodes* (arrows, ctrl, shift aren't ASCII), so it gained a second,
+parallel `(scancode, pressed)` event ring that `SYS_POLL_KEY` drains.
+`SYS_GET_TICKS`/`SYS_SLEEP` round out the syscalls, wrapping the
+kernel's existing 100Hz PIT for `doomgeneric`'s timing hooks. All four
+are read-only or copy-only from the kernel's side, and — since a
+syscall trap doesn't switch `CR3` — the handler runs with the calling
+task's own isolated page directory still loaded, so it can safely
+dereference that task's own buffer pointer without any special-casing.
+
+**Verification.** Booted in QEMU, clicked `DOOM.ELF` in the File
+Manager, and watched the real init sequence scroll on the serial
+console (`Z_Init`, `W_Init: Init WADfiles`, ` adding doom1.wad`,
+`R_Init: Init DOOM refresh daemon`, `HU_Init`) before the fullscreen
+takeover kicked in showing the actual E1M1 ("Hangar") level, correctly
+textured, with a working HUD (ammo/health/armor/face) and an enemy on
+screen. Sending keys through it produced real, live gameplay — picked
+up a clip, a medikit, and armor (HUD updating to `100%`/`200%`
+correctly), took and dealt damage, and opened/closed the real DOOM
+main menu — not a static render, an actually-playable game loop.
+
+**Scope.** This is a v1: fullscreen only (no windowed mode, since the
+GUI has no general per-window pixel-buffer API yet), keyboard-only (no
+mouse look/strafe), no sound (every `i_sound_zapos.c` function is a
+no-op stub — AC97 output exists elsewhere in ZapOS for WAV playback,
+but wiring DOOM's sound mixer into it is future work), and the
+shareware WAD only (the full retail WAD would work identically, since
+nothing here special-cases which WAD is embedded — it's just not
+included, for licensing reasons the shareware WAD doesn't have).
 
 ## How the browser works
 
@@ -1022,7 +1123,10 @@ fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
 js/              a from-scratch JS engine: lexer, parser, tree-walking
                  interpreter, and the DOM bindings that connect it to net/dom.c
 userprogs/       source for standalone test programs run via the ELF loader
-                 (built fresh by tools/make_disk_image.sh, not committed as binaries)
+                 (built fresh by tools/make_disk_image.sh, not committed as binaries);
+                 userprogs/doom/ is the DOOM port -- doomgeneric source, a from-
+                 scratch libc, and the ZapOS platform layer (see "How the DOOM
+                 port works" above)
 include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/, js/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
@@ -1052,6 +1156,13 @@ preemptible rather than the only thing running.
   (`font8x8_basic.h`), originally based on IBM VGA ROM font data by Marcel
   Sondaar. No code from that project is used — only the glyph bitmap data,
   reformatted into our own header/source split.
+- `userprogs/doom/` — the DOOM game logic/renderer itself (not the
+  platform layer, libc, or WAD-loading code, which are original to
+  this project) is [doomgeneric](https://github.com/ozkl/doomgeneric),
+  GPL-2.0, itself a portability fork of id Software's DOOM source
+  release. `userprogs/doom/doom1.wad` is id Software's official
+  shareware IWAD (`doom1.wad`, md5 `f0cefca49926d00903cf57551d901abe`),
+  which id has distributed freely since 1993.
 
 Everything else (kernel, drivers, GUI, build system) is original code
 written for this project. GRUB is used only as a bootloader (Multiboot2
@@ -1069,9 +1180,10 @@ float/width/height/flex model, custom-property (`var()`) resolution, and
 an in-memory response cache — clickable links and images, and file
 downloads, AC97 audio with WAV playback, a from-scratch JavaScript
 engine (lexer, parser, tree-walking interpreter, and DOM bindings with
-onclick interactivity), and a minimal ELF loader that runs real
-programs from disk in their own genuinely isolated, per-process page
-directory are now done (see above). Rough order of what's next:
+onclick interactivity), a minimal ELF loader that runs real programs
+from disk in their own genuinely isolated, per-process page directory,
+and a real, playable port of DOOM are now done (see above). Rough
+order of what's next:
 
 1. **Extend per-process isolation to every task, not just ELF-loaded
    ones** — the compiled-in ring-3 demo task and every kernel-mode task

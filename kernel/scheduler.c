@@ -153,6 +153,11 @@ struct task *scheduler_current(void) {
     return current_task;
 }
 
+enum task_state scheduler_task_state(int pid) {
+    if (pid < 0 || pid >= task_count) return TASK_TERMINATED;
+    return tasks[pid].state;
+}
+
 void task_exited(void) {
     current_task->state = TASK_TERMINATED;
     serial_printf("scheduler: task pid=%d exited\n", current_task->pid);

@@ -49,6 +49,27 @@ int keyboard_key_pressed(uint8_t scancode) {
     return key_state[scancode & 0x7F];
 }
 
+#define EVENT_BUF_SIZE 64
+struct key_event { uint8_t scancode; uint8_t pressed; };
+static struct key_event event_ring[EVENT_BUF_SIZE];
+static uint32_t event_head = 0, event_tail = 0;
+
+static void event_push(uint8_t scancode, uint8_t pressed) {
+    uint32_t next = (event_head + 1) % EVENT_BUF_SIZE;
+    if (next == event_tail) return; /* full, drop */
+    event_ring[event_head].scancode = scancode;
+    event_ring[event_head].pressed = pressed;
+    event_head = next;
+}
+
+int keyboard_poll_event(uint8_t *scancode, uint8_t *pressed) {
+    if (event_tail == event_head) return 0;
+    *scancode = event_ring[event_tail].scancode;
+    *pressed = event_ring[event_tail].pressed;
+    event_tail = (event_tail + 1) % EVENT_BUF_SIZE;
+    return 1;
+}
+
 static void keyboard_handler(struct registers *regs) {
     (void)regs;
     uint8_t code = inb(KBD_DATA_PORT);
@@ -56,6 +77,12 @@ static void keyboard_handler(struct registers *regs) {
     int release = code & 0x80;
     uint8_t sc = code & 0x7F;
     if (sc < 128) key_state[sc] = release ? 0 : 1;
+
+    /* Every make/break goes into the raw event queue regardless of
+     * whether it also has an ASCII meaning below -- SYS_POLL_KEY's
+     * consumers care about press/release edges for keys (arrows, ctrl)
+     * the ASCII ring never represents at all. */
+    if (sc < 128) event_push(sc, (uint8_t)(!release));
 
     switch (sc) {
         case 0x2A: case 0x36: shift_held = !release; return; /* shift */

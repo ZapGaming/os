@@ -67,6 +67,24 @@ static int dragging_window = -1;
 static int drag_dx = 0, drag_dy = 0;
 static int prev_left = 0;
 
+/* Fullscreen takeover, for SYS_BLIT (see kernel/syscall.c): a program
+ * with its own isolated address space (DOOM, specifically) can claim
+ * the whole display instead of drawing into a compositor window --
+ * closer to how real DOS/console games actually worked than trying to
+ * retrofit them into a windowed desktop. Only one at a time; a second
+ * blit from a different pid than the current owner just takes over
+ * (the desktop resumes on its own once the owning task's state is
+ * TASK_TERMINATED, checked once per frame -- see gui_run()). */
+static uint32_t fs_buffer[DOOM_BLIT_W * DOOM_BLIT_H];
+static int fs_active = 0;
+static int fs_owner_pid = -1;
+
+void gui_blit_fullscreen(const uint32_t *pixels, int owner_pid) {
+    memcpy(fs_buffer, pixels, sizeof(fs_buffer));
+    fs_active = 1;
+    fs_owner_pid = owner_pid;
+}
+
 #define TASKBAR_ICON_W 44
 #define TASKBAR_ICON_H 32
 #define TASKBAR_ICON_GAP 6
@@ -1167,7 +1185,34 @@ static void draw_cursor(int x, int y) {
     fb_fill_triangle(x + 1, y + 2, x + 1, y + 13, x + 9, y + 11, 0xFFFFFF);
 }
 
+/* Scales fs_buffer (DOOM_BLIT_W x DOOM_BLIT_H) up to fill as much of
+ * the real screen as fits without distorting its aspect ratio, letter-
+ * boxed and centered above the taskbar. */
+static void draw_fullscreen_app(void) {
+    fb_fill_rect(0, 0, (int)fb_width(), (int)fb_height(), 0x000000);
+
+    int avail_h = (int)fb_height() - TASKBAR_H;
+    int avail_w = (int)fb_width();
+    int scale = avail_w / DOOM_BLIT_W;
+    int scale_h = avail_h / DOOM_BLIT_H;
+    if (scale_h < scale) scale = scale_h;
+    if (scale < 1) scale = 1;
+
+    int w = DOOM_BLIT_W * scale, h = DOOM_BLIT_H * scale;
+    int x = (avail_w - w) / 2, y = (avail_h - h) / 2;
+    fb_blit_rgb(x, y, w, h, fs_buffer, DOOM_BLIT_W, DOOM_BLIT_H);
+}
+
 static void draw_frame(int mx, int my) {
+    if (fs_active) {
+        draw_fullscreen_app();
+        if (scheduler_task_state(fs_owner_pid) == TASK_TERMINATED) {
+            fs_active = 0;
+            fs_owner_pid = -1;
+        }
+        return;
+    }
+
     fb_fill_gradient_v(0, 0, fb_width(), fb_height(), COL_BG_TOP, COL_BG_BOTTOM);
     fb_draw_string(24, 20, "ZapOS", COL_TEXT, 3);
     fb_draw_string(24, 56, "a custom 32-bit OS", COL_MUTED, 1);
