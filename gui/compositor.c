@@ -39,6 +39,7 @@
 typedef struct {
     int x, y, w, h;
     char title[32];
+    char icon_label[5];
     const char *body_line1;
     const char *body_line2;
     uint32_t accent;
@@ -56,9 +57,11 @@ static int window_count = 0;
 static int dragging_window = -1;
 static int drag_dx = 0, drag_dy = 0;
 static int prev_left = 0;
-static int start_menu_open = 0;
 
-#define TASKBAR_MENU_ROW_H 26
+#define TASKBAR_ICON_W 44
+#define TASKBAR_ICON_H 32
+#define TASKBAR_ICON_GAP 6
+#define TASKBAR_ICONS_X 104
 
 static const uint32_t COL_BG_TOP    = 0x141B4D;
 static const uint32_t COL_BG_BOTTOM = 0x05060F;
@@ -112,11 +115,14 @@ static struct css_stylesheet br_stylesheet;
 static int br_stylesheet_valid = 0;
 
 static int add_window(int x, int y, int w, int h, const char *title,
+                       const char *icon_label,
                        const char *l1, const char *l2, uint32_t accent) {
     int idx = window_count;
     gui_window_t *win = &windows[idx];
     win->x = x; win->y = y; win->w = w; win->h = h;
     strcpy(win->title, title);
+    strncpy(win->icon_label, icon_label, sizeof(win->icon_label) - 1);
+    win->icon_label[sizeof(win->icon_label) - 1] = 0;
     win->body_line1 = l1;
     win->body_line2 = l2;
     win->accent = accent;
@@ -149,31 +155,31 @@ static void open_and_focus(int wi) {
 }
 
 void gui_init(void) {
-    add_window(120, 90, 340, 190, "About ZapOS",
+    add_window(120, 90, 340, 190, "About ZapOS", "ABT",
                "A fully custom 32-bit OS kernel",
                "GUI + drivers written from scratch", 0x3E6FF0);
-    add_window(560, 160, 300, 170, "System Monitor",
+    add_window(560, 160, 300, 170, "System Monitor", "SYS",
                "Kernel heap + paging: online",
                "PS/2 keyboard + mouse: online", 0x2FBF71);
-    add_window(260, 340, 320, 150, "Roadmap",
+    add_window(260, 340, 320, 150, "Roadmap", "MAP",
                "Next up: process isolation + a filesystem",
                "See README.md for the plan", 0xE0954C);
 
-    int pm = add_window(640, 420, 320, 190, "Process Monitor", NULL, NULL, 0xB05CE0);
+    int pm = add_window(640, 420, 320, 190, "Process Monitor", "PROC", NULL, NULL, 0xB05CE0);
     windows[pm].is_process_monitor = 1;
 
-    int net = add_window(120, 460, 340, 190, "Network", NULL, NULL, 0x3ED0D8);
+    int net = add_window(120, 460, 340, 190, "Network", "NET", NULL, NULL, 0x3ED0D8);
     windows[net].is_network = 1;
 
     if (fat32_is_mounted()) {
-        int fm = add_window(480, 560, 380, 220, "File Manager", NULL, NULL, 0xF2C14E);
+        int fm = add_window(480, 560, 380, 220, "File Manager", "FILE", NULL, NULL, 0xF2C14E);
         windows[fm].is_file_manager = 1;
         fm_current_dir = fat32_root_cluster();
         fm_refresh();
     }
 
     if (net_is_up()) {
-        int br = add_window(600, 60, 400, 400, "Browser", NULL, NULL, 0x62D8FF);
+        int br = add_window(600, 60, 400, 400, "Browser", "WWW", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
         br_window_idx = br;
         layout_doc_alloc(&br_layout);
@@ -902,6 +908,8 @@ static void draw_window(const gui_window_t *w, int focused) {
     /* close button */
     int cbx = w->x + w->w - 20, cby = w->y + 8;
     fb_fill_rect(cbx, cby, 12, 12, 0xE05252);
+    fb_draw_line(cbx + 2, cby + 2, cbx + 9, cby + 9, 0xFFFFFF);
+    fb_draw_line(cbx + 9, cby + 2, cbx + 2, cby + 9, 0xFFFFFF);
 
     /* body */
     fb_fill_rect(w->x, w->y + TITLEBAR_H, w->w, w->h - TITLEBAR_H, 0x1B2040);
@@ -915,35 +923,48 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->is_browser) draw_browser(w);
 }
 
-static void draw_taskbar(void) {
-    int y = fb_height() - TASKBAR_H;
+/* Geometry for the taskbar icon of windows[slot] -- shared between drawing
+ * and click hit-testing so they can never drift apart. */
+static void taskbar_icon_rect(int slot, int *ix, int *iy, int *iw, int *ih) {
+    *ix = TASKBAR_ICONS_X + slot * (TASKBAR_ICON_W + TASKBAR_ICON_GAP);
+    *iy = (int)fb_height() - TASKBAR_H + (TASKBAR_H - TASKBAR_ICON_H) / 2;
+    *iw = TASKBAR_ICON_W;
+    *ih = TASKBAR_ICON_H;
+}
+
+/* One dock icon per window ZapOS knows about, open or closed -- closing a
+ * window (via its titlebar's X) only hides it, so this dock is also the
+ * only way to bring one back: click a closed icon to reopen it, click an
+ * already-open one to bring it back to front. A bright fill + underline
+ * marks whichever window is currently focused; open-but-not-focused gets
+ * a dimmer tint; closed gets a flat, dark slot. */
+static void draw_taskbar_icon(int slot, int focused_wi) {
+    int ix, iy, iw, ih;
+    taskbar_icon_rect(slot, &ix, &iy, &iw, &ih);
+    const gui_window_t *w = &windows[slot];
+
+    uint32_t bg = 0x171E38;
+    if (w->open) bg = (slot == focused_wi) ? w->accent : ((w->accent >> 1) & 0x7F7F7F);
+    fb_fill_rect(ix, iy, iw, ih, bg);
+    fb_draw_rect(ix, iy, iw, ih, w->open ? w->accent : 0x2A3350);
+
+    int tw = fb_text_width(w->icon_label, 1);
+    fb_draw_string(ix + (iw - tw) / 2, iy + 6, w->icon_label,
+                    w->open ? 0xFFFFFF : 0x7A83A8, 1);
+
+    if (w->open) fb_fill_rect(ix + 4, iy + ih - 4, iw - 8, 2, 0xFFFFFF);
+}
+
+static void draw_taskbar(int focused_wi) {
+    int y = (int)fb_height() - TASKBAR_H;
     fb_fill_gradient_v(0, y, fb_width(), TASKBAR_H, 0x10132C, 0x05060F);
     fb_draw_line(0, y, fb_width(), y, 0x3A4270);
 
-    /* start pill */
-    fb_fill_rect(12, y + 8, 90, TASKBAR_H - 16, start_menu_open ? 0x62D8FF : 0x3E6FF0);
-    fb_draw_string(28, y + 16, "ZapOS", 0xFFFFFF, 1);
+    fb_draw_string(14, y + 16, "ZapOS", 0xFFFFFF, 1);
+
+    for (int i = 0; i < window_count; i++) draw_taskbar_icon(i, focused_wi);
 
     draw_clock(fb_width() - 90, y + 12);
-}
-
-/* Popup launcher listing every window ZapOS knows about, open or closed --
- * closing a window (via its titlebar's close button) only hides it, so
- * this is also the only way to bring one back. Click the pill to toggle,
- * click a row to open (or just re-focus) that window. */
-static void draw_start_menu(void) {
-    int rows = window_count;
-    int menu_h = rows * TASKBAR_MENU_ROW_H + 8;
-    int menu_y = fb_height() - TASKBAR_H - menu_h;
-    fb_fill_rect(12, menu_y, 200, menu_h, 0x141B33);
-    fb_draw_rect(12, menu_y, 200, menu_h, 0x3A4270);
-
-    for (int i = 0; i < rows; i++) {
-        int ry = menu_y + 4 + i * TASKBAR_MENU_ROW_H;
-        uint32_t dot = windows[i].open ? 0x7DF5A3 : 0x697588;
-        fb_fill_rect(20, ry + 8, 8, 8, dot);
-        fb_draw_string(38, ry + 6, windows[i].title, 0xF2F4FF, 1);
-    }
 }
 
 static void draw_cursor(int x, int y) {
@@ -966,8 +987,7 @@ static void draw_frame(int mx, int my) {
         draw_window(&windows[wi], i == top_open_pos);
     }
 
-    draw_taskbar();
-    if (start_menu_open) draw_start_menu();
+    draw_taskbar(top_open_pos >= 0 ? window_order[top_open_pos] : -1);
     draw_cursor(mx, my);
 }
 
@@ -981,25 +1001,15 @@ void gui_run(void) {
         int left_edge = left_down && !prev_left;
 
         if (left_edge) {
-            int taskbar_y = (int)fb_height() - TASKBAR_H;
-            int on_pill = mx >= 12 && mx < 12 + 90 && my >= taskbar_y + 8 && my < taskbar_y + TASKBAR_H - 8;
-            int menu_h = window_count * TASKBAR_MENU_ROW_H + 8;
-            int menu_y = taskbar_y - menu_h;
-            int on_menu = start_menu_open && mx >= 12 && mx < 12 + 200 && my >= menu_y && my < menu_y + menu_h;
             int consumed = 0;
-
-            if (on_pill) {
-                start_menu_open = !start_menu_open;
-                consumed = 1;
-            } else if (on_menu) {
-                int row = (my - menu_y - 4) / TASKBAR_MENU_ROW_H;
-                if (row >= 0 && row < window_count) open_and_focus(row);
-                start_menu_open = 0;
-                consumed = 1;
-            } else if (start_menu_open) {
-                /* Clicking anywhere else just dismisses the menu; the
-                 * click itself still falls through to normal handling. */
-                start_menu_open = 0;
+            for (int i = 0; i < window_count; i++) {
+                int ix, iy, iw, ih;
+                taskbar_icon_rect(i, &ix, &iy, &iw, &ih);
+                if (mx >= ix && mx < ix + iw && my >= iy && my < iy + ih) {
+                    open_and_focus(i);
+                    consumed = 1;
+                    break;
+                }
             }
 
             if (!consumed) {
