@@ -29,12 +29,43 @@ static void hoist(struct js_node *stmts, struct js_env *env) {
             fn->func_node = s;
             fn->closure_env = env;
             js_env_declare(env, s->u.func.name, js_make_object(fn), 0);
-        } else if (s->type == JS_VAR_DECL) {
+        } else if (s->type == JS_VAR_DECL && s->u.var_decl.name) {
+            /* Destructuring decls (name==NULL, see js.h) aren't
+             * pre-declared -- they're rare to reference before their
+             * own statement runs, and doing it right would mean walking
+             * the pattern for every leaf name here too. */
             js_value existing;
             if (!js_env_get(env, s->u.var_decl.name, &existing)) {
                 js_env_declare(env, s->u.var_decl.name, js_undefined(), 0);
             }
         }
+    }
+}
+
+/* Recursively binds `value` against a destructuring pattern (array/object,
+ * possibly nested), declaring each leaf identifier in `env` -- shared by
+ * var/let/const destructuring and by destructured function/arrow params. */
+static void bind_pattern(struct js_node *pattern, js_value value, struct js_env *env) {
+    if (pattern->type == JS_IDENT) {
+        js_env_declare(env, pattern->u.ident.name, value, 0);
+        return;
+    }
+    if (pattern->type == JS_ARRAY_PATTERN) {
+        struct js_object *arr = value.type == JS_OBJ ? value.as.object : NULL;
+        int i = 0;
+        for (struct js_node *el = pattern->u.array_lit.elements; el; el = el->next, i++) {
+            js_value item = arr ? js_get_prop(arr, js_to_string(js_make_num(i))) : js_undefined();
+            bind_pattern(el, item, env);
+        }
+        return;
+    }
+    if (pattern->type == JS_OBJECT_PATTERN) {
+        struct js_object *obj = value.type == JS_OBJ ? value.as.object : NULL;
+        for (struct js_node *p = pattern->u.object_lit.props; p; p = p->next) {
+            js_value item = obj ? js_get_prop(obj, p->u.var_decl.name) : js_undefined();
+            bind_pattern(p->u.var_decl.init, item, env);
+        }
+        return;
     }
 }
 
@@ -141,17 +172,34 @@ js_value js_call(js_value fn, js_value this_val, js_value *args, int argc) {
     if (fn.as.object->kind == JS_OBJ_NATIVE) {
         return fn.as.object->native_fn(this_val, args, argc);
     }
-    if (fn.as.object->kind != JS_OBJ_FUNCTION) {
+    if (fn.as.object->kind != JS_OBJ_FUNCTION && fn.as.object->kind != JS_OBJ_ARROW) {
         serial_printf("js: attempted to call a non-function\n");
+        return js_undefined();
+    }
+    if (fn.as.object->func_node->type == JS_CLASS_DECL || fn.as.object->func_node->type == JS_CLASS_EXPR) {
+        /* A class's JS_OBJ_FUNCTION wrapper stores a class_decl-shaped
+         * node (name+methods), not a func-shaped one (params+body) --
+         * reading .params/.body off it would read the wrong union
+         * member. Real JS also rejects calling a class without `new`. */
+        serial_printf("js: class constructor cannot be invoked without 'new'\n");
         return js_undefined();
     }
 
     struct js_env *call_env = js_env_new(fn.as.object->closure_env);
-    js_env_declare(call_env, "this", this_val, 0);
+    /* Arrow functions have no own `this` -- it resolves lexically
+     * through closure_env, so it deliberately isn't declared here. */
+    if (fn.as.object->kind == JS_OBJ_FUNCTION) {
+        js_env_declare(call_env, "this", this_val, 0);
+    }
 
     struct js_node *param = fn.as.object->func_node->u.func.params;
     for (int i = 0; param; param = param->next, i++) {
-        js_env_declare(call_env, param->u.ident.name, i < argc ? args[i] : js_undefined(), 0);
+        js_value pv = i < argc ? args[i] : js_undefined();
+        if (param->type == JS_IDENT) {
+            js_env_declare(call_env, param->u.ident.name, pv, 0);
+        } else {
+            bind_pattern(param, pv, call_env);
+        }
     }
 
     struct js_node *body = fn.as.object->func_node->u.func.body;
@@ -161,6 +209,28 @@ js_value js_call(js_value fn, js_value this_val, js_value *args, int argc) {
         if (r.flow == JS_FLOW_RETURN) return r.value;
     }
     return js_undefined();
+}
+
+/* Evaluates a call/new argument list into `args` (capped at `cap`,
+ * matching JS_CALL's existing fixed-size buffer), expanding any
+ * JS_SPREAD entries element-by-element via their "length" prop --
+ * covers spreading a JS_OBJ_ARRAY, which is what f(...args) needs. */
+static int eval_args(struct js_node *arg_list, struct js_env *env, js_value *args, int cap) {
+    int argc = 0;
+    for (struct js_node *a = arg_list; a && argc < cap; a = a->next) {
+        if (a->type == JS_SPREAD) {
+            js_value sv = eval_expr(a->u.unary.operand, env);
+            if (sv.type == JS_OBJ) {
+                int32_t slen = js_to_num(js_get_prop(sv.as.object, "length"));
+                for (int32_t k = 0; k < slen && argc < cap; k++, argc++) {
+                    args[argc] = js_get_prop(sv.as.object, js_to_string(js_make_num(k)));
+                }
+            }
+        } else {
+            args[argc++] = eval_expr(a, env);
+        }
+    }
+    return argc;
 }
 
 static js_value eval_expr(struct js_node *node, struct js_env *env) {
@@ -183,8 +253,19 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
         case JS_ARRAY_LIT: {
             struct js_object *arr = js_new_object(JS_OBJ_ARRAY);
             int i = 0;
-            for (struct js_node *el = node->u.array_lit.elements; el; el = el->next, i++) {
-                js_set_prop(arr, js_to_string(js_make_num(i)), eval_expr(el, env));
+            for (struct js_node *el = node->u.array_lit.elements; el; el = el->next) {
+                if (el->type == JS_SPREAD) {
+                    js_value sv = eval_expr(el->u.unary.operand, env);
+                    if (sv.type == JS_OBJ) {
+                        int32_t slen = js_to_num(js_get_prop(sv.as.object, "length"));
+                        for (int32_t k = 0; k < slen; k++, i++) {
+                            js_set_prop(arr, js_to_string(js_make_num(i)), js_get_prop(sv.as.object, js_to_string(js_make_num(k))));
+                        }
+                    }
+                } else {
+                    js_set_prop(arr, js_to_string(js_make_num(i)), eval_expr(el, env));
+                    i++;
+                }
             }
             js_set_prop(arr, "length", js_make_num(i));
             return js_make_object(arr);
@@ -201,6 +282,67 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
             fn->func_node = node;
             fn->closure_env = env;
             return js_make_object(fn);
+        }
+        case JS_ARROW_FUNC: {
+            struct js_object *fn = js_new_object(JS_OBJ_ARROW);
+            fn->func_node = node;
+            fn->closure_env = env;
+            return js_make_object(fn);
+        }
+        case JS_CLASS_EXPR: {
+            struct js_object *cls = js_new_object(JS_OBJ_FUNCTION);
+            cls->func_node = node;
+            cls->closure_env = env;
+            return js_make_object(cls);
+        }
+        case JS_NEW: {
+            js_value ctor = eval_expr(node->u.call.callee, env);
+            js_value args[8];
+            int argc = eval_args(node->u.call.args, env, args, 8);
+            if (ctor.type != JS_OBJ || (ctor.as.object->kind != JS_OBJ_FUNCTION && ctor.as.object->kind != JS_OBJ_ARROW)) {
+                serial_printf("js: 'new' target is not a constructor\n");
+                return js_undefined();
+            }
+            struct js_object *instance = js_new_object(JS_OBJ_PLAIN);
+            js_value instance_val = js_make_object(instance);
+            struct js_node *class_node = ctor.as.object->func_node;
+            if (class_node->type == JS_CLASS_DECL || class_node->type == JS_CLASS_EXPR) {
+                js_value constructor_fn = js_undefined();
+                int has_constructor = 0;
+                for (struct js_node *m = class_node->u.class_decl.methods; m; m = m->next) {
+                    struct js_object *method = js_new_object(JS_OBJ_FUNCTION);
+                    method->func_node = m;
+                    method->closure_env = ctor.as.object->closure_env;
+                    if (strcmp(m->u.func.name, "constructor") == 0) {
+                        constructor_fn = js_make_object(method);
+                        has_constructor = 1;
+                    } else {
+                        js_set_prop(instance, m->u.func.name, js_make_object(method));
+                    }
+                }
+                if (has_constructor) js_call(constructor_fn, instance_val, args, argc);
+            } else {
+                /* `new` on a plain function: no methods to copy, just run
+                 * its body with `this` bound to the new object. */
+                js_call(ctor, instance_val, args, argc);
+            }
+            return instance_val;
+        }
+        case JS_TEMPLATE_LIT: {
+            /* Fixed-size part buffer, same style as JS_CALL's args[8] --
+             * plenty for real-world template strings, and this engine
+             * has no dynamic array to fall back to mid-expression. */
+            const char *strs[32];
+            int n = 0;
+            for (struct js_node *p = node->u.template_lit.parts; p && n < 32; p = p->next, n++) {
+                strs[n] = js_to_string(eval_expr(p, env));
+            }
+            uint32_t total = 0;
+            for (int k = 0; k < n; k++) total += (uint32_t)strlen(strs[k]);
+            char *out = (char *)js_alloc(total + 1);
+            out[0] = 0;
+            for (int k = 0; k < n; k++) strcat(out, strs[k]);
+            return js_make_str(out);
         }
         case JS_MEMBER:
             return eval_lvalue_get(node, env);
@@ -219,10 +361,7 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
                 fn = eval_expr(node->u.call.callee, env);
             }
             js_value args[8];
-            int argc = 0;
-            for (struct js_node *a = node->u.call.args; a && argc < 8; a = a->next, argc++) {
-                args[argc] = eval_expr(a, env);
-            }
+            int argc = eval_args(node->u.call.args, env, args, 8);
             return js_call(fn, this_val, args, argc);
         }
         case JS_ASSIGN: {
@@ -252,6 +391,7 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
                     case JS_NUM: return js_make_str("number");
                     case JS_STR: return js_make_str("string");
                     case JS_OBJ: return js_make_str(v.as.object->kind == JS_OBJ_FUNCTION ||
+                                                     v.as.object->kind == JS_OBJ_ARROW ||
                                                      v.as.object->kind == JS_OBJ_NATIVE ? "function" : "object");
                 }
             }
@@ -284,12 +424,23 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
 
 static struct js_result eval_stmt(struct js_node *node, struct js_env *env) {
     switch (node->type) {
-        case JS_VAR_DECL:
-            js_env_declare(env, node->u.var_decl.name,
-                            node->u.var_decl.init ? eval_expr(node->u.var_decl.init, env) : js_undefined(), 0);
+        case JS_VAR_DECL: {
+            js_value v = node->u.var_decl.init ? eval_expr(node->u.var_decl.init, env) : js_undefined();
+            if (node->u.var_decl.pattern) bind_pattern(node->u.var_decl.pattern, v, env);
+            else js_env_declare(env, node->u.var_decl.name, v, 0);
             return js_result_normal();
+        }
         case JS_FUNC_DECL:
             return js_result_normal(); /* already hoisted */
+        case JS_CLASS_DECL: {
+            /* Not hoisted (see hoist()'s doc comment) -- available from
+             * this statement onward, same as a `const X = function(){}`. */
+            struct js_object *cls = js_new_object(JS_OBJ_FUNCTION);
+            cls->func_node = node;
+            cls->closure_env = env;
+            js_env_declare(env, node->u.class_decl.name, js_make_object(cls), 0);
+            return js_result_normal();
+        }
         case JS_EXPR_STMT:
             eval_expr(node->u.expr_stmt.expr, env);
             return js_result_normal();

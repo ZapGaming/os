@@ -118,7 +118,7 @@ const char *js_to_string(js_value v) {
         }
         case JS_OBJ:
             return v.as.object->kind == JS_OBJ_ARRAY ? "[array]" :
-                   v.as.object->kind == JS_OBJ_FUNCTION ? "[function]" : "[object]";
+                   (v.as.object->kind == JS_OBJ_FUNCTION || v.as.object->kind == JS_OBJ_ARROW) ? "[function]" : "[object]";
     }
     return "";
 }

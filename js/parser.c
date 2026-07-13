@@ -33,6 +33,158 @@ static struct js_node *parse_assign(struct js_lexer *lx);
 static struct js_node *parse_statement(struct js_lexer *lx);
 static struct js_node *parse_block(struct js_lexer *lx);
 static struct js_node *parse_func_body_and_params(struct js_lexer *lx, struct js_node **params_out);
+static struct js_node *parse_binding_target(struct js_lexer *lx);
+static struct js_node *parse_arg_list(struct js_lexer *lx);
+static struct js_node *parse_class_body(struct js_lexer *lx, struct js_node *cls);
+static struct js_node *parse_template_literal(struct js_lexer *lx);
+
+/* Shared by function params, arrow-function params, and destructuring
+ * var declarations: an identifier, or an object/array destructuring
+ * pattern (which can itself nest). Returns NULL (consuming nothing
+ * committed as a pattern) if the current token can't start one, so
+ * callers that are only guessing -- see try_parse_arrow_function --
+ * can tell "not a binding target" apart from a real parse error. */
+static struct js_node *parse_binding_target(struct js_lexer *lx) {
+    if (lx->cur.type == TOK_IDENT) {
+        struct js_node *p = js_node_new(JS_IDENT);
+        p->u.ident.name = js_strdup(lx->cur.text);
+        js_lexer_next(lx);
+        return p;
+    }
+    if (eat_punct(lx, "{")) {
+        struct js_node *n = js_node_new(JS_OBJECT_PATTERN);
+        struct js_node *head = NULL, *tail = NULL;
+        while (!is_punct(lx, "}") && lx->cur.type != TOK_EOF) {
+            struct js_node *prop = js_node_new(JS_VAR_DECL);
+            prop->u.var_decl.name = js_strdup(lx->cur.text); /* source key */
+            js_lexer_next(lx);
+            if (eat_punct(lx, ":")) {
+                prop->u.var_decl.init = parse_binding_target(lx); /* `{a: renamed}` */
+            } else {
+                struct js_node *ident = js_node_new(JS_IDENT);
+                ident->u.ident.name = js_strdup(prop->u.var_decl.name);
+                prop->u.var_decl.init = ident; /* shorthand `{a}` */
+            }
+            if (!head) head = prop; else tail->next = prop;
+            tail = prop;
+            if (!eat_punct(lx, ",")) break;
+        }
+        expect_punct(lx, "}");
+        n->u.object_lit.props = head;
+        return n;
+    }
+    if (eat_punct(lx, "[")) {
+        struct js_node *n = js_node_new(JS_ARRAY_PATTERN);
+        struct js_node *head = NULL, *tail = NULL;
+        while (!is_punct(lx, "]") && lx->cur.type != TOK_EOF) {
+            struct js_node *el = parse_binding_target(lx);
+            if (!el) break;
+            if (!head) head = el; else tail->next = el;
+            tail = el;
+            if (!eat_punct(lx, ",")) break;
+        }
+        expect_punct(lx, "]");
+        n->u.array_lit.elements = head;
+        return n;
+    }
+    return NULL;
+}
+
+/* Call-argument list, `(` already consumed; consumes the closing `)`.
+ * Shared by ordinary calls and `new` so spread (`f(...args)`) only
+ * needs to be handled in one place. */
+static struct js_node *parse_arg_list(struct js_lexer *lx) {
+    struct js_node *head = NULL, *tail = NULL;
+    while (!is_punct(lx, ")") && lx->cur.type != TOK_EOF) {
+        struct js_node *arg;
+        if (eat_punct(lx, "...")) {
+            arg = js_node_new(JS_SPREAD);
+            arg->u.unary.operand = parse_assign(lx);
+        } else {
+            arg = parse_assign(lx);
+        }
+        if (!head) head = arg; else tail->next = arg;
+        tail = arg;
+        if (!eat_punct(lx, ",")) break;
+    }
+    expect_punct(lx, ")");
+    return head;
+}
+
+/* Splits a TOK_TEMPLATE's raw body into alternating STR_LIT chunks and
+ * interpolated-expression nodes chained through ->next (always starts
+ * and ends with a chunk, possibly empty, so the interpreter can just
+ * concatenate js_to_string() of every part in order). Each ${...} gets
+ * its own throwaway sub-lexer over that byte range so the full
+ * expression grammar (whatever parse_expr already handles) is
+ * available inside interpolations. */
+static struct js_node *parse_template_literal(struct js_lexer *lx) {
+    const char *raw = lx->cur.template_raw;
+    uint32_t len = lx->cur.template_len;
+    js_lexer_next(lx);
+
+    struct js_node *head = NULL, *tail = NULL;
+    uint32_t i = 0;
+    for (;;) {
+        uint32_t start = i;
+        while (i < len && !(raw[i] == '$' && i + 1 < len && raw[i + 1] == '{')) i++;
+        uint32_t seg_len = i - start;
+        char *chunk = (char *)js_alloc(seg_len + 1);
+        int ci = 0;
+        for (uint32_t k = start; k < i;) {
+            char ch = raw[k];
+            if (ch == '\\' && k + 1 < i) { k++; ch = js_lexer_decode_escape(raw[k]); }
+            chunk[ci++] = ch;
+            k++;
+        }
+        chunk[ci] = 0;
+        struct js_node *strn = js_node_new(JS_STR_LIT);
+        strn->u.str_lit.value = chunk;
+        if (!head) head = strn; else tail->next = strn;
+        tail = strn;
+
+        if (i >= len) break;
+        i += 2; /* skip "${" */
+        uint32_t expr_start = i;
+        int depth = 1;
+        while (i < len && depth > 0) {
+            if (raw[i] == '{') depth++;
+            else if (raw[i] == '}') { depth--; if (depth == 0) break; }
+            i++;
+        }
+        struct js_lexer sub;
+        js_lexer_init(&sub, raw + expr_start, i - expr_start);
+        struct js_node *expr = parse_expr(&sub);
+        tail->next = expr;
+        tail = expr;
+        if (i < len) i++; /* skip '}' */
+    }
+
+    struct js_node *n = js_node_new(JS_TEMPLATE_LIT);
+    n->u.template_lit.parts = head;
+    return n;
+}
+
+/* Class body: a sequence of `name(params) { body }` methods, one of
+ * which may be named "constructor". No getters/setters/static/fields --
+ * this engine has no prototype chain (see js.h's JS_OBJ kinds), so
+ * `new` just copies bound method closures onto a plain object (see
+ * js/interp.c's JS_NEW); that only needs methods, not the extra forms. */
+static struct js_node *parse_class_body(struct js_lexer *lx, struct js_node *cls) {
+    expect_punct(lx, "{");
+    struct js_node *head = NULL, *tail = NULL;
+    while (!is_punct(lx, "}") && lx->cur.type != TOK_EOF) {
+        struct js_node *m = js_node_new(JS_FUNC_EXPR);
+        m->u.func.name = js_strdup(lx->cur.text);
+        js_lexer_next(lx);
+        m->u.func.body = parse_func_body_and_params(lx, &m->u.func.params);
+        if (!head) head = m; else tail->next = m;
+        tail = m;
+    }
+    expect_punct(lx, "}");
+    cls->u.class_decl.methods = head;
+    return cls;
+}
 
 static struct js_node *parse_primary(struct js_lexer *lx) {
     if (lx->cur.type == TOK_NUM) {
@@ -56,6 +208,7 @@ static struct js_node *parse_primary(struct js_lexer *lx) {
     if (eat_keyword(lx, "null")) return js_node_new(JS_NULL_LIT);
     if (eat_keyword(lx, "undefined")) return js_node_new(JS_UNDEF_LIT);
     if (eat_keyword(lx, "this")) return js_node_new(JS_THIS);
+    if (lx->cur.type == TOK_TEMPLATE) return parse_template_literal(lx);
     if (lx->cur.type == TOK_IDENT) {
         struct js_node *n = js_node_new(JS_IDENT);
         n->u.ident.name = js_strdup(lx->cur.text);
@@ -68,6 +221,45 @@ static struct js_node *parse_primary(struct js_lexer *lx) {
         n->u.func.body = parse_func_body_and_params(lx, &n->u.func.params);
         return n;
     }
+    if (eat_keyword(lx, "class")) {
+        struct js_node *n = js_node_new(JS_CLASS_EXPR);
+        if (lx->cur.type == TOK_IDENT) { n->u.class_decl.name = js_strdup(lx->cur.text); js_lexer_next(lx); }
+        return parse_class_body(lx, n);
+    }
+    if (eat_keyword(lx, "new")) {
+        /* NewExpression: callee is a member chain (no calls), followed by
+         * at most one argument list -- `new a.b.C(1).d` means
+         * `(new a.b.C(1)).d`, not `new (a.b.C(1).d)`. Returning the
+         * JS_NEW node from here (instead of parsing it inline in
+         * parse_call_member) lets that function's normal `.`/`[]`/`(`
+         * loop take over afterward and chain correctly off the result. */
+        struct js_node *n = js_node_new(JS_NEW);
+        struct js_node *callee = parse_primary(lx);
+        for (;;) {
+            if (eat_punct(lx, ".")) {
+                struct js_node *m = js_node_new(JS_MEMBER);
+                m->u.member.object = callee;
+                struct js_node *prop = js_node_new(JS_IDENT);
+                prop->u.ident.name = js_strdup(lx->cur.text);
+                js_lexer_next(lx);
+                m->u.member.property = prop;
+                m->u.member.computed = 0;
+                callee = m;
+            } else if (eat_punct(lx, "[")) {
+                struct js_node *m = js_node_new(JS_MEMBER);
+                m->u.member.object = callee;
+                m->u.member.property = parse_expr(lx);
+                m->u.member.computed = 1;
+                expect_punct(lx, "]");
+                callee = m;
+            } else {
+                break;
+            }
+        }
+        n->u.call.callee = callee;
+        if (eat_punct(lx, "(")) n->u.call.args = parse_arg_list(lx);
+        return n;
+    }
     if (eat_punct(lx, "(")) {
         struct js_node *n = parse_expr(lx);
         expect_punct(lx, ")");
@@ -77,7 +269,13 @@ static struct js_node *parse_primary(struct js_lexer *lx) {
         struct js_node *n = js_node_new(JS_ARRAY_LIT);
         struct js_node *head = NULL, *tail = NULL;
         while (!is_punct(lx, "]") && lx->cur.type != TOK_EOF) {
-            struct js_node *el = parse_assign(lx);
+            struct js_node *el;
+            if (eat_punct(lx, "...")) {
+                el = js_node_new(JS_SPREAD);
+                el->u.unary.operand = parse_assign(lx);
+            } else {
+                el = parse_assign(lx);
+            }
             if (!head) head = el; else tail->next = el;
             tail = el;
             if (!eat_punct(lx, ",")) break;
@@ -136,15 +334,7 @@ static struct js_node *parse_call_member(struct js_lexer *lx) {
         } else if (eat_punct(lx, "(")) {
             struct js_node *c = js_node_new(JS_CALL);
             c->u.call.callee = n;
-            struct js_node *head = NULL, *tail = NULL;
-            while (!is_punct(lx, ")") && lx->cur.type != TOK_EOF) {
-                struct js_node *arg = parse_assign(lx);
-                if (!head) head = arg; else tail->next = arg;
-                tail = arg;
-                if (!eat_punct(lx, ",")) break;
-            }
-            expect_punct(lx, ")");
-            c->u.call.args = head;
+            c->u.call.args = parse_arg_list(lx);
             n = c;
         } else {
             break;
@@ -248,7 +438,57 @@ static struct js_node *parse_conditional(struct js_lexer *lx) {
     return test;
 }
 
+/* Arrow functions (`x => ...`, `(a, b) => ...`) share a prefix with a
+ * parenthesized expression and a plain identifier, so there's no way to
+ * tell without looking past the closing `)` for `=>`. Snapshot the
+ * lexer (a flat struct -- `src` just points at the caller's buffer, so
+ * a copy/restore is safe and cheap) and speculatively parse a param
+ * list; restore and return NULL if it doesn't pan out. */
+static struct js_node *try_parse_arrow_function(struct js_lexer *lx) {
+    struct js_lexer save = *lx;
+    struct js_node *params = NULL;
+    int ok = 0;
+
+    if (lx->cur.type == TOK_IDENT) {
+        struct js_node *p = js_node_new(JS_IDENT);
+        p->u.ident.name = js_strdup(lx->cur.text);
+        js_lexer_next(lx);
+        if (is_punct(lx, "=>")) { params = p; ok = 1; }
+    } else if (is_punct(lx, "(")) {
+        js_lexer_next(lx);
+        struct js_node *head = NULL, *tail = NULL;
+        int bad = 0;
+        while (!is_punct(lx, ")") && lx->cur.type != TOK_EOF) {
+            struct js_node *p = parse_binding_target(lx);
+            if (!p) { bad = 1; break; }
+            if (!head) head = p; else tail->next = p;
+            tail = p;
+            if (!eat_punct(lx, ",")) break;
+        }
+        if (!bad && eat_punct(lx, ")") && is_punct(lx, "=>")) { params = head; ok = 1; }
+    }
+
+    if (!ok) { *lx = save; return NULL; }
+
+    js_lexer_next(lx); /* consume "=>" */
+    struct js_node *n = js_node_new(JS_ARROW_FUNC);
+    n->u.func.params = params;
+    if (is_punct(lx, "{")) {
+        n->u.func.body = parse_block(lx);
+    } else {
+        /* Expression body: `x => x + 1` behaves like `x => { return x + 1; }`. */
+        struct js_node *ret = js_node_new(JS_RETURN);
+        ret->u.return_stmt.value = parse_assign(lx);
+        struct js_node *block = js_node_new(JS_BLOCK);
+        block->u.block.stmts = ret;
+        n->u.func.body = block;
+    }
+    return n;
+}
+
 static struct js_node *parse_assign(struct js_lexer *lx) {
+    struct js_node *arrow = try_parse_arrow_function(lx);
+    if (arrow) return arrow;
     struct js_node *left = parse_conditional(lx);
     static const char *ops[] = {"=", "+=", "-=", "*=", "/=", "%="};
     for (unsigned i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
@@ -280,8 +520,12 @@ static struct js_node *parse_var_decl_list(struct js_lexer *lx) {
     struct js_node *head = NULL, *tail = NULL;
     for (;;) {
         struct js_node *n = js_node_new(JS_VAR_DECL);
-        n->u.var_decl.name = js_strdup(lx->cur.text);
-        js_lexer_next(lx);
+        if (is_punct(lx, "{") || is_punct(lx, "[")) {
+            n->u.var_decl.pattern = parse_binding_target(lx);
+        } else {
+            n->u.var_decl.name = js_strdup(lx->cur.text);
+            js_lexer_next(lx);
+        }
         if (eat_punct(lx, "=")) n->u.var_decl.init = parse_assign(lx);
         if (!head) head = n; else tail->next = n;
         tail = n;
@@ -293,10 +537,9 @@ static struct js_node *parse_var_decl_list(struct js_lexer *lx) {
 static struct js_node *parse_func_body_and_params(struct js_lexer *lx, struct js_node **params_out) {
     expect_punct(lx, "(");
     struct js_node *phead = NULL, *ptail = NULL;
-    while (lx->cur.type == TOK_IDENT) {
-        struct js_node *p = js_node_new(JS_IDENT);
-        p->u.ident.name = js_strdup(lx->cur.text);
-        js_lexer_next(lx);
+    while (!is_punct(lx, ")") && lx->cur.type != TOK_EOF) {
+        struct js_node *p = parse_binding_target(lx);
+        if (!p) { parse_error(lx, "parameter"); break; }
         if (!phead) phead = p; else ptail->next = p;
         ptail = p;
         if (!eat_punct(lx, ",")) break;
@@ -341,6 +584,12 @@ static struct js_node *parse_statement(struct js_lexer *lx) {
         js_lexer_next(lx);
         n->u.func.body = parse_func_body_and_params(lx, &n->u.func.params);
         return n;
+    }
+    if (eat_keyword(lx, "class")) {
+        struct js_node *n = js_node_new(JS_CLASS_DECL);
+        n->u.class_decl.name = js_strdup(lx->cur.text);
+        js_lexer_next(lx);
+        return parse_class_body(lx, n);
     }
     if (eat_keyword(lx, "if")) {
         struct js_node *n = js_node_new(JS_IF);

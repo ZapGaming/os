@@ -4,6 +4,12 @@
 static const char *keywords[] = {
     "var", "let", "const", "function", "return", "if", "else", "for", "while",
     "break", "continue", "true", "false", "null", "undefined", "this", "typeof",
+    "class", "new",
+    /* Deliberately no "extends": this engine has no prototype chain, so
+     * class inheritance is out of scope (see js/interp.c's JS_NEW). Not
+     * lexing it as a keyword means `class Foo extends Bar {}` fails with
+     * an honest parse error (unexpected identifier "extends" where `{`
+     * was expected) instead of silently dropping the parent class. */
 };
 
 static int is_keyword(const char *text) {
@@ -40,13 +46,13 @@ static void skip_ws_and_comments(struct js_lexer *lx) {
     }
 }
 
-static char decode_escape(char c) {
+char js_lexer_decode_escape(char c) {
     switch (c) {
         case 'n': return '\n';
         case 't': return '\t';
         case 'r': return '\r';
         case '0': return '\0';
-        default: return c; /* \\, \', \", and anything else pass through literally */
+        default: return c; /* \\, \', \", \`, \$, and anything else pass through literally */
     }
 }
 
@@ -82,6 +88,42 @@ void js_lexer_next(struct js_lexer *lx) {
         return;
     }
 
+    if (c == '`') {
+        /* Template literal: scan for the matching closing backtick without
+         * decoding or splitting on ${...} here -- js/parser.c re-walks
+         * template_raw/template_len to build alternating string-chunk and
+         * interpolated-expression nodes (it needs a whole sub-lexer per
+         * interpolation, which this single-token lexer can't hand back).
+         * Brace-depth tracking only applies inside a ${...}: a bare
+         * backtick nested inside one (e.g. a string literal in the
+         * interpolated expression) isn't handled -- rare enough in
+         * generated JS to accept as a scope limit. */
+        lx->pos++;
+        uint32_t start = lx->pos;
+        int depth = 0;
+        while (lx->pos < lx->len) {
+            char ch = lx->src[lx->pos];
+            if (depth == 0 && ch == '`') break;
+            if (ch == '\\' && lx->pos + 1 < lx->len) { lx->pos += 2; continue; }
+            if (depth == 0 && ch == '$' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '{') {
+                depth = 1;
+                lx->pos += 2;
+                continue;
+            }
+            if (depth > 0) {
+                if (ch == '{') depth++;
+                else if (ch == '}') depth--;
+            }
+            lx->pos++;
+        }
+        lx->cur.template_raw = lx->src + start;
+        lx->cur.template_len = lx->pos - start;
+        lx->cur.text[0] = 0;
+        if (lx->pos < lx->len) lx->pos++; /* closing backtick */
+        lx->cur.type = TOK_TEMPLATE;
+        return;
+    }
+
     if (c == '"' || c == '\'') {
         char quote = c;
         lx->pos++;
@@ -90,7 +132,7 @@ void js_lexer_next(struct js_lexer *lx) {
             char ch = lx->src[lx->pos];
             if (ch == '\\' && lx->pos + 1 < lx->len) {
                 lx->pos++;
-                ch = decode_escape(lx->src[lx->pos]);
+                ch = js_lexer_decode_escape(lx->src[lx->pos]);
             }
             lx->cur.text[i++] = ch;
             lx->pos++;
@@ -113,9 +155,9 @@ void js_lexer_next(struct js_lexer *lx) {
     }
 
     /* Punctuation -- longest match first. */
-    static const char *three[] = {"===", "!=="};
+    static const char *three[] = {"===", "!==", "..."};
     static const char *two[] = {"==", "!=", "<=", ">=", "&&", "||", "++", "--",
-                                 "+=", "-=", "*=", "/=", "%="};
+                                 "+=", "-=", "*=", "/=", "%=", "=>"};
 
     for (unsigned t = 0; t < sizeof(three) / sizeof(three[0]); t++) {
         uint32_t l = (uint32_t)strlen(three[t]);

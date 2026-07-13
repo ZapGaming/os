@@ -33,7 +33,11 @@ typedef struct js_value {
     } as;
 } js_value;
 
-enum js_obj_kind { JS_OBJ_PLAIN, JS_OBJ_ARRAY, JS_OBJ_FUNCTION, JS_OBJ_NATIVE, JS_OBJ_DOM_ELEMENT, JS_OBJ_DOM_STYLE };
+/* JS_OBJ_ARROW is split out from JS_OBJ_FUNCTION only so js_call() can
+ * tell them apart: an arrow function must NOT get its own `this`
+ * binding (it resolves lexically through closure_env), everything else
+ * about invoking one is identical to a regular function. */
+enum js_obj_kind { JS_OBJ_PLAIN, JS_OBJ_ARRAY, JS_OBJ_FUNCTION, JS_OBJ_ARROW, JS_OBJ_NATIVE, JS_OBJ_DOM_ELEMENT, JS_OBJ_DOM_STYLE };
 
 struct js_prop {
     char *name;
@@ -105,6 +109,16 @@ enum js_node_type {
     JS_IDENT, JS_ARRAY_LIT, JS_OBJECT_LIT, JS_FUNC_EXPR,
     JS_BINARY, JS_LOGICAL, JS_UNARY, JS_UPDATE, JS_ASSIGN,
     JS_CALL, JS_MEMBER, JS_CONDITIONAL, JS_SEQ,
+    /* ES6+ additions -- see js/parser.c and js/interp.c for how each is
+     * built/evaluated. */
+    JS_ARROW_FUNC,      /* func-shaped: params+body; name unused */
+    JS_CLASS_DECL,      /* statement form: `class Foo { ... }` */
+    JS_CLASS_EXPR,      /* expression form: `class { ... }` / `class Foo { ... }` as a value */
+    JS_NEW,             /* call-shaped: callee+args, e.g. `new Foo(1)` */
+    JS_TEMPLATE_LIT,    /* backtick string; `parts` alternates STR_LIT chunks and interpolated exprs */
+    JS_SPREAD,          /* unary-shaped: operand is the spread expression, in array lits / call args */
+    JS_ARRAY_PATTERN,   /* array_lit-shaped destructuring target: `[a, b]` */
+    JS_OBJECT_PATTERN,  /* object_lit-shaped destructuring target: `{a, b}` / `{a: x}` */
 };
 
 struct js_node {
@@ -112,8 +126,11 @@ struct js_node {
     struct js_node *next; /* sibling: statement lists, argument lists, etc. */
     union {
         struct { struct js_node *body; } program;
-        struct { char *name; struct js_node *init; } var_decl; /* one node per declarator */
-        struct { char *name; struct js_node *params; struct js_node *body; } func;
+        /* one node per declarator; destructuring (`const {a,b}=o`) sets
+         * `pattern` (an ARRAY_PATTERN/OBJECT_PATTERN node) and leaves
+         * `name` NULL instead of using a plain identifier name. */
+        struct { char *name; struct js_node *init; struct js_node *pattern; } var_decl;
+        struct { char *name; struct js_node *params; struct js_node *body; } func; /* also used for ARROW_FUNC and class methods */
         struct { struct js_node *test, *cons, *alt; } if_stmt;
         struct { struct js_node *init, *test, *update, *body; } for_stmt;
         struct { struct js_node *test, *body; } while_stmt;
@@ -124,15 +141,17 @@ struct js_node {
         struct { char *value; } str_lit;
         struct { int value; } bool_lit;
         struct { char *name; } ident;
-        struct { struct js_node *elements; } array_lit;
-        struct { struct js_node *props; } object_lit; /* each: var_decl-shaped, name+init */
+        struct { struct js_node *elements; } array_lit; /* also used for ARRAY_PATTERN */
+        struct { struct js_node *props; } object_lit; /* each: var_decl-shaped, name+init; also used for OBJECT_PATTERN (name=source key, init=target) */
         struct { const char *op; struct js_node *left, *right; } binary;
-        struct { const char *op; struct js_node *operand; int prefix; } unary;
+        struct { const char *op; struct js_node *operand; int prefix; } unary; /* also used for SPREAD (operand only) */
         struct { const char *op; struct js_node *target; struct js_node *value; } assign;
-        struct { struct js_node *callee; struct js_node *args; } call;
+        struct { struct js_node *callee; struct js_node *args; } call; /* also used for NEW */
         struct { struct js_node *object; struct js_node *property; int computed; } member;
         struct { struct js_node *test, *cons, *alt; } conditional;
         struct { struct js_node *left, *right; } seq;
+        struct { char *name; struct js_node *methods; } class_decl; /* methods: func-shaped nodes, chained; one may be named "constructor" */
+        struct { struct js_node *parts; } template_lit;
     } u;
 };
 
