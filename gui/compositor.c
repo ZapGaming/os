@@ -46,6 +46,7 @@ typedef struct {
     int is_network;
     int is_file_manager;
     int is_browser;
+    int open;
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -55,6 +56,9 @@ static int window_count = 0;
 static int dragging_window = -1;
 static int drag_dx = 0, drag_dy = 0;
 static int prev_left = 0;
+static int start_menu_open = 0;
+
+#define TASKBAR_MENU_ROW_H 26
 
 static const uint32_t COL_BG_TOP    = 0x141B4D;
 static const uint32_t COL_BG_BOTTOM = 0x05060F;
@@ -120,6 +124,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->is_network = 0;
     win->is_file_manager = 0;
     win->is_browser = 0;
+    win->open = 1;
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -131,6 +136,16 @@ static void bring_to_front(int order_pos) {
         window_order[i] = window_order[i + 1];
     }
     window_order[window_count - 1] = wi;
+}
+
+/* Opens (if closed) and raises the window at windows[wi] -- used by the
+ * taskbar launcher, which addresses windows by their fixed slot index
+ * rather than by their current stacking position. */
+static void open_and_focus(int wi) {
+    windows[wi].open = 1;
+    for (int i = 0; i < window_count; i++) {
+        if (window_order[i] == wi) { bring_to_front(i); break; }
+    }
 }
 
 void gui_init(void) {
@@ -906,10 +921,29 @@ static void draw_taskbar(void) {
     fb_draw_line(0, y, fb_width(), y, 0x3A4270);
 
     /* start pill */
-    fb_fill_rect(12, y + 8, 90, TASKBAR_H - 16, 0x3E6FF0);
+    fb_fill_rect(12, y + 8, 90, TASKBAR_H - 16, start_menu_open ? 0x62D8FF : 0x3E6FF0);
     fb_draw_string(28, y + 16, "ZapOS", 0xFFFFFF, 1);
 
     draw_clock(fb_width() - 90, y + 12);
+}
+
+/* Popup launcher listing every window ZapOS knows about, open or closed --
+ * closing a window (via its titlebar's close button) only hides it, so
+ * this is also the only way to bring one back. Click the pill to toggle,
+ * click a row to open (or just re-focus) that window. */
+static void draw_start_menu(void) {
+    int rows = window_count;
+    int menu_h = rows * TASKBAR_MENU_ROW_H + 8;
+    int menu_y = fb_height() - TASKBAR_H - menu_h;
+    fb_fill_rect(12, menu_y, 200, menu_h, 0x141B33);
+    fb_draw_rect(12, menu_y, 200, menu_h, 0x3A4270);
+
+    for (int i = 0; i < rows; i++) {
+        int ry = menu_y + 4 + i * TASKBAR_MENU_ROW_H;
+        uint32_t dot = windows[i].open ? 0x7DF5A3 : 0x697588;
+        fb_fill_rect(20, ry + 8, 8, 8, dot);
+        fb_draw_string(38, ry + 6, windows[i].title, 0xF2F4FF, 1);
+    }
 }
 
 static void draw_cursor(int x, int y) {
@@ -922,12 +956,18 @@ static void draw_frame(int mx, int my) {
     fb_draw_string(24, 20, "ZapOS", COL_TEXT, 3);
     fb_draw_string(24, 56, "a custom 32-bit OS", COL_MUTED, 1);
 
+    int top_open_pos = -1;
+    for (int i = 0; i < window_count; i++) {
+        if (windows[window_order[i]].open) top_open_pos = i;
+    }
     for (int i = 0; i < window_count; i++) {
         int wi = window_order[i];
-        draw_window(&windows[wi], i == window_count - 1);
+        if (!windows[wi].open) continue;
+        draw_window(&windows[wi], i == top_open_pos);
     }
 
     draw_taskbar();
+    if (start_menu_open) draw_start_menu();
     draw_cursor(mx, my);
 }
 
@@ -941,34 +981,65 @@ void gui_run(void) {
         int left_edge = left_down && !prev_left;
 
         if (left_edge) {
-            int hit_titlebar = 0;
-            for (int oi = window_count - 1; oi >= 0; oi--) {
-                int wi = window_order[oi];
-                gui_window_t *w = &windows[wi];
-                if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + TITLEBAR_H) {
-                    bring_to_front(oi);
-                    dragging_window = wi;
-                    drag_dx = mx - w->x;
-                    drag_dy = my - w->y;
-                    hit_titlebar = 1;
-                    break;
-                }
-            }
-            /* Clicking anywhere deselects both text-input widgets; the
-             * specific click handler below re-focuses its own if the
-             * click actually landed on it. */
-            br_editing_url = 0;
-            if (fm_viewing_file) fm_editing = 0;
+            int taskbar_y = (int)fb_height() - TASKBAR_H;
+            int on_pill = mx >= 12 && mx < 12 + 90 && my >= taskbar_y + 8 && my < taskbar_y + TASKBAR_H - 8;
+            int menu_h = window_count * TASKBAR_MENU_ROW_H + 8;
+            int menu_y = taskbar_y - menu_h;
+            int on_menu = start_menu_open && mx >= 12 && mx < 12 + 200 && my >= menu_y && my < menu_y + menu_h;
+            int consumed = 0;
 
-            if (!hit_titlebar) {
+            if (on_pill) {
+                start_menu_open = !start_menu_open;
+                consumed = 1;
+            } else if (on_menu) {
+                int row = (my - menu_y - 4) / TASKBAR_MENU_ROW_H;
+                if (row >= 0 && row < window_count) open_and_focus(row);
+                start_menu_open = 0;
+                consumed = 1;
+            } else if (start_menu_open) {
+                /* Clicking anywhere else just dismisses the menu; the
+                 * click itself still falls through to normal handling. */
+                start_menu_open = 0;
+            }
+
+            if (!consumed) {
+                int hit_titlebar = 0;
                 for (int oi = window_count - 1; oi >= 0; oi--) {
                     int wi = window_order[oi];
                     gui_window_t *w = &windows[wi];
-                    if (mx >= w->x && mx < w->x + w->w && my >= w->y + TITLEBAR_H && my < w->y + w->h) {
-                        bring_to_front(oi);
-                        if (w->is_file_manager) fm_handle_click(w, my);
-                        else if (w->is_browser) br_handle_click(w, mx, my);
+                    if (!w->open) continue;
+                    if (mx >= w->x && mx < w->x + w->w && my >= w->y && my < w->y + TITLEBAR_H) {
+                        int cbx = w->x + w->w - 20, cby = w->y + 8;
+                        if (mx >= cbx && mx < cbx + 12 && my >= cby && my < cby + 12) {
+                            w->open = 0;
+                            dragging_window = -1;
+                        } else {
+                            bring_to_front(oi);
+                            dragging_window = wi;
+                            drag_dx = mx - w->x;
+                            drag_dy = my - w->y;
+                        }
+                        hit_titlebar = 1;
                         break;
+                    }
+                }
+                /* Clicking anywhere deselects both text-input widgets; the
+                 * specific click handler below re-focuses its own if the
+                 * click actually landed on it. */
+                br_editing_url = 0;
+                if (fm_viewing_file) fm_editing = 0;
+
+                if (!hit_titlebar) {
+                    for (int oi = window_count - 1; oi >= 0; oi--) {
+                        int wi = window_order[oi];
+                        gui_window_t *w = &windows[wi];
+                        if (!w->open) continue;
+                        if (mx >= w->x && mx < w->x + w->w && my >= w->y + TITLEBAR_H && my < w->y + w->h) {
+                            bring_to_front(oi);
+                            if (w->is_file_manager) fm_handle_click(w, my);
+                            else if (w->is_browser) br_handle_click(w, mx, my);
+                            break;
+                        }
                     }
                 }
             }
