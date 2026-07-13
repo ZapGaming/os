@@ -1348,10 +1348,7 @@ stack-machine interpreter — **i32 only**, no i64/f32/f64, matching the
 JS engine's own int32-only constraint one section up (this kernel is
 built `-mno-sse -mno-80387 -mgeneral-regs-only`, so a single float
 instruction anywhere in the interpreter's C code is a hard compile
-error, not a style choice). It isn't wired into the browser or JS
-engine yet — see "What's next" above for why (no `fetch()`/`ArrayBuffer`
-exists to hand it bytes in the first place) — but the interpreter core
-itself is complete and independently tested.
+error, not a style choice).
 
 The parser walks every standard MVP section (Type/Import/Function/
 Memory/Global/Export/Start/Code/Data), rejecting any f32/f64/i64 type
@@ -1397,6 +1394,57 @@ genuinely uses an i64 local — and rebuilding at `-O0` avoided the
 idiom; it's a good reminder that this scope cut will occasionally
 reject real-world `-O1`+ output for reasons that have nothing to do
 with what the source code actually says.
+
+**Wired into the browser.** A page's JS can now actually call
+`WebAssembly.instantiate(url)` and run a real compiled `.wasm` module.
+The shape is deliberately non-standard, forced by what this engine
+actually has: real `WebAssembly.instantiate()` takes an `ArrayBuffer`
+and a `Promise`; this one takes a URL string (resolved against the
+current page, same as an `<img src>`) and returns the resolved
+`{instance: {exports: {...}}}` object directly and synchronously,
+because this JS engine has neither `fetch()` nor `ArrayBuffer` nor
+`Promise` to do it the real way. Every function the module exports
+becomes a genuinely callable JS function.
+
+Two small pieces made this possible:
+
+- **`js_native_fn` gained a fourth parameter** — the calling native's
+  own `js_object*` — because a WASM export wrapper needs to remember
+  *which* `wasm_instance` and *which* export name it was created for,
+  and the previous three-argument signature (`this_val`, `args`, `argc`)
+  had no way to carry that. A new `native_data` field on `struct
+  js_object` holds it (arena-allocated, so it's freed for free on the
+  next page navigation). Every existing native (`console.log`,
+  `Math.*`) just ignores the new parameter.
+- **A registrable fetch callback** (`js_set_binary_fetcher()` in
+  `js/dom_binding.c`, mirroring the existing `js_set_console_sink()`
+  pattern) lets the browser (`gui/compositor.c`'s `br_wasm_fetch()`)
+  supply the actual bytes — it resolves the URL against the current
+  page's host/port/path (stashed in file-scope statics right before a
+  page's scripts run, since `js/dom_binding.c` has no reason to know
+  about `br_resolve_subresource()`/`http_get()` itself) and fetches it
+  exactly like an `<img>` subresource. `net/wasm.c`'s modules/instances
+  are `kmalloc`'d, not arena-allocated, so a small fixed-size table
+  (`WASM_INSTANCE_MAX` 4 live instances per page) tracks them for
+  explicit cleanup in `js_dom_reset()` on every navigation — the same
+  pattern already used for the onclick-handler table.
+
+Verified two ways: a host-side harness compiling the real
+`js/dom_binding.c` + `net/wasm.c` together, instantiating real `.wasm`
+files and calling their exports from real JS (multiple concurrent
+instances, calling an export via a plain variable reference rather than
+a method call, a missing export coming back `undefined`, a failed fetch
+failing cleanly); and a temporary boot-time self-test (removed before
+committing) that ran `WebAssembly.instantiate()` against an embedded
+`add.wasm` inside the actual booted kernel and printed `WASM_SELFTEST
+add(3,4)=7` to the serial log — which caught a real bug on the first
+attempt: the self-test forgot to call `js_arena_reset()` before running,
+so every single `js_alloc()` call silently failed over to the 256-byte
+OOM scratch buffer (see `js/value.c`), and nothing printed at all. Every
+real page load already calls `js_arena_reset()` before running scripts,
+so this was purely an artifact of the self-test skipping the setup a
+real page load always does — but it's exactly the kind of bug that only
+shows up by actually running the thing, not by reading the code.
 
 ## How the Terminal and shell work
 
@@ -1824,17 +1872,17 @@ done (see above). Rough order of what's next:
    and animated GIF remain -- JPEG needs a real DCT/Huffman decoder, a
    genuinely different algorithm family from PNG's chunk/filter approach
    and a substantial project on its own.
-10. **Wiring the WASM interpreter into the browser** — `net/wasm.c` is a
-    complete, host-tested WebAssembly binary-format parser and i32
-    stack-machine interpreter (see "How the WASM interpreter works"
-    below), but nothing in the browser or JS engine calls it yet: there's
-    no `WebAssembly` JS global, and no way for a page to hand it a
-    `.wasm` blob (this JS engine has no `fetch()`/`ArrayBuffer` to carry
-    the bytes in the first place). Exposing it for real would mean
-    picking a binding shape (likely a native `WebAssembly.instantiate`
-    that accepts an array of byte values, given there's no `ArrayBuffer`
-    type) and deciding how a page's exported WASM functions get called
-    back into from JS.
+10. **Growing the WASM/JS bridge** — `WebAssembly.instantiate(url)`
+    works now (see "How the WASM interpreter works" below for exactly
+    how), but it's a non-standard, synchronous, string-URL-only shape
+    forced by this engine having no `fetch()`/`ArrayBuffer`/`Promise`.
+    Adding any of those three (even a minimal one) would let this get
+    closer to the real API shape, and imported WASM functions still
+    can't be bound to a JS callback (an imported function traps cleanly
+    if actually called -- see `net/wasm.c` -- rather than calling back
+    into JS), so a module that expects host-provided imports (common in
+    real-world WASM, e.g. anything using `wasi_snapshot_preview1`) won't
+    run yet.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.

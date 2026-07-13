@@ -170,7 +170,7 @@ js_value js_call(js_value fn, js_value this_val, js_value *args, int argc) {
         return js_undefined();
     }
     if (fn.as.object->kind == JS_OBJ_NATIVE) {
-        return fn.as.object->native_fn(this_val, args, argc);
+        return fn.as.object->native_fn(this_val, args, argc, fn.as.object);
     }
     if (fn.as.object->kind != JS_OBJ_FUNCTION && fn.as.object->kind != JS_OBJ_ARROW) {
         serial_printf("js: attempted to call a non-function\n");

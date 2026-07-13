@@ -48,7 +48,13 @@ struct js_prop {
 struct js_node; /* AST, defined below */
 struct js_env;
 
-typedef js_value (*js_native_fn)(js_value this_val, js_value *args, int argc);
+/* `fn_obj` is the JS_OBJ_NATIVE object being called (== the object a
+ * plain js_native_fn ptr is stored on) -- passed through so a native
+ * can carry its own per-instance context via `native_data` below (e.g.
+ * a WASM export binding needs to remember *which* wasm_instance and
+ * *which* export name each wrapper function was created for). Existing
+ * natives that don't need context (console.log, Math.*) just ignore it. */
+typedef js_value (*js_native_fn)(js_value this_val, js_value *args, int argc, struct js_object *fn_obj);
 
 struct js_object {
     enum js_obj_kind kind;
@@ -58,6 +64,7 @@ struct js_object {
     struct js_env *closure_env;
     /* JS_OBJ_NATIVE */
     js_native_fn native_fn;
+    void *native_data; /* opaque, arena-allocated context for native_fn; NULL if unused */
     /* JS_OBJ_DOM_ELEMENT */
     struct dom_node *dom_node;
 };

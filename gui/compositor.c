@@ -48,6 +48,10 @@
  * truncate a chunk of the sheet (safely, just losing whatever rules
  * fell past the cut, not corrupting anything earlier). */
 #define BR_CSS_FETCH_CAP   (128u * 1024)
+/* A .wasm module fetched via WebAssembly.instantiate(url) -- see
+ * br_wasm_fetch() below. Generous like BR_IMAGE_FETCH_CAP; a hobby-scale
+ * compiled module is nowhere near this. */
+#define BR_WASM_FETCH_CAP  (512u * 1024)
 /* No dynamic collections anywhere in this file -- tabs, history, and
  * bookmarks are all fixed-size arrays, same as windows[]/fm_entries[]. */
 #define BR_MAX_TABS       6
@@ -136,6 +140,7 @@ static uint8_t *fm_audio_buf = NULL;
 static struct wav_info fm_wav;
 
 static void fm_refresh(void);
+static int br_wasm_fetch(const char *url, uint8_t **out_data, uint32_t *out_len);
 
 /* Browser state -- up to BR_MAX_TABS pages open at once (a fixed array,
  * same convention as every other collection in this file, e.g.
@@ -586,6 +591,7 @@ void gui_init(void) {
     }
 
     if (net_is_up()) {
+        js_set_binary_fetcher(br_wasm_fetch);
         int br = add_window(SX(600), SY(60), 500, 500, "Browser", "WWW", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
         br_window_idx = br;
@@ -1277,6 +1283,42 @@ static int br_resolve_subresource(const char *base_host, uint16_t base_port, con
     return 1;
 }
 
+/* The current page's own host/port/path/scheme, stashed right before
+ * running its scripts so br_wasm_fetch() (registered once with
+ * js_set_binary_fetcher(), called from deep inside the JS interpreter
+ * with nothing but a URL string to go on) can resolve a relative
+ * WebAssembly.instantiate(url) the same way an <img src> gets resolved. */
+static char br_wasm_ctx_host[64];
+static uint16_t br_wasm_ctx_port;
+static char br_wasm_ctx_path[64];
+static int br_wasm_ctx_is_https;
+
+/* js_binary_fetch_fn implementation (see include/js/dom_binding.h):
+ * resolves `url` against the page context above and fetches it exactly
+ * like an <img>/<link> subresource, handing the caller a kmalloc'd
+ * buffer it owns. */
+static int br_wasm_fetch(const char *url, uint8_t **out_data, uint32_t *out_len) {
+    char host[64], path[64];
+    uint16_t port;
+    int is_https = br_wasm_ctx_is_https;
+    if (!br_resolve_subresource(br_wasm_ctx_host, br_wasm_ctx_port, br_wasm_ctx_path, url,
+                                 host, sizeof(host), &port, path, sizeof(path), &is_https)) {
+        return 0;
+    }
+    uint8_t *buf = (uint8_t *)kmalloc(BR_WASM_FETCH_CAP + 1);
+    if (!buf) return 0;
+    int status;
+    uint32_t blen;
+    if (!http_get(is_https, host, port, path, &status, (char *)buf, BR_WASM_FETCH_CAP, &blen, NULL, 0) ||
+        status < 200 || status >= 300) {
+        kfree(buf);
+        return 0;
+    }
+    *out_data = buf;
+    *out_len = blen;
+    return 1;
+}
+
 /* Decoded <img> cache for the active tab's page (struct br_image_slot
  * and the per-tab `images`/`image_count` fields are declared with the
  * rest of br_tab_t, up near the other browser state) -- keyed by the
@@ -1467,6 +1509,13 @@ static void br_fetch_page(br_tab_t *t, int record_history) {
         /* Scripts run before the first layout so DOM mutations they
          * make (innerHTML, textContent, style) show up immediately
          * rather than requiring a second pass. */
+        strncpy(br_wasm_ctx_host, host, sizeof(br_wasm_ctx_host) - 1);
+        br_wasm_ctx_host[sizeof(br_wasm_ctx_host) - 1] = 0;
+        br_wasm_ctx_port = port;
+        strncpy(br_wasm_ctx_path, path, sizeof(br_wasm_ctx_path) - 1);
+        br_wasm_ctx_path[sizeof(br_wasm_ctx_path) - 1] = 0;
+        br_wasm_ctx_is_https = is_https;
+
         struct js_env *global_env = js_make_global_env(t->dom_root);
         js_run_inline_scripts(body, body_len, global_env);
         js_dom_clear_relayout_flag();

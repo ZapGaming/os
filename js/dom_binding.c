@@ -2,10 +2,36 @@
 #include <js/lexer.h>
 #include <kernel/kheap.h>
 #include <kernel/serial.h>
+#include <net/wasm.h>
 #include <string.h>
 
 #define ONCLICK_MAX 32
 #define TEXT_CONTENT_MAX 512
+
+/* WebAssembly.instantiate(url) needs raw bytes from somewhere, but this
+ * engine has no fetch()/ArrayBuffer to carry them in JS -- so instead
+ * of a byte source, the browser (which already knows how to resolve a
+ * relative URL against the current page and fetch it) registers a
+ * callback here. `*out_data` is kmalloc'd; caller (native_wasm_instantiate)
+ * frees it once wasm_parse_module() has copied what it needs. */
+static js_binary_fetch_fn g_binary_fetcher = NULL;
+void js_set_binary_fetcher(js_binary_fetch_fn fn) { g_binary_fetcher = fn; }
+
+/* WASM modules/instances are kmalloc'd (their own allocator, per
+ * net/wasm.h), not arena-allocated, so they need explicit cleanup --
+ * same reasoning as onclick_table below, and cleared alongside it in
+ * js_dom_reset() since both are per-page state that outlives nothing
+ * past a navigation. */
+#define WASM_INSTANCE_MAX 4
+static struct wasm_module wasm_modules[WASM_INSTANCE_MAX];
+static struct wasm_instance wasm_instances[WASM_INSTANCE_MAX];
+static int wasm_slot_used[WASM_INSTANCE_MAX];
+
+struct js_wasm_export_binding {
+    struct wasm_instance *inst;
+    char name[WASM_MAX_NAME_LEN];
+    int has_result;
+};
 
 static struct dom_node *g_document_root = NULL;
 static int g_needs_relayout = 0;
@@ -34,6 +60,13 @@ void js_dom_reset(void) {
     onclick_count = 0;
     g_needs_relayout = 0;
     g_document_root = NULL;
+    for (int i = 0; i < WASM_INSTANCE_MAX; i++) {
+        if (wasm_slot_used[i]) {
+            wasm_free_instance(&wasm_instances[i]);
+            wasm_free_module(&wasm_modules[i]);
+            wasm_slot_used[i] = 0;
+        }
+    }
 }
 
 int js_dom_needs_relayout(void) { return g_needs_relayout; }
@@ -224,15 +257,15 @@ void js_dom_set_prop(struct js_object *obj, const char *name, js_value value, in
     *handled = 0;
 }
 
-static js_value native_get_element_by_id(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_get_element_by_id(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     if (argc < 1 || !g_document_root) return js_null_value();
     struct dom_node *found = find_by_id(g_document_root, js_to_string(args[0]));
     return found ? js_wrap_dom_node(found) : js_null_value();
 }
 
-static js_value native_console_log(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_console_log(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     void (*out)(const char *) = g_console_sink ? g_console_sink : serial_write;
     for (int i = 0; i < argc; i++) {
         out(i > 0 ? " " : "");
@@ -242,25 +275,25 @@ static js_value native_console_log(js_value this_val, js_value *args, int argc) 
     return js_undefined();
 }
 
-static js_value native_math_abs(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_math_abs(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     int32_t n = argc > 0 ? js_to_num(args[0]) : 0;
     return js_make_num(n < 0 ? -n : n);
 }
-static js_value native_math_max(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_math_max(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     int32_t best = argc > 0 ? js_to_num(args[0]) : 0;
     for (int i = 1; i < argc; i++) { int32_t n = js_to_num(args[i]); if (n > best) best = n; }
     return js_make_num(best);
 }
-static js_value native_math_min(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_math_min(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     int32_t best = argc > 0 ? js_to_num(args[0]) : 0;
     for (int i = 1; i < argc; i++) { int32_t n = js_to_num(args[i]); if (n < best) best = n; }
     return js_make_num(best);
 }
-static js_value native_math_floor(js_value this_val, js_value *args, int argc) {
-    (void)this_val;
+static js_value native_math_floor(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
     /* Numbers are already integers in this engine -- see js.h. */
     return js_make_num(argc > 0 ? js_to_num(args[0]) : 0);
 }
@@ -269,6 +302,101 @@ static struct js_object *make_native(js_native_fn fn) {
     struct js_object *obj = js_new_object(JS_OBJ_NATIVE);
     obj->native_fn = fn;
     return obj;
+}
+
+/* The actual callable wrapper for one WASM export -- native_data (set
+ * by native_wasm_instantiate below) says which instance and which
+ * export name this particular native function object is bound to,
+ * since js_native_fn has no other way to carry per-object context. */
+static js_value native_wasm_export_call(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val;
+    struct js_wasm_export_binding *binding = (struct js_wasm_export_binding *)fn_obj->native_data;
+    int32_t wargs[WASM_MAX_PARAMS];
+    int wargc = argc > WASM_MAX_PARAMS ? WASM_MAX_PARAMS : argc;
+    for (int i = 0; i < wargc; i++) wargs[i] = js_to_num(args[i]);
+    int32_t result = 0;
+    if (!wasm_call_export(binding->inst, binding->name, wargs, wargc, &result)) {
+        serial_printf("js: WebAssembly call to '%s' trapped\n", binding->name);
+        return js_undefined();
+    }
+    return binding->has_result ? js_make_num(result) : js_undefined();
+}
+
+/* Non-standard shape, forced by what this engine actually has: real
+ * WebAssembly.instantiate() takes an ArrayBuffer/Promise and returns a
+ * Promise -- this engine has neither, so it takes a URL string
+ * (resolved against the current page by whatever js_set_binary_fetcher()
+ * registered) and returns the resolved `{instance: {exports: {...}}}`
+ * object directly and synchronously. Every exported function becomes a
+ * real callable JS native wrapping wasm_call_export(). */
+static js_value native_wasm_instantiate(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
+    if (argc < 1 || args[0].type != JS_STR) {
+        serial_printf("js: WebAssembly.instantiate needs a URL string (no fetch()/ArrayBuffer in this engine)\n");
+        return js_undefined();
+    }
+    if (!g_binary_fetcher) {
+        serial_printf("js: WebAssembly.instantiate: no fetcher registered\n");
+        return js_undefined();
+    }
+
+    int slot = -1;
+    for (int i = 0; i < WASM_INSTANCE_MAX; i++) {
+        if (!wasm_slot_used[i]) { slot = i; break; }
+    }
+    if (slot < 0) {
+        serial_printf("js: WebAssembly: too many live instances for this page (max %d)\n", WASM_INSTANCE_MAX);
+        return js_undefined();
+    }
+
+    const char *url = js_to_string(args[0]);
+    uint8_t *data = NULL;
+    uint32_t len = 0;
+    if (!g_binary_fetcher(url, &data, &len)) {
+        serial_printf("js: WebAssembly.instantiate: fetch failed for %s\n", url);
+        return js_undefined();
+    }
+
+    struct wasm_module *mod = &wasm_modules[slot];
+    int parsed = wasm_parse_module(data, len, mod);
+    kfree(data);
+    if (!parsed) {
+        serial_printf("js: WebAssembly.instantiate: module parse failed for %s\n", url);
+        return js_undefined();
+    }
+
+    struct wasm_instance *inst = &wasm_instances[slot];
+    if (!wasm_instantiate(mod, inst)) {
+        wasm_free_module(mod);
+        serial_printf("js: WebAssembly.instantiate: instantiation failed for %s\n", url);
+        return js_undefined();
+    }
+    wasm_slot_used[slot] = 1;
+
+    struct js_object *exports = js_new_object(JS_OBJ_PLAIN);
+    for (uint32_t i = 0; i < mod->export_count; i++) {
+        struct wasm_export *exp = &mod->exports[i];
+        if (exp->kind != 0) continue; /* function exports only -- nothing to call for table/memory/global */
+
+        struct js_wasm_export_binding *binding =
+            (struct js_wasm_export_binding *)js_alloc(sizeof(struct js_wasm_export_binding));
+        binding->inst = inst;
+        strncpy(binding->name, exp->name, sizeof(binding->name) - 1);
+        binding->name[sizeof(binding->name) - 1] = 0;
+        binding->has_result = mod->types[mod->funcs[exp->index].type_idx].result_count > 0;
+
+        struct js_object *fn = js_new_object(JS_OBJ_NATIVE);
+        fn->native_fn = native_wasm_export_call;
+        fn->native_data = binding;
+        js_set_prop(exports, exp->name, js_make_object(fn));
+    }
+
+    struct js_object *instance_obj = js_new_object(JS_OBJ_PLAIN);
+    js_set_prop(instance_obj, "exports", js_make_object(exports));
+
+    struct js_object *result = js_new_object(JS_OBJ_PLAIN);
+    js_set_prop(result, "instance", js_make_object(instance_obj));
+    return js_make_object(result);
 }
 
 struct js_env *js_make_global_env(struct dom_node *document_root) {
@@ -289,6 +417,10 @@ struct js_env *js_make_global_env(struct dom_node *document_root) {
     js_set_prop(math, "min", js_make_object(make_native(native_math_min)));
     js_set_prop(math, "floor", js_make_object(make_native(native_math_floor)));
     js_env_declare(env, "Math", js_make_object(math), 0);
+
+    struct js_object *wasm_ns = js_new_object(JS_OBJ_PLAIN);
+    js_set_prop(wasm_ns, "instantiate", js_make_object(make_native(native_wasm_instantiate)));
+    js_env_declare(env, "WebAssembly", js_make_object(wasm_ns), 0);
 
     return env;
 }

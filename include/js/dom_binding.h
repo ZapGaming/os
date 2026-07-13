@@ -54,4 +54,13 @@ void js_run_inline_scripts(const char *html, uint32_t len, struct js_env *env);
  * default; the browser never needs to call this itself). */
 void js_set_console_sink(void (*sink)(const char *));
 
+/* Lets WebAssembly.instantiate(url) (see js/dom_binding.c) actually
+ * fetch bytes -- this engine has no fetch()/ArrayBuffer of its own, so
+ * the browser (which already knows how to resolve a URL against the
+ * current page and fetch it over HTTP) registers this once. `*out_data`
+ * must be kmalloc'd; the caller frees it after use. Returns 1 on
+ * success, 0 on any fetch/resolve failure. */
+typedef int (*js_binary_fetch_fn)(const char *url, uint8_t **out_data, uint32_t *out_len);
+void js_set_binary_fetcher(js_binary_fetch_fn fn);
+
 #endif
