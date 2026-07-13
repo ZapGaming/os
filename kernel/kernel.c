@@ -20,6 +20,7 @@
 #include <kernel/demo_user_task.h>
 #include <kernel/ping_task.h>
 #include <net/net.h>
+#include <net/dhcp.h>
 #include <drivers/ata.h>
 #include <drivers/ac97.h>
 #include <fs/fat32.h>
@@ -116,6 +117,16 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     __asm__ volatile ("sti");
     serial_printf("Interrupts enabled\n");
+
+    /* Needs interrupts on (it blocks waiting for replies, same as
+     * dns_resolve()) so it can't run any earlier than this -- net_init()
+     * already gave every network consumer a usable static fallback
+     * config, so this is a best-effort upgrade, not something anything
+     * else needs to wait for. ping_task (already created above, and
+     * about to start competing for CPU time via preemption) re-reads
+     * the gateway fresh every iteration rather than caching it, so it
+     * can't observe a permanently-stale pre-DHCP value either way. */
+    if (net_up) net_dhcp_negotiate();
 
     gui_init();
     serial_printf("Entering GUI main loop\n");

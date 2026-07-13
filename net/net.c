@@ -5,11 +5,16 @@
 #include <kernel/serial.h>
 #include <stddef.h>
 
-/* Static config matching QEMU's default user-mode (SLIRP) network:
- * guest 10.0.2.15, gateway/host 10.0.2.2. No DHCP client yet. */
+/* Fallback config matching QEMU's default user-mode (SLIRP) network:
+ * guest 10.0.2.15, gateway/host 10.0.2.2. net_dhcp_negotiate() (see
+ * net/dhcp.c), called once interrupts are enabled, overwrites this with
+ * a real negotiated lease if a DHCP server actually answers -- this is
+ * just what's in effect until/unless that happens, and what's kept if
+ * it never does (e.g. an isolated test network with no DHCP server). */
 static uint32_t our_ip = 0;
 static uint32_t gateway_ip = 0;
 static uint32_t netmask = 0;
+static uint32_t dns_server_ip = 0; /* 0 = unset; dns_resolve() falls back to guessing */
 static uint8_t our_mac[6];
 static int is_up = 0;
 static const char *driver_name = "";
@@ -57,6 +62,15 @@ const char *net_get_driver_name(void) { return driver_name; }
 void net_send_frame(const void *data, uint16_t len) {
     if (active_send) active_send(data, len);
 }
+
+void net_set_ip_config(uint32_t ip, uint32_t gateway, uint32_t mask) {
+    our_ip = ip;
+    gateway_ip = gateway;
+    netmask = mask;
+}
+
+uint32_t net_get_dns_server(void) { return dns_server_ip; }
+void net_set_dns_server(uint32_t ip) { dns_server_ip = ip; }
 
 int net_is_local(uint32_t ip) {
     return (ip & netmask) == (our_ip & netmask);

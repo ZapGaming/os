@@ -119,8 +119,13 @@ int dns_resolve(const char *hostname, uint32_t *out_ip) {
 
     udp_register_handler(LOCAL_DNS_PORT, dns_response_handler);
 
-    uint32_t dns_server = net_get_gateway_ip() & 0xFFFFFF00; /* SLIRP's DNS proxy is x.x.x.3 */
-    dns_server |= 3;
+    uint32_t dns_server = net_get_dns_server();
+    if (!dns_server) {
+        /* No DHCP-provided DNS server known -- fall back to the QEMU
+         * SLIRP convention (its DNS proxy is always x.x.x.3). Only
+         * correct for SLIRP specifically, not a general assumption. */
+        dns_server = (net_get_gateway_ip() & 0xFFFFFF00) | 3;
+    }
     if (!udp_send(dns_server, LOCAL_DNS_PORT, DNS_SERVER_PORT, packet, (uint16_t)pos)) {
         udp_unregister_handler(LOCAL_DNS_PORT);
         return 0;

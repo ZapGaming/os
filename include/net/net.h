@@ -30,6 +30,16 @@ int net_is_local(uint32_t ip);
  * "rtl8139", "e1000"), for display -- empty string if none. */
 const char *net_get_driver_name(void);
 
+/* Overwrites the IP/gateway/netmask that net_init() set as a fallback --
+ * called by net_dhcp_negotiate() once it actually gets a lease. */
+void net_set_ip_config(uint32_t ip, uint32_t gateway, uint32_t mask);
+
+/* 0 if no DHCP-provided DNS server is known yet (dns_resolve() falls
+ * back to guessing gateway+3, which is specifically a QEMU SLIRP
+ * convention, not a general one). */
+uint32_t net_get_dns_server(void);
+void net_set_dns_server(uint32_t ip);
+
 /* Hands a fully-built Ethernet frame to whichever NIC driver is active.
  * eth_send() is the only caller; a NIC driver is never referenced by
  * name outside net_init() itself. */
