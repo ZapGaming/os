@@ -216,6 +216,39 @@ you can keep building on.
   comments/numbers) for C, JS, and Python.
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
+- **A real TLS 1.2 client, HTTPS, and everything a daily-driver browser
+  needs on top of that**: `net/tls.c` layers a from-scratch TLS 1.2
+  handshake and record layer (X25519 ECDHE, AES-128-GCM, SHA-256/HMAC,
+  each independently verified against published test vectors before
+  being wired in) directly on top of `net/tcp.c`'s existing connection —
+  see "How HTTPS/TLS works" below for its exact scope and the
+  deliberate security cut it makes. `http_get()` now follows HTTP
+  redirects (including an `http://` → `https://` upgrade mid-chain),
+  sends/stores cookies via a small per-host jar, and transparently
+  decodes gzip/deflate response bodies (`net/gzip.c`, a from-scratch
+  DEFLATE decoder). The Browser window itself gained tabs (a real tab
+  strip — "+"/"×", Ctrl+T/Ctrl+W, each tab with its own DOM/stylesheet/
+  layout/scroll/history), per-tab back/forward history (Alt+Left/
+  Alt+Right, real truncate-the-redo-branch semantics), bookmarks
+  (persisted to `BOOKMARKS.TXT` on the FAT32 disk, a star button plus a
+  browsable dropdown), and a combined address/search bar — anything
+  typed that doesn't look like a URL is sent to DuckDuckGo's plain
+  HTML results page (`html.duckduckgo.com/html/`, no JS/heavy CSS
+  needed to render it) instead. Verified end-to-end in QEMU against
+  real HTTPS sites (`https://example.com/`, a live search, and
+  `failure.fail` — see "How the browser works" for how that one
+  renders) with real TLS handshakes and gzip-compressed responses
+  actually decoding correctly.
+- **DOOM (and the rest of the FAT32 disk) now ships inside `zapos.iso`
+  itself** — GRUB loads `zapos_disk.img` as a multiboot2 module
+  (`iso/grub.cfg`'s `module2` line), and `drivers/ata.c` falls back to
+  serving FAT32 reads/writes straight out of that in-memory copy
+  whenever there's no real ATA hard disk attached, so booting the ISO
+  alone (no second `-drive`) still has the full filesystem, DOOM
+  included. Real ATA hardware still takes priority when present, so
+  `make run`'s existing persistence-across-reboots is unaffected —
+  `make run-iso-only` boots with just the ISO to prove it's genuinely
+  self-contained.
 
 ## What's stubbed / not yet built
 
@@ -260,11 +293,12 @@ you can keep building on.
   `<canvas>` or renders only through client-side JS/React just doesn't
   appear (see "How the browser works" for what a real Next.js/React
   page running into all of this at once actually looks like). There's
-  no HTTPS (plain HTTP only — no TLS, so `https://` links are refused
-  rather than fetched), the fetch is synchronous and blocks GUI redraws
-  while it runs, and only one TCP connection can be open at a time
-  (external stylesheets and each image are fetched one at a time,
-  sequentially, not concurrently with the page or each other) --
+  the fetch is synchronous and blocks GUI redraws while it runs, and
+  only one TCP connection can be open at a time (external stylesheets
+  and each image are fetched one at a time, sequentially, not
+  concurrently with the page or each other — see "How HTTPS/TLS works"
+  for why that's not actually a limitation in practice, given nothing
+  in this browser ever needs two connections open simultaneously) --
   partially offset by the response cache (see "How the browser cache
   works") when the same URL was already fetched with a cacheable
   `Cache-Control`, but a page's *first* visit still pays for every
@@ -277,10 +311,6 @@ you can keep building on.
   external stylesheets at 128KB (large enough for a real minified
   Tailwind/Next.js bundle, per "How the browser works" below, but still
   a hard cap, not streaming).
-- **Filesystem writes still can't delete or rename** — `fat32_write_file`
-  can create and overwrite, but there's no way to remove a directory
-  entry or grow a file's directory *tree* (only its own cluster chain
-  and, for the immediate parent, one additional directory cluster).
 - **Incoming packet checksums aren't validated** (outgoing ones are
   computed correctly). TCP is client-only (active-open), single-
   connection (no concurrent sockets) — there's no listening/server side.
@@ -822,10 +852,39 @@ The GUI's Browser window (`gui/compositor.c`) draws that item list in
 three passes (backgrounds, then rules, then text, so a block's own
 background never paints over its text regardless of emission order),
 and clicking a link resolves its `href` against the current URL
-(handling `http://` absolute, `//host/path`, `/path` absolute-path, and
-plain relative hrefs, with `#fragment`/`mailto:`/`javascript:` treated as
-no-ops and `https://` refused outright — no TLS client exists) before
-re-fetching.
+(handling `http://`/`https://` absolute, `//host/path` scheme-relative
+— inheriting whatever scheme the current page used — `/path`
+absolute-path, and plain relative hrefs, with `#fragment`/`mailto:`/
+`javascript:` treated as no-ops) before re-fetching, now genuinely
+following an https: link into a real TLS handshake — see "How
+HTTPS/TLS works" below.
+
+The Browser window itself is no longer single-page: `br_tabs[]` (a
+fixed array, `BR_MAX_TABS` slots, same no-dynamic-collections
+convention as every other list in `gui/compositor.c`) holds a
+complete, independent copy of everything a page needs — URL, DOM tree,
+stylesheet, layout, scroll position, decoded `<img>` cache, and its own
+back/forward history stack — so switching tabs is just repointing
+`br_active_tab`, nothing needs re-fetching. A real tab strip (click to
+switch, "×" to close, "+" for a new one, plus Ctrl+T/Ctrl+W) sits above
+the address bar; back/forward buttons (and Alt+Left/Alt+Right) rewind
+or replay a tab's history stack with standard truncate-the-redo-branch
+semantics (going back, then navigating somewhere new, discards
+whatever was ahead); a star button bookmarks the active tab's URL to
+`BOOKMARKS.TXT` on the FAT32 disk (one URL per line, rewritten whole on
+every change, loaded lazily on first use — the same "just overwrite
+it" model `NOTES.TXT` editing already used), browsable via a dropdown.
+The address bar doubles as a search box: anything typed that doesn't
+look like a URL (no scheme, no `.` before the first space) gets sent to
+`https://html.duckduckgo.com/html/?q=...` instead — DuckDuckGo's plain
+server-rendered results page, picked specifically because it needs no
+JS and minimal CSS to render, unlike Google's own results page.
+One known gap: the JS engine (`js/dom_binding.c`'s onclick table,
+`js/value.c`'s arena) is still a single global instance, not per-tab —
+switching to a tab you haven't just (re)fetched, after fetching a
+*different* tab in between, can dispatch a click against a stale
+table until that tab reloads. A pre-existing single-page assumption
+inherited from before tabs existed, not something this pass fixed.
 
 Several real bugs surfaced while getting this to render correctly
 end-to-end — all caught by actually fetching real pages (both a live
@@ -959,6 +1018,79 @@ initial HTML never appears (this browser only runs a page's *inline*
 nothing resembling a React runtime). The honest summary: this is enough
 real CSS to make a modern site's actual *content* legible, not enough to
 make it look right.
+
+## How HTTPS/TLS works
+
+`net/tls.c` is a from-scratch TLS 1.2 client layered directly on top of
+`net/tcp.c`'s existing single-connection API (`tls_connect`/`tls_send`/
+`tls_recv`/`tls_close` mirror `tcp_connect`/`tcp_send`/`tcp_recv`/
+`tcp_close` exactly) — it owns no sockets or packets of its own, just
+the handshake state machine and record framing on top. Deliberately
+scoped down hard, for tractability:
+
+- **TLS 1.2 only, one cipher suite** (`TLS_ECDHE_RSA_WITH_AES_128_GCM_
+  SHA256`, 0xC02F) **and one curve** (X25519, RFC 7748) — if a server
+  doesn't support that exact combination, the connection just fails. In
+  practice the large majority of real HTTPS servers still do.
+- **Every primitive it's built from — SHA-256, HMAC-SHA256, X25519,
+  AES-128, GCM (`net/sha256.c`, `net/hmac.c`, `net/x25519.c`,
+  `net/aes.c`, `net/gcm.c`)** — was independently verified against
+  published test vectors on the host (plain `gcc`, not the freestanding
+  kernel build) before ever being wired into the handshake: NIST's
+  SHA-256 vectors, RFC 4231's HMAC-SHA256 vectors, RFC 7748 §5.2's
+  X25519 vectors (including its 1,000/1,000,000-iteration self-test,
+  which is good at catching subtle bit-arithmetic bugs a single-input
+  test wouldn't), FIPS-197's AES-128 vector, and the classic McGrew &
+  Viega GCM test vectors plus additional cases cross-checked against a
+  real crypto library — the same "verify on the host before trusting
+  it in the kernel" rigor `net/gzip.c`'s DEFLATE decoder got.
+- **DELIBERATE SECURITY SCOPE CUT, stated plainly: this client
+  authenticates nothing about the server.** The Certificate message is
+  parsed only enough to skip over it (its length is self-delimiting);
+  the signature over the ECDHE parameters in ServerKeyExchange is never
+  checked; there's no chain validation, no hostname check, no expiry
+  check. It gets you a genuinely encrypted (and tag-authenticated —
+  every AES-GCM record's auth tag *is* checked, and a failure is always
+  treated as fatal) channel to *something* claiming to be the host you
+  asked for, which is enough to stop a passive eavesdropper and get
+  real HTTPS sites to respond at all, but it is trivially defeated by
+  an active on-path attacker (e.g. this sandbox's own outbound TLS
+  proxy, which is exactly what this client actually talked to during
+  development — irrelevant to *correctness* testing, since it was
+  never going to validate the cert either way, but a concrete
+  reminder of what "no authentication" really means in practice). This
+  is "for interoperability, not security" — don't use it for anything
+  where that distinction matters.
+- **No renegotiation, no session resumption, no outgoing alerts** (a
+  fatal condition just closes the connection), and a received alert
+  during the handshake is treated as fatal without inspecting it
+  further.
+- The ephemeral X25519 keypair and ClientHello random come from a
+  SHA-256-mixed RDTSC/PIT-jitter pool (`net/tls.c`'s `tls_random_bytes`)
+  — a best-effort entropy source, not a vetted CSPRNG, consistent with
+  the scope cut above (a weak ephemeral key only weakens forward
+  secrecy of a connection whose *server* was never authenticated
+  either).
+
+`http_get()` (`net/http.c`) picked a leading `use_tls` flag over adding
+a second near-duplicate function: `conn_connect`/`conn_send`/
+`conn_recv`/`conn_close` dispatch to either `tcp_*` or `tls_*` from one
+code path, and the redirect-following loop can flip that flag
+mid-chain (an `http://` origin that 301s to `https://`, extremely
+common in the real world, upgrades automatically without the caller
+doing anything). SNI (the `server_name` extension) is always sent —
+required for correctly reaching most CDN-fronted sites even though
+this client never checks the certificate it gets back.
+
+Verified two ways: unit-testing each primitive (above), and a genuine
+end-to-end run inside QEMU — typing `https://example.com/` into the
+Browser's address bar produces, in the serial log, a real DNS lookup, a
+real TCP connect to port 443, `tls: handshake complete`, and a decoded
+200 response, with the page rendering correctly on screen. A DuckDuckGo
+search and a `failure.fail` fetch (see "How the browser works" above)
+additionally exercised repeated fresh handshakes for cross-origin
+subresources (Google Fonts' CSS, several favicon fetches) in the same
+session, back to back, without incident.
 
 ## How the browser cache works
 
@@ -1319,22 +1451,34 @@ Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
 the demo `SONG.WAV`, skipping it gracefully if unavailable.
 
 ```sh
-make          # compile the kernel (build/kernel.elf)
-make iso      # package it as zapos.iso via GRUB
-make disk     # build zapos_disk.img + zapos_disk.vmdk (only if missing --
-              # won't clobber anything you've saved via the File Manager)
-make run      # build both and boot in QEMU with a NIC + AC97 + disk + serial on stdio
+make              # compile the kernel (build/kernel.elf)
+make iso          # package it as zapos.iso via GRUB (embeds zapos_disk.img
+                   # as a multiboot2 module -- see below)
+make disk         # build zapos_disk.img + zapos_disk.vmdk (only if missing --
+                   # won't clobber anything you've saved via the File Manager)
+make run          # build both and boot in QEMU with a NIC + AC97 + disk + serial on stdio
+make run-iso-only # boot with just zapos.iso, no second -drive at all --
+                   # proves the ISO is genuinely self-contained (see below)
 ```
 
 `make run` attaches an RTL8139 NIC and an AC97 codec via QEMU's default
 audio backend, plus the FAT32 disk image, with `-boot order=d` so it
 boots the CD-ROM first (see above for why that matters once a hard disk
-is attached). Booting `zapos.iso` some other way (VirtualBox/VMware/real
-hardware, or without `zapos_disk.img` at all) works fine too — the GUI
-just shows "no NIC detected" / "no disk/FAT32 detected" for whichever
-piece isn't present, and everything else runs the same. Boot mode is
-legacy BIOS (not UEFI/Secure Boot yet — that would need a
-`grub-mkrescue --efi` build and a different Multiboot path).
+is attached). `make iso` bundles the *entire* FAT32 disk image (DOOM.ELF
+and everything else on it) directly into `zapos.iso` as a GRUB module
+(`iso/grub.cfg`'s `module2` line); `drivers/ata.c` serves FAT32 reads/
+writes straight out of that in-memory copy whenever there's no real ATA
+hard disk attached, so `zapos.iso` alone — no second file to carry
+around — still has the full filesystem. Real ATA hardware still takes
+priority when present, so `make run`'s persistence-across-reboots via
+the real disk image is unaffected; the RAM-disk fallback only kicks in
+when there's genuinely no hardware disk, e.g. `make run-iso-only`, or
+booting the ISO some other way (VirtualBox/VMware/real hardware)
+without also attaching `zapos_disk.img`. The GUI still just shows "no
+NIC detected" if no network card is present, and everything else runs
+the same. Boot mode is legacy BIOS (not UEFI/Secure Boot yet — that
+would need a `grub-mkrescue --efi` build and a different Multiboot
+path).
 
 To actually *hear* audio (rather than just verify the driver talks to
 the hardware correctly), QEMU needs a real `-audiodev` backend --
@@ -1355,9 +1499,12 @@ drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
                  RTL8139 + Intel e1000 NICs, ATA, AC97 codec, WAV file parsing
 gui/             framebuffer primitives, bitmap font, window compositor,
                  the Terminal window (shell.c) and its built-in shell
-net/             Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP, HTTP -- a
-                 from-scratch TCP/IP stack -- plus DOM/CSS/layout and a
-                 BMP decoder, a real (if pragmatic) web browser backend
+net/             Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP, TLS, HTTP --
+                 a from-scratch TCP/IP stack (TLS 1.2 in tls.c, its crypto
+                 primitives split into their own sha256.c/hmac.c/x25519.c/
+                 aes.c/gcm.c, see "How HTTPS/TLS works" above) -- plus a
+                 gzip/DEFLATE decoder (gzip.c), DOM/CSS/layout, and a BMP
+                 decoder, a real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing,
                  read/write/delete/rename/mkdir)
 js/              a from-scratch JS engine: lexer, parser, tree-walking

@@ -32,7 +32,7 @@
 #define FM_MAX_ENTRIES 24
 #define FM_PREVIEW_MAX 2048
 #define FM_AUDIO_MAX   (2 * 1024 * 1024)
-#define BR_MAX_URL     96
+#define BR_MAX_URL     224
 #define TERM_SCROLLBACK 4096
 #define TERM_INPUT_MAX  120
 /* Well under http.c's own HTTP_RAW_BUF_SIZE (2MB) -- both have to fit
@@ -1118,13 +1118,20 @@ static void draw_file_manager(const gui_window_t *w) {
     }
 }
 
-/* Splits "example.com:8000/path" (an optional "http://" prefix is
- * skipped) into a host, a port (defaulting to 80), and a path
- * (defaulting to "/"). */
+/* Splits "example.com:8000/path" (an optional "http://" or "https://"
+ * prefix is skipped, and remembered in *is_https_out) into a host, a
+ * port (defaulting to 80, or 443 if the URL said https), and a path
+ * (defaulting to "/"). A bare host with no scheme prefix (e.g. the
+ * default new-tab URL) is treated as http, same as before TLS existed. */
 static void br_parse_url(const char *url, char *host_out, int host_cap, uint16_t *port_out,
-                          char *path_out, int path_cap) {
+                          char *path_out, int path_cap, int *is_https_out) {
     const char *p = url;
+    *is_https_out = 0;
     if (p[0] == 'h' && p[1] == 't' && p[2] == 't' && p[3] == 'p' &&
+        p[4] == 's' && p[5] == ':' && p[6] == '/' && p[7] == '/') {
+        *is_https_out = 1;
+        p += 8;
+    } else if (p[0] == 'h' && p[1] == 't' && p[2] == 't' && p[3] == 'p' &&
         p[4] == ':' && p[5] == '/' && p[6] == '/') {
         p += 7;
     }
@@ -1132,7 +1139,7 @@ static void br_parse_url(const char *url, char *host_out, int host_cap, uint16_t
     while (*p && *p != '/' && *p != ':' && i < host_cap - 1) host_out[i++] = *p++;
     host_out[i] = 0;
 
-    *port_out = 80;
+    *port_out = *is_https_out ? 443 : 80;
     if (*p == ':') {
         p++;
         int port = 0;
@@ -1233,15 +1240,33 @@ static void br_join_path(const char *base_path, const char *href, char *out, int
  * page that referenced it, without touching the browser's own
  * navigation state (the active tab's url/status_msg) -- a missing
  * image shouldn't clobber the address bar or status line. Returns 0
- * for schemes this browser can't fetch (https:, data:, empty) rather
- * than 1 with a nonsense host/path. */
+ * for schemes this browser can't fetch (data:, empty) rather than 1
+ * with a nonsense host/path. A relative reference inherits the
+ * referencing page's own scheme (*is_https_out is read on entry as
+ * that page's scheme, then overwritten with the resolved result). */
 static int br_resolve_subresource(const char *base_host, uint16_t base_port, const char *base_path,
                                    const char *url, char *host_out, int host_cap,
-                                   uint16_t *port_out, char *path_out, int path_cap) {
+                                   uint16_t *port_out, char *path_out, int path_cap, int *is_https_out) {
     if (!url[0] || url[0] == '#') return 0;
-    if (strncmp(url, "https://", 8) == 0 || strncmp(url, "data:", 5) == 0) return 0;
-    if (strncmp(url, "http://", 7) == 0) {
-        br_parse_url(url, host_out, host_cap, port_out, path_out, path_cap);
+    if (strncmp(url, "data:", 5) == 0) return 0;
+    if (strncmp(url, "https://", 8) == 0 || strncmp(url, "http://", 7) == 0) {
+        br_parse_url(url, host_out, host_cap, port_out, path_out, path_cap, is_https_out);
+        return 1;
+    }
+    if (url[0] == '/' && url[1] == '/') {
+        /* Scheme-relative ("//host/path") -- inherit the referencing
+         * page's own scheme (already in *is_https_out on entry), same
+         * as parse_location() does for a Location header. Without
+         * this, a scheme-relative <img>/<link> (common for CDN-hosted
+         * assets, e.g. DuckDuckGo's favicon proxy) fell through to the
+         * relative-path branch below and got wrongly joined onto the
+         * current page's own path. */
+        char tmp[136];
+        strcpy(tmp, *is_https_out ? "https:" : "http:");
+        int n = (int)strlen(tmp);
+        int ul = (int)strlen(url);
+        if (n + ul < (int)sizeof(tmp)) memcpy(tmp + n, url, (size_t)ul + 1);
+        br_parse_url(tmp, host_out, host_cap, port_out, path_out, path_cap, is_https_out);
         return 1;
     }
     strncpy(host_out, base_host, host_cap - 1);
@@ -1292,18 +1317,18 @@ static void br_images_reset(br_tab_t *t) {
  * sub-resource is silently skipped rather than aborting the page, same
  * as a real browser would just show a broken-image icon and move on. */
 static void br_load_subresources(br_tab_t *t, struct dom_node *node, const char *base_host,
-                                  uint16_t base_port, const char *base_path) {
+                                  uint16_t base_port, int base_is_https, const char *base_path) {
     for (struct dom_node *child = node->children; child; child = child->next) {
         if (child->type != DOM_ELEMENT) continue;
 
         if (strcmp(child->tag, "link") == 0 && strcmp(child->rel, "stylesheet") == 0 && child->href[0]) {
-            char host[64], path[64]; uint16_t port;
+            char host[64], path[64]; uint16_t port; int is_https = base_is_https;
             if (br_resolve_subresource(base_host, base_port, base_path, child->href,
-                                        host, sizeof(host), &port, path, sizeof(path))) {
+                                        host, sizeof(host), &port, path, sizeof(path), &is_https)) {
                 char *buf = kmalloc(BR_CSS_FETCH_CAP + 1);
                 if (buf) {
                     int status; uint32_t blen;
-                    if (http_get(host, port, path, &status, buf, BR_CSS_FETCH_CAP, &blen, NULL, 0) &&
+                    if (http_get(is_https, host, port, path, &status, buf, BR_CSS_FETCH_CAP, &blen, NULL, 0) &&
                         status >= 200 && status < 300) {
                         css_parse_into(&t->stylesheet, buf, blen);
                     }
@@ -1311,13 +1336,13 @@ static void br_load_subresources(br_tab_t *t, struct dom_node *node, const char 
                 }
             }
         } else if (strcmp(child->tag, "img") == 0 && child->href[0] && t->image_count < BR_MAX_IMAGES) {
-            char host[64], path[64]; uint16_t port;
+            char host[64], path[64]; uint16_t port; int is_https = base_is_https;
             if (br_resolve_subresource(base_host, base_port, base_path, child->href,
-                                        host, sizeof(host), &port, path, sizeof(path))) {
+                                        host, sizeof(host), &port, path, sizeof(path), &is_https)) {
                 char *buf = kmalloc(BR_IMAGE_FETCH_CAP + 1);
                 if (buf) {
                     int status; uint32_t blen;
-                    if (http_get(host, port, path, &status, buf, BR_IMAGE_FETCH_CAP, &blen, NULL, 0) &&
+                    if (http_get(is_https, host, port, path, &status, buf, BR_IMAGE_FETCH_CAP, &blen, NULL, 0) &&
                         status >= 200 && status < 300) {
                         struct bmp_image img;
                         if (bmp_decode((const uint8_t *)buf, blen, &img)) {
@@ -1331,7 +1356,7 @@ static void br_load_subresources(br_tab_t *t, struct dom_node *node, const char 
             }
         }
 
-        br_load_subresources(t, child, base_host, base_port, base_path);
+        br_load_subresources(t, child, base_host, base_port, base_is_https, base_path);
     }
 }
 
@@ -1377,7 +1402,8 @@ static void br_history_push(br_tab_t *t, const char *url) {
 static void br_fetch_page(br_tab_t *t, int record_history) {
     char host[64], path[64];
     uint16_t port;
-    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path));
+    int is_https;
+    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path), &is_https);
 
     char *body = (char *)kmalloc(BR_FETCH_CAP + 1);
     if (!body) {
@@ -1389,7 +1415,7 @@ static void br_fetch_page(br_tab_t *t, int record_history) {
     uint32_t body_len;
     char content_type[BR_CONTENT_TYPE_MAX];
 
-    if (!http_get(host, port, path, &status, body, BR_FETCH_CAP, &body_len,
+    if (!http_get(is_https, host, port, path, &status, body, BR_FETCH_CAP, &body_len,
                    content_type, sizeof(content_type))) {
         strcpy(t->status_msg, "Failed to load (DNS/TCP error)");
         t->layout.item_count = 0;
@@ -1426,7 +1452,7 @@ static void br_fetch_page(br_tab_t *t, int record_history) {
          * HTTP fetch, done here (before layout, after DOM/inline-CSS)
          * so the external rules are in the cascade and every image's
          * natural size is known by the time layout_run() needs it. */
-        br_load_subresources(t, t->dom_root, host, port, path);
+        br_load_subresources(t, t->dom_root, host, port, is_https, path);
 
         /* Custom-property (var()) resolution needs the FINAL stylesheet
          * -- including whatever external sheets br_load_subresources()
@@ -1484,6 +1510,81 @@ static void br_fetch_page(br_tab_t *t, int record_history) {
     kfree(body);
 }
 
+/* DuckDuckGo's plain server-rendered results page -- no JS, minimal CSS,
+ * about as close to "will actually render in this engine" as a real
+ * search engine gets (Google's own results page assumes a full modern
+ * JS/CSS stack this from-scratch renderer doesn't have). Only reachable
+ * at all now that net/tls.c exists -- it redirects http to https. */
+#define BR_SEARCH_HOST "html.duckduckgo.com"
+#define BR_SEARCH_PATH_PREFIX "/html/?q="
+
+/* Heuristic for "is this address-bar text a URL, or a search query" --
+ * the same rough rule real browsers use: an explicit scheme, or any
+ * '.' before the first space, reads as a URL; anything else (no dot at
+ * all, or a space before one) is a search query. Not spec-perfect (a
+ * bare "localhost" reads as a search, same tradeoff most browsers make
+ * without a fuller heuristic), just good enough for everyday typing. */
+static int br_looks_like_url(const char *s) {
+    if (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0) return 1;
+    for (const char *p = s; *p; p++) {
+        if (*p == ' ') return 0;
+        if (*p == '.') return 1;
+    }
+    return 0;
+}
+
+/* Percent-encodes `in` for use as a URL query-string value (RFC 3986
+ * unreserved characters pass through, a space becomes '+' as query
+ * strings conventionally use, everything else becomes %XX) -- stops
+ * early rather than overflowing if the encoded form would exceed
+ * out_cap, same hard-truncate convention the rest of this file uses. */
+static void br_percent_encode(const char *in, char *out, int out_cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    int j = 0;
+    for (const char *p = in; *p && j < out_cap - 4; p++) {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out[j++] = c;
+        } else if (c == ' ') {
+            out[j++] = '+';
+        } else {
+            out[j++] = '%';
+            out[j++] = hex[((uint8_t)c) >> 4];
+            out[j++] = hex[((uint8_t)c) & 0xF];
+        }
+    }
+    out[j] = 0;
+}
+
+/* Rewrites t->url in place into a DuckDuckGo query URL if it doesn't
+ * look like a URL at all -- called right before every address-bar
+ * Enter triggers a fetch, so typing a search term and pressing Enter
+ * just works, the same as any other browser's combined address/search
+ * bar. Leaves t->url alone (returns without touching it) for anything
+ * that already looks like a URL. */
+static void br_maybe_search(br_tab_t *t) {
+    if (br_looks_like_url(t->url)) return;
+
+    static const char prefix[] = "https://" BR_SEARCH_HOST BR_SEARCH_PATH_PREFIX;
+    char query[BR_MAX_URL];
+    strncpy(query, t->url, sizeof(query) - 1);
+    query[sizeof(query) - 1] = 0;
+
+    int encoded_cap = BR_MAX_URL - (int)sizeof(prefix); /* sizeof(prefix) includes prefix's own NUL */
+    if (encoded_cap < 1) encoded_cap = 1;
+    char encoded[BR_MAX_URL];
+    if (encoded_cap > (int)sizeof(encoded)) encoded_cap = (int)sizeof(encoded);
+    br_percent_encode(query, encoded, encoded_cap);
+
+    strcpy(t->url, prefix);
+    int n = (int)strlen(t->url);
+    int el = (int)strlen(encoded);
+    if (n + el < BR_MAX_URL) { memcpy(t->url + n, encoded, (size_t)el); n += el; }
+    t->url[n] = 0;
+    t->url_len = n;
+}
+
 static void br_fetch(void) {
     br_fetch_page(br_active(), 1);
 }
@@ -1515,19 +1616,16 @@ static void br_go_forward(void) {
 }
 
 /* Resolves `href` (as found on an <a> in the just-loaded page) against
- * `t`'s current url, writes the resolved absolute "host[:port]/path"
+ * `t`'s current url, writes the resolved absolute "scheme://host[:port]/path"
  * back into it, and returns 1 -- or returns 0 (no navigation) for
- * fragment-only/mailto:/javascript: links and for https: links, which
- * this browser can't fetch (no TLS client). */
+ * fragment-only/mailto:/javascript: links. A relative href inherits
+ * the current page's own scheme (an https page's relative links stay
+ * https, rather than silently downgrading -- see br_parse_url()). */
 static int br_resolve_href(br_tab_t *t, const char *href) {
     if (href[0] == '#' || href[0] == 0) return 0;
     if (strncmp(href, "mailto:", 7) == 0 || strncmp(href, "javascript:", 11) == 0) return 0;
-    if (strncmp(href, "https://", 8) == 0) {
-        strcpy(t->status_msg, "HTTPS not supported (no TLS client)");
-        return 0;
-    }
 
-    if (strncmp(href, "http://", 7) == 0) {
+    if (strncmp(href, "https://", 8) == 0 || strncmp(href, "http://", 7) == 0) {
         strncpy(t->url, href, BR_MAX_URL - 1);
         t->url[BR_MAX_URL - 1] = 0;
         t->url_len = (int)strlen(t->url);
@@ -1536,15 +1634,19 @@ static int br_resolve_href(br_tab_t *t, const char *href) {
 
     char host[64], path[64];
     uint16_t port;
-    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path));
+    int is_https;
+    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path), &is_https);
 
     char new_path[64];
     br_join_path(path, href, new_path, sizeof(new_path));
 
-    int n = 0;
-    n += (int)strlen(host);
-    strncpy(t->url, host, BR_MAX_URL - 1);
-    if (port != 80 && n < BR_MAX_URL - 8) {
+    const char *scheme = is_https ? "https://" : "http://";
+    int n = (int)strlen(scheme);
+    memcpy(t->url, scheme, (size_t)n);
+    int hl = (int)strlen(host);
+    if (n + hl < BR_MAX_URL) { memcpy(t->url + n, host, (size_t)hl); n += hl; }
+    int default_port = is_https ? 443 : 80;
+    if (port != default_port && n < BR_MAX_URL - 8) {
         char portbuf[8];
         utoa(port, portbuf);
         t->url[n++] = ':';
@@ -1739,6 +1841,7 @@ static void br_handle_key(char c) {
     if (!br_editing_url) return;
     br_tab_t *t = br_active();
     if (c == '\n' || c == '\r') {
+        br_maybe_search(t);
         br_fetch();
     } else if (c == '\b') {
         if (t->url_len > 0) t->url_len--;

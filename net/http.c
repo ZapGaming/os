@@ -1,6 +1,7 @@
 #include <net/http.h>
 #include <net/dns.h>
 #include <net/tcp.h>
+#include <net/tls.h>
 #include <net/gzip.h>
 #include <kernel/pit.h>
 #include <kernel/kheap.h>
@@ -337,29 +338,35 @@ static const char *find_header_next(const char *headers, uint32_t len, const cha
     return NULL;
 }
 
-/* Parses a Location header value into an (updated) host/port/path.
- * Handles absolute ("http://host[:port]/path"), scheme-relative
- * ("//host/path"), and root-relative ("/path") targets -- the common
- * real-world cases. Returns 0 (can't/won't follow) for an https target
- * (no TLS client exists yet) or an opaque relative path (this doesn't
- * attempt dot-segment resolution against the current URL), 1 otherwise. */
+/* Parses a Location header value into an (updated) host/port/path/
+ * scheme. Handles absolute ("http(s)://host[:port]/path"), scheme-
+ * relative ("//host/path", inheriting *is_https as passed in), and
+ * root-relative ("/path", host/port/scheme all unchanged) targets --
+ * the common real-world cases (an http -> https forced-redirect being
+ * by far the most important one now that there's a TLS client to
+ * follow it with). Returns 0 only for an opaque relative path (this
+ * doesn't attempt dot-segment resolution against the current URL), 1
+ * otherwise. `*is_https` is both read (as the current hop's scheme,
+ * for the scheme-relative case) and written (with the target's). */
 static int parse_location(const char *loc, uint32_t loc_len, char *host, uint32_t host_cap,
-                           uint16_t *port, char *path, uint32_t path_cap) {
+                           uint16_t *port, char *path, uint32_t path_cap, int *is_https) {
     const char *p = loc;
     const char *end = loc + loc_len;
 
-    if (loc_len >= 8 && ci_starts_with(p, "https://")) return 0;
-
-    if (loc_len >= 7 && ci_starts_with(p, "http://")) {
+    if (loc_len >= 8 && ci_starts_with(p, "https://")) {
+        *is_https = 1;
+        p += 8;
+    } else if (loc_len >= 7 && ci_starts_with(p, "http://")) {
+        *is_https = 0;
         p += 7;
     } else if (loc_len >= 2 && p[0] == '/' && p[1] == '/') {
-        p += 2; /* scheme-relative -- assume http, same reasoning as above */
+        p += 2; /* scheme-relative -- keep whatever *is_https already was */
     } else if (loc_len >= 1 && p[0] == '/') {
         uint32_t n = (uint32_t)(end - p);
         if (n >= path_cap) n = path_cap - 1;
         memcpy(path, p, n);
         path[n] = 0;
-        return 1; /* root-relative: host/port unchanged */
+        return 1; /* root-relative: host/port/scheme unchanged */
     } else {
         return 0;
     }
@@ -376,7 +383,7 @@ static int parse_location(const char *loc, uint32_t loc_len, char *host, uint32_
         *port = (uint16_t)parse_uint(p, end);
         while (p < end && *p != '/') p++;
     } else {
-        *port = 80;
+        *port = *is_https ? 443 : 80;
     }
 
     if (p < end) {
@@ -390,11 +397,24 @@ static int parse_location(const char *loc, uint32_t loc_len, char *host, uint32_
     return 1;
 }
 
+static int conn_connect(int use_tls, uint32_t ip, uint16_t port, const char *sni_host) {
+    return use_tls ? tls_connect(ip, port, sni_host) : tcp_connect(ip, port);
+}
+static int conn_send(int use_tls, const void *data, uint16_t len) {
+    return use_tls ? tls_send(data, len) : tcp_send(data, len);
+}
+static int conn_recv(int use_tls, void *buf, uint16_t max_len) {
+    return use_tls ? tls_recv(buf, max_len) : tcp_recv(buf, max_len);
+}
+static void conn_close(int use_tls) {
+    if (use_tls) tls_close(); else tcp_close();
+}
+
 static int is_redirect_status(int status) {
     return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
-int http_get(const char *host, uint16_t port, const char *path,
+int http_get(int use_tls, const char *host, uint16_t port, const char *path,
              int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
              char *content_type_out, uint32_t content_type_cap) {
     *status_out = 0;
@@ -428,6 +448,7 @@ int http_get(const char *host, uint16_t port, const char *path,
     char cur_host[128];
     char cur_path[512];
     uint16_t cur_port = port;
+    int cur_is_https = use_tls;
     strncpy(cur_host, host, sizeof(cur_host) - 1); cur_host[sizeof(cur_host) - 1] = 0;
     strncpy(cur_path, path, sizeof(cur_path) - 1); cur_path[sizeof(cur_path) - 1] = 0;
 
@@ -436,7 +457,7 @@ int http_get(const char *host, uint16_t port, const char *path,
     for (int hop = 0; ; hop++) {
         uint32_t ip;
         if (!dns_resolve(cur_host, &ip)) return 0;
-        if (!tcp_connect(ip, cur_port)) return 0;
+        if (!conn_connect(cur_is_https, ip, cur_port, cur_host)) return 0;
 
         char cookie_hdr[512];
         uint32_t cookie_hdr_len = cookie_build_header(cur_host, cookie_hdr, sizeof(cookie_hdr));
@@ -454,14 +475,14 @@ int http_get(const char *host, uint16_t port, const char *path,
         }
         strcat(req, "Connection: close\r\n\r\n");
 
-        if (!tcp_send(req, (uint16_t)strlen(req))) {
-            tcp_close();
+        if (!conn_send(cur_is_https, req, (uint16_t)strlen(req))) {
+            conn_close(cur_is_https);
             return 0;
         }
 
         total = 0;
         for (;;) {
-            int got = tcp_recv(raw_buf + total, (uint16_t)(HTTP_RAW_BUF_SIZE - total > 4096 ? 4096 : HTTP_RAW_BUF_SIZE - total));
+            int got = conn_recv(cur_is_https, raw_buf + total, (uint16_t)(HTTP_RAW_BUF_SIZE - total > 4096 ? 4096 : HTTP_RAW_BUF_SIZE - total));
             if (got > 0) {
                 total += (uint32_t)got;
             } else if (got < 0) {
@@ -473,7 +494,7 @@ int http_get(const char *host, uint16_t port, const char *path,
                 break;
             }
         }
-        tcp_close();
+        conn_close(cur_is_https);
 
         header_end = 0;
         for (uint32_t i = 0; i + 3 < total; i++) {
@@ -508,14 +529,17 @@ int http_get(const char *host, uint16_t port, const char *path,
                 while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
                 char next_host[128], next_path[512];
                 uint16_t next_port;
+                int next_is_https = cur_is_https;
                 strcpy(next_host, cur_host);
                 next_port = cur_port;
                 if (parse_location(loc, (uint32_t)(line_end - loc), next_host, sizeof(next_host),
-                                    &next_port, next_path, sizeof(next_path))) {
+                                    &next_port, next_path, sizeof(next_path), &next_is_https)) {
                     strcpy(cur_host, next_host);
                     cur_port = next_port;
+                    cur_is_https = next_is_https;
                     strcpy(cur_path, next_path);
-                    serial_printf("http: %d redirect -> %s:%u%s\n", *status_out, cur_host, cur_port, cur_path);
+                    serial_printf("http: %d redirect -> %s%s:%u%s\n", *status_out,
+                                  cur_is_https ? "https://" : "http://", cur_host, cur_port, cur_path);
                     continue;
                 }
             }
