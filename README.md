@@ -612,6 +612,8 @@ up a clip, a medikit, and armor (HUD updating to `100%`/`200%`
 correctly), took and dealt damage, and opened/closed the real DOOM
 main menu — not a static render, an actually-playable game loop.
 
+![DOOM running on ZapOS](docs/screenshots/doom_gameplay.png)
+
 **Scope.** This is a v1: fullscreen only (no windowed mode, since the
 GUI has no general per-window pixel-buffer API yet), keyboard-only (no
 mouse look/strafe), no sound (every `i_sound_zapos.c` function is a
