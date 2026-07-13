@@ -47,8 +47,22 @@ static void add_item(struct layout_ctx *ctx, enum layout_item_type type, int x, 
     it->color = color;
     it->link_id = link_id;
     it->owner = owner;
+    it->pixels = NULL;
     if (text) { strncpy(it->text, text, LAYOUT_TEXT_LEN - 1); it->text[LAYOUT_TEXT_LEN - 1] = 0; }
     else it->text[0] = 0;
+}
+
+static void add_image_item(struct layout_ctx *ctx, int x, int y, int w, int h,
+                            const uint32_t *pixels, int link_id, const struct dom_node *owner) {
+    if (ctx->doc->item_count >= LAYOUT_MAX_ITEMS) { ctx->items_dropped++; return; }
+    struct layout_item *it = &ctx->doc->items[ctx->doc->item_count++];
+    it->type = LAYOUT_ITEM_IMAGE;
+    it->x = x; it->y = y; it->w = w; it->h = h;
+    it->color = 0;
+    it->link_id = link_id;
+    it->owner = owner;
+    it->pixels = pixels;
+    it->text[0] = 0;
 }
 
 static int register_link(struct layout_ctx *ctx, const char *href) {
@@ -117,7 +131,25 @@ static int flush_flow(struct layout_ctx *ctx, int x, int width, int cursor_y) {
 static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent,
                             const struct css_computed *parent_style, int x, int width,
                             int cursor_y, int link_id, const struct dom_node *owner) {
+    /* Simplified float tracking, scoped to this one block formatting
+     * context: at most one active float per side. A float carves out
+     * horizontal space from x/width for whatever follows it in normal
+     * flow, until the flow's cursor_y passes the float's own bottom
+     * ("clears" it) -- floats don't advance cursor_y themselves, since
+     * they sit beside flow content instead of pushing it down. A second
+     * same-side float that starts before the first clears just stacks
+     * below it rather than beside it (real CSS packs same-side floats
+     * side by side if they fit; that's out of scope here). */
+    int lf_w = 0, lf_bottom = cursor_y;
+    int rf_w = 0, rf_bottom = cursor_y;
+
     for (const struct dom_node *child = parent->children; child; child = child->next) {
+        if (cursor_y >= lf_bottom) lf_w = 0;
+        if (cursor_y >= rf_bottom) rf_w = 0;
+        int eff_x = x + lf_w;
+        int eff_width = width - lf_w - rf_w;
+        if (eff_width < LAYOUT_CHAR_W) eff_width = LAYOUT_CHAR_W;
+
         if (child->type == DOM_TEXT) {
             flow_text(ctx, child->text, parent_style->color, link_id, owner);
             continue;
@@ -133,26 +165,93 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
         }
 
         if (strcmp(child->tag, "br") == 0) {
-            cursor_y = flush_flow(ctx, x, width, cursor_y);
+            cursor_y = flush_flow(ctx, eff_x, eff_width, cursor_y);
             continue;
         }
 
-        if (style.display == CSS_DISPLAY_INLINE) {
+        if (strcmp(child->tag, "img") == 0) {
+            cursor_y = flush_flow(ctx, eff_x, eff_width, cursor_y);
+
+            int nat_w = 0, nat_h = 0;
+            const uint32_t *pixels = NULL;
+            layout_get_image(child, &nat_w, &nat_h, &pixels);
+            int img_w = style.width > 0 ? style.width : (nat_w > 0 ? nat_w : 32);
+            int img_h = style.height > 0 ? style.height :
+                        (nat_h > 0 && nat_w > 0 ? (img_w * nat_h) / nat_w : 32);
+
+            if (style.cssfloat != CSS_FLOAT_NONE) {
+                int fy = (style.cssfloat == CSS_FLOAT_LEFT) ? (lf_w > 0 ? lf_bottom : cursor_y)
+                                                             : (rf_w > 0 ? rf_bottom : cursor_y);
+                int fx = (style.cssfloat == CSS_FLOAT_LEFT) ? x : x + width - img_w;
+                add_image_item(ctx, fx, fy, img_w, img_h, pixels, child_link_id, child);
+                if (style.cssfloat == CSS_FLOAT_LEFT) { lf_w = img_w; lf_bottom = fy + img_h; }
+                else { rf_w = img_w; rf_bottom = fy + img_h; }
+            } else {
+                cursor_y += style.margin_top;
+                add_image_item(ctx, eff_x, cursor_y, img_w, img_h, pixels, child_link_id, child);
+                cursor_y += img_h + style.margin_bottom;
+            }
+            continue;
+        }
+
+        if (style.display == CSS_DISPLAY_INLINE && style.cssfloat == CSS_FLOAT_NONE) {
             /* Stays in the same paragraph flow as its siblings. */
-            cursor_y = layout_children(ctx, child, &style, x, width, cursor_y, child_link_id, child);
+            cursor_y = layout_children(ctx, child, &style, eff_x, eff_width, cursor_y, child_link_id, child);
             continue;
         }
 
-        /* Block-level: flush whatever inline content preceded it, then
-         * lay this element out as its own box. */
-        cursor_y = flush_flow(ctx, x, width, cursor_y);
+        /* Block-level (floats are always block, regardless of `display`,
+         * per CSS -- and everything else non-inline): flush whatever
+         * inline content preceded it, then lay this element out as its
+         * own box. */
+        cursor_y = flush_flow(ctx, eff_x, eff_width, cursor_y);
 
         if (strcmp(child->tag, "hr") == 0) {
             cursor_y += style.margin_top;
-            add_item(ctx, LAYOUT_ITEM_HR, x, cursor_y, width, 2, style.color, NULL, -1, child);
+            add_item(ctx, LAYOUT_ITEM_HR, eff_x, cursor_y, eff_width, 2, style.color, NULL, -1, child);
             cursor_y += 2 + style.margin_bottom;
             continue;
         }
+
+        if (style.cssfloat != CSS_FLOAT_NONE) {
+            int float_w = style.width > 0 ? style.width : eff_width / 2;
+            if (float_w < LAYOUT_CHAR_W) float_w = LAYOUT_CHAR_W;
+            int fy = (style.cssfloat == CSS_FLOAT_LEFT) ? (lf_w > 0 ? lf_bottom : cursor_y)
+                                                         : (rf_w > 0 ? rf_bottom : cursor_y);
+            int fx = (style.cssfloat == CSS_FLOAT_LEFT) ? x : x + width - float_w;
+
+            int block_top = fy + style.margin_top;
+            int fcursor = block_top + style.padding_top;
+
+            int rect_idx = -1;
+            if (style.has_background) {
+                int before_count = ctx->doc->item_count;
+                add_item(ctx, LAYOUT_ITEM_RECT, fx, block_top, float_w, 0, style.background_color, NULL, -1, child);
+                if (ctx->doc->item_count > before_count) rect_idx = before_count;
+            }
+
+            int fchild_x = fx + style.padding_left;
+            int fchild_w = float_w - style.padding_left;
+            if (fchild_w < LAYOUT_CHAR_W) fchild_w = LAYOUT_CHAR_W;
+
+            if (strcmp(child->tag, "li") == 0) push_word(ctx, "-", 1, style.color, -1, child);
+
+            fcursor = layout_children(ctx, child, &style, fchild_x, fchild_w, fcursor, child_link_id, child);
+            fcursor = flush_flow(ctx, fchild_x, fchild_w, fcursor);
+            fcursor += style.padding_bottom;
+            if (style.height > 0 && block_top + style.padding_top + style.height > fcursor) {
+                fcursor = block_top + style.padding_top + style.height;
+            }
+            if (rect_idx >= 0) ctx->doc->items[rect_idx].h = fcursor - block_top;
+
+            int float_bottom = fcursor + style.margin_bottom;
+            if (style.cssfloat == CSS_FLOAT_LEFT) { lf_w = float_w; lf_bottom = float_bottom; }
+            else { rf_w = float_w; rf_bottom = float_bottom; }
+            continue;
+        }
+
+        int box_width = eff_width;
+        if (style.width > 0 && style.width < box_width) box_width = style.width;
 
         cursor_y += style.margin_top;
         int block_top = cursor_y;
@@ -173,12 +272,12 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
         int rect_idx = -1;
         if (style.has_background) {
             int before_count = ctx->doc->item_count;
-            add_item(ctx, LAYOUT_ITEM_RECT, x, block_top, width, 0, style.background_color, NULL, -1, child);
+            add_item(ctx, LAYOUT_ITEM_RECT, eff_x, block_top, box_width, 0, style.background_color, NULL, -1, child);
             if (ctx->doc->item_count > before_count) rect_idx = before_count;
         }
 
-        int child_x = x + style.padding_left;
-        int child_width = width - style.padding_left;
+        int child_x = eff_x + style.padding_left;
+        int child_width = box_width - style.padding_left;
         if (child_width < LAYOUT_CHAR_W) child_width = LAYOUT_CHAR_W;
 
         if (strcmp(child->tag, "li") == 0) push_word(ctx, "-", 1, style.color, -1, child);
@@ -188,10 +287,17 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
 
         cursor_y += style.padding_bottom;
 
+        if (style.height > 0 && block_top + style.padding_top + style.height > cursor_y) {
+            cursor_y = block_top + style.padding_top + style.height;
+        }
+
         if (rect_idx >= 0) ctx->doc->items[rect_idx].h = cursor_y - block_top;
 
         cursor_y += style.margin_bottom;
     }
+
+    if (lf_bottom > cursor_y) cursor_y = lf_bottom;
+    if (rf_bottom > cursor_y) cursor_y = rf_bottom;
     return cursor_y;
 }
 

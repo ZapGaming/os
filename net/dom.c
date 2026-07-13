@@ -99,6 +99,8 @@ static void parse_attrs(const char *html, uint32_t len, uint32_t *i, struct dom_
             if (tag_is(name, "id")) strncpy(node->id, value, DOM_MAX_ID - 1);
             else if (tag_is(name, "class")) strncpy(node->class_name, value, DOM_MAX_CLASS - 1);
             else if (tag_is(name, "href")) strncpy(node->href, value, DOM_MAX_HREF - 1);
+            else if (tag_is(name, "src")) strncpy(node->href, value, DOM_MAX_HREF - 1);
+            else if (tag_is(name, "rel")) strncpy(node->rel, value, DOM_MAX_REL - 1);
             else if (tag_is(name, "style")) strncpy(node->style, value, DOM_MAX_STYLE - 1);
         }
     }

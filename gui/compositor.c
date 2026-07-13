@@ -14,6 +14,7 @@
 #include <net/dom.h>
 #include <net/css.h>
 #include <net/layout.h>
+#include <net/bmp.h>
 #include <fs/fat32.h>
 #include <drivers/ac97.h>
 #include <drivers/wav.h>
@@ -35,6 +36,9 @@
  * resident (e.g. a WAV file the File Manager has open). */
 #define BR_FETCH_CAP   (2u * 1024 * 1024 - 65536)
 #define BR_CONTENT_TYPE_MAX 64
+#define BR_MAX_IMAGES     8
+#define BR_IMAGE_FETCH_CAP (300u * 1024)
+#define BR_CSS_FETCH_CAP   (32u * 1024)
 
 typedef struct {
     int x, y, w, h;
@@ -154,32 +158,47 @@ static void open_and_focus(int wi) {
     }
 }
 
+/* Window x/y positions below are designed against a 1024x768 desktop;
+ * on a bigger framebuffer (see boot/multiboot.asm's resolution request)
+ * they'd otherwise all stay clustered in the top-left corner of a much
+ * larger canvas. Scale positions (not sizes -- window bodies are already
+ * sized to fit their content, no reason to stretch them) up to match,
+ * but never shrink below the design baseline. */
+static int SX(int v) {
+    int fw = (int)fb_width();
+    return fw <= 1024 ? v : v * fw / 1024;
+}
+static int SY(int v) {
+    int fh = (int)fb_height();
+    return fh <= 768 ? v : v * fh / 768;
+}
+
 void gui_init(void) {
-    add_window(120, 90, 340, 190, "About ZapOS", "ABT",
+    add_window(SX(120), SY(90), 340, 190, "About ZapOS", "ABT",
                "A fully custom 32-bit OS kernel",
                "GUI + drivers written from scratch", 0x3E6FF0);
-    add_window(560, 160, 300, 170, "System Monitor", "SYS",
+    add_window(SX(560), SY(160), 300, 170, "System Monitor", "SYS",
                "Kernel heap + paging: online",
                "PS/2 keyboard + mouse: online", 0x2FBF71);
-    add_window(260, 340, 320, 150, "Roadmap", "MAP",
+    add_window(SX(260), SY(340), 320, 150, "Roadmap", "MAP",
                "Next up: process isolation + a filesystem",
                "See README.md for the plan", 0xE0954C);
 
-    int pm = add_window(640, 420, 320, 190, "Process Monitor", "PROC", NULL, NULL, 0xB05CE0);
+    int pm = add_window(SX(640), SY(420), 320, 190, "Process Monitor", "PROC", NULL, NULL, 0xB05CE0);
     windows[pm].is_process_monitor = 1;
 
-    int net = add_window(120, 460, 340, 190, "Network", "NET", NULL, NULL, 0x3ED0D8);
+    int net = add_window(SX(120), SY(460), 340, 190, "Network", "NET", NULL, NULL, 0x3ED0D8);
     windows[net].is_network = 1;
 
     if (fat32_is_mounted()) {
-        int fm = add_window(480, 560, 380, 220, "File Manager", "FILE", NULL, NULL, 0xF2C14E);
+        int fm = add_window(SX(480), SY(560), 380, 220, "File Manager", "FILE", NULL, NULL, 0xF2C14E);
         windows[fm].is_file_manager = 1;
         fm_current_dir = fat32_root_cluster();
         fm_refresh();
     }
 
     if (net_is_up()) {
-        int br = add_window(600, 60, 400, 400, "Browser", "WWW", NULL, NULL, 0x62D8FF);
+        int br = add_window(SX(600), SY(60), 500, 500, "Browser", "WWW", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
         br_window_idx = br;
         layout_doc_alloc(&br_layout);
@@ -610,6 +629,135 @@ static void br_derive_filename(const char *path, char *out, int out_cap) {
     out[out_cap - 1] = 0;
 }
 
+/* Joins `href` against `base_path`'s directory (unless `href` is itself
+ * root-relative, i.e. starts with '/'). Shared by br_resolve_href (for
+ * <a> navigation) and br_resolve_subresource (for <link>/<img>), so the
+ * two can never disagree about what a relative URL means. */
+static void br_join_path(const char *base_path, const char *href, char *out, int out_cap) {
+    if (href[0] == '/') {
+        strncpy(out, href, out_cap - 1);
+        out[out_cap - 1] = 0;
+        return;
+    }
+    char dir[64];
+    strncpy(dir, base_path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    char *found = NULL;
+    for (char *p = dir; *p; p++) if (*p == '/') found = p;
+    if (found) found[1] = 0;
+    else strcpy(dir, "/");
+
+    strncpy(out, dir, out_cap - 1);
+    out[out_cap - 1] = 0;
+    int dl = (int)strlen(out);
+    int hl = (int)strlen(href);
+    if (dl + hl < out_cap) strcpy(out + dl, href);
+}
+
+/* Resolves a sub-resource reference (a <link href> or <img src>, as
+ * opposed to an <a href> the user actually navigates to) against the
+ * page that referenced it, without touching the browser's own
+ * navigation state (br_url/br_status_msg) -- a missing image shouldn't
+ * clobber the address bar or status line. Returns 0 for schemes this
+ * browser can't fetch (https:, data:, empty) rather than 1 with a
+ * nonsense host/path. */
+static int br_resolve_subresource(const char *base_host, uint16_t base_port, const char *base_path,
+                                   const char *url, char *host_out, int host_cap,
+                                   uint16_t *port_out, char *path_out, int path_cap) {
+    if (!url[0] || url[0] == '#') return 0;
+    if (strncmp(url, "https://", 8) == 0 || strncmp(url, "data:", 5) == 0) return 0;
+    if (strncmp(url, "http://", 7) == 0) {
+        br_parse_url(url, host_out, host_cap, port_out, path_out, path_cap);
+        return 1;
+    }
+    strncpy(host_out, base_host, host_cap - 1);
+    host_out[host_cap - 1] = 0;
+    *port_out = base_port;
+    br_join_path(base_path, url, path_out, path_cap);
+    return 1;
+}
+
+/* Decoded <img> cache for the currently displayed page -- keyed by the
+ * DOM node so layout_get_image() (called from net/layout.c while laying
+ * out that exact <img> element) can look its pixels back up. Filled by
+ * br_load_subresources() right after the DOM parses and before the
+ * first layout, since layout needs each image's natural size to
+ * reserve space for it. Freed and reset on every navigation. */
+struct br_image_slot {
+    const struct dom_node *node;
+    struct bmp_image img;
+};
+static struct br_image_slot br_images[BR_MAX_IMAGES];
+static int br_image_count = 0;
+
+int layout_get_image(const struct dom_node *node, int *out_w, int *out_h, const uint32_t **out_pixels) {
+    for (int i = 0; i < br_image_count; i++) {
+        if (br_images[i].node == node) {
+            *out_w = br_images[i].img.width;
+            *out_h = br_images[i].img.height;
+            *out_pixels = br_images[i].img.pixels;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void br_images_reset(void) {
+    for (int i = 0; i < br_image_count; i++) bmp_free(&br_images[i].img);
+    br_image_count = 0;
+}
+
+/* Walks the DOM fetching every <link rel="stylesheet"> and <img> it
+ * finds, one HTTP request at a time (this browser only ever has one TCP
+ * connection open at once) -- external CSS is parsed straight into the
+ * page's stylesheet, images are decoded into br_images[] for
+ * layout_get_image() to find. Best-effort: a failed/unsupported
+ * sub-resource is silently skipped rather than aborting the page, same
+ * as a real browser would just show a broken-image icon and move on. */
+static void br_load_subresources(struct dom_node *node, const char *base_host, uint16_t base_port,
+                                  const char *base_path) {
+    for (struct dom_node *child = node->children; child; child = child->next) {
+        if (child->type != DOM_ELEMENT) continue;
+
+        if (strcmp(child->tag, "link") == 0 && strcmp(child->rel, "stylesheet") == 0 && child->href[0]) {
+            char host[64], path[64]; uint16_t port;
+            if (br_resolve_subresource(base_host, base_port, base_path, child->href,
+                                        host, sizeof(host), &port, path, sizeof(path))) {
+                char *buf = kmalloc(BR_CSS_FETCH_CAP + 1);
+                if (buf) {
+                    int status; uint32_t blen;
+                    if (http_get(host, port, path, &status, buf, BR_CSS_FETCH_CAP, &blen, NULL, 0) &&
+                        status >= 200 && status < 300) {
+                        css_parse_into(&br_stylesheet, buf, blen);
+                    }
+                    kfree(buf);
+                }
+            }
+        } else if (strcmp(child->tag, "img") == 0 && child->href[0] && br_image_count < BR_MAX_IMAGES) {
+            char host[64], path[64]; uint16_t port;
+            if (br_resolve_subresource(base_host, base_port, base_path, child->href,
+                                        host, sizeof(host), &port, path, sizeof(path))) {
+                char *buf = kmalloc(BR_IMAGE_FETCH_CAP + 1);
+                if (buf) {
+                    int status; uint32_t blen;
+                    if (http_get(host, port, path, &status, buf, BR_IMAGE_FETCH_CAP, &blen, NULL, 0) &&
+                        status >= 200 && status < 300) {
+                        struct bmp_image img;
+                        if (bmp_decode((const uint8_t *)buf, blen, &img)) {
+                            br_images[br_image_count].node = child;
+                            br_images[br_image_count].img = img;
+                            br_image_count++;
+                        }
+                    }
+                    kfree(buf);
+                }
+            }
+        }
+
+        br_load_subresources(child, base_host, base_port, base_path);
+    }
+}
+
 /* Runs synchronously on the GUI's own task -- the screen won't redraw
  * until this returns (a few seconds for a small page, longer for a
  * multi-MB download). A real async fetch would need a dedicated task
@@ -660,6 +808,7 @@ static void br_fetch(void) {
          * as the page that owns them is displayed. */
         if (br_dom_root) { dom_free(br_dom_root); br_dom_root = NULL; }
         if (br_stylesheet_valid) { css_stylesheet_free(&br_stylesheet); br_stylesheet_valid = 0; }
+        br_images_reset();
         js_arena_reset();
         js_dom_reset();
 
@@ -669,6 +818,12 @@ static void br_fetch(void) {
         css_stylesheet_init(&br_stylesheet);
         css_extract_style_blocks(&br_stylesheet, body, body_len);
         br_stylesheet_valid = 1;
+
+        /* External <link rel=stylesheet> and <img> both need their own
+         * HTTP fetch, done here (before layout, after DOM/inline-CSS)
+         * so the external rules are in the cascade and every image's
+         * natural size is known by the time layout_run() needs it. */
+        br_load_subresources(br_dom_root, host, port, path);
 
         /* Scripts run before the first layout so DOM mutations they
          * make (innerHTML, textContent, style) show up immediately
@@ -737,24 +892,7 @@ static int br_resolve_href(const char *href) {
     br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
 
     char new_path[64];
-    if (href[0] == '/') {
-        strncpy(new_path, href, sizeof(new_path) - 1);
-        new_path[sizeof(new_path) - 1] = 0;
-    } else {
-        /* Relative to the current path's directory. */
-        char dir[64];
-        strncpy(dir, path, sizeof(dir) - 1);
-        dir[sizeof(dir) - 1] = 0;
-        char *found = NULL;
-        for (char *p = dir; *p; p++) if (*p == '/') found = p;
-        if (found) found[1] = 0;
-        else strcpy(dir, "/");
-
-        strcpy(new_path, dir);
-        int dl = (int)strlen(new_path);
-        int hl = (int)strlen(href);
-        if (dl + hl < (int)sizeof(new_path)) strcpy(new_path + dl, href);
-    }
+    br_join_path(path, href, new_path, sizeof(new_path));
 
     int n = 0;
     n += (int)strlen(host);
@@ -802,7 +940,7 @@ static void br_handle_click(const gui_window_t *w, int mx, int my) {
 
     for (int i = 0; i < br_layout.item_count; i++) {
         const struct layout_item *it = &br_layout.items[i];
-        if (it->type != LAYOUT_ITEM_TEXT) continue;
+        if (it->type != LAYOUT_ITEM_TEXT && it->type != LAYOUT_ITEM_IMAGE) continue;
         if (doc_x < it->x || doc_x >= it->x + it->w || doc_y < it->y || doc_y >= it->y + it->h) continue;
 
         if (it->link_id >= 0) {
@@ -862,11 +1000,12 @@ static void draw_browser(const gui_window_t *w) {
     if (br_scroll > max_scroll) br_scroll = max_scroll;
     if (br_scroll < 0) br_scroll = 0;
 
-    /* Three passes so backgrounds always sit under rules and text,
+    /* Four passes so backgrounds always sit under images/rules/text,
      * regardless of the order layout emitted them in. */
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < 4; pass++) {
         enum layout_item_type want = pass == 0 ? LAYOUT_ITEM_RECT :
-                                      pass == 1 ? LAYOUT_ITEM_HR : LAYOUT_ITEM_TEXT;
+                                      pass == 1 ? LAYOUT_ITEM_IMAGE :
+                                      pass == 2 ? LAYOUT_ITEM_HR : LAYOUT_ITEM_TEXT;
         for (int i = 0; i < br_layout.item_count; i++) {
             const struct layout_item *it = &br_layout.items[i];
             if (it->type != want) continue;
@@ -876,7 +1015,22 @@ static void draw_browser(const gui_window_t *w) {
             int sy = content_y + (it->y - br_scroll);
             if (it->type == LAYOUT_ITEM_RECT) fb_fill_rect(sx, sy, it->w, it->h, it->color);
             else if (it->type == LAYOUT_ITEM_HR) fb_draw_line(sx, sy, sx + it->w, sy, it->color);
-            else fb_draw_string(sx, sy, it->text, it->color, 1);
+            else if (it->type == LAYOUT_ITEM_IMAGE) {
+                if (it->pixels) {
+                    /* it->w/it->h are the *display* size (CSS width/
+                     * height, if the page set one); the pixel buffer's
+                     * own dimensions -- needed as the blit's source
+                     * size when those differ -- live in the image
+                     * cache, keyed by the same <img> node. */
+                    int nat_w = 0, nat_h = 0;
+                    const uint32_t *ignored = NULL;
+                    layout_get_image(it->owner, &nat_w, &nat_h, &ignored);
+                    fb_blit_rgb(sx, sy, it->w, it->h, it->pixels,
+                                nat_w > 0 ? nat_w : it->w, nat_h > 0 ? nat_h : it->h);
+                } else {
+                    fb_draw_rect(sx, sy, it->w, it->h, 0xA8AFD6); /* broken-image placeholder */
+                }
+            } else fb_draw_string(sx, sy, it->text, it->color, 1);
         }
     }
 }

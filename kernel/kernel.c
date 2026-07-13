@@ -73,6 +73,23 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     ps2_init();
     keyboard_init();
     mouse_init();
+
+    /* Unmask every IRQ line this kernel actually drives at the PIC
+     * itself, rather than trusting whatever mask pic_remap() inherited
+     * from the BIOS/bootloader handoff -- the same class of bug fixed
+     * in ata.c's ATA_STATUS_FLOATING (something that happened to work
+     * under one BIOS/emulator's default mask isn't guaranteed under
+     * another). Concretely: IRQ1 was found masked on some boot paths,
+     * which silently ate all keyboard input with no error, just a
+     * text box that never responds to typing. IRQ2 is the master
+     * PIC's cascade line to the slave -- required for ANY slave IRQ
+     * (12, the mouse, here) to ever reach the CPU regardless of the
+     * slave's own mask bit. */
+    pic_clear_mask(0);  /* PIT timer */
+    pic_clear_mask(1);  /* PS/2 keyboard */
+    pic_clear_mask(2);  /* cascade to slave PIC */
+    pic_clear_mask(12); /* PS/2 mouse */
+
     if (mb_info.has_framebuffer) {
         mouse_set_bounds(mb_info.fb_width, mb_info.fb_height);
         fb_init((uint32_t)mb_info.fb_addr, mb_info.fb_pitch,

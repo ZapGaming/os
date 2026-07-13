@@ -16,14 +16,26 @@ you can keep building on.
   graphics framebuffer — no real-mode VBE/VGA BIOS calls needed.
 - **Core kernel**: GDT, IDT, ISR/IRQ dispatch, 8259 PIC remapping, PIT timer.
 - **Memory**: physical frame bitmap allocator, paging (4 GiB identity-mapped
-  via 4 MiB PSE pages), a first-fit `kmalloc`/`kfree` kernel heap.
+  via 4 MiB PSE pages), a first-fit `kmalloc`/`kfree` kernel heap (32MB —
+  sized to comfortably outlive the framebuffer's own back buffer, which
+  at 1920x1080x32bpp is already ~8MB on its own, on top of everything
+  else — browser fetch/image buffers, the JS arena, FAT32/audio
+  buffers — sharing the same arena).
 - **Drivers**: PS/2 keyboard (scancode set 1 → ASCII, shift/caps/ctrl
   state) and PS/2 mouse (relative packet decoding, button state).
 - **Graphics**: linear framebuffer primitives (pixels, rects, lines, filled
-  triangles, alpha blending, gradients) with an embedded 8x8 bitmap font.
+  triangles, alpha blending, gradients, RGB image blits) with an embedded
+  8x8 bitmap font. Boots at 1920x1080 if the host/hypervisor's VBE modes
+  support it (GRUB reports back whatever it actually granted, which the
+  kernel uses as-is — every part of the GUI reads the real width/height
+  at runtime instead of assuming a fixed size).
 - **GUI**: a compositor with a themed desktop background, draggable
-  windows with title bars/close buttons/drop shadows, a taskbar with a
-  live clock, and a custom-drawn cursor. Double-buffered to avoid tearing.
+  windows with title bars/close buttons (a real X, not just a colored
+  square)/drop shadows, a taskbar with a live clock and a dock of
+  per-app icons (color-coded, dims when closed, click to reopen/focus —
+  closing a window only hides it, so the dock is also the only way to
+  bring one back), and a custom-drawn cursor. Double-buffered to avoid
+  tearing.
 - **Preemptive multitasking**: a real scheduler with independent kernel
   stacks per task, driven off the PIT timer interrupt — tasks are switched
   transparently, not cooperatively. See "How the scheduler works" below.
@@ -51,22 +63,30 @@ you can keep building on.
   client on top of TCP (handles both `Content-Length` and chunked
   transfer-encoding), a real DOM tree parser (`net/dom.c`), a CSS parser
   and cascade (`net/css.c`, a UA default stylesheet plus a page's own
-  `<style>` blocks and inline `style=""`, with real property
-  inheritance), and a layout engine (`net/layout.c`) that walks the DOM
-  with resolved styles into block/inline boxes — real vertical margins
-  and padding, block-level background colors, `<hr>` rules, list-item
-  bullets, and per-word wrapped, individually-colored text runs. Links
-  are genuinely clickable: clicking one resolves the href (relative,
-  absolute-path, or absolute-URL) against the current page and
-  navigates. Fetching something that *isn't* HTML (by `Content-Type`,
-  or the URL's extension as a fallback) doesn't try to render it — it
-  gets saved straight to the FAT32 disk instead, so a song, video, or
-  any other file you point the browser at ends up as a real file in the
-  File Manager. The GUI's "Browser" window has a real address bar (with
-  optional `host:port`); press Enter and it resolves DNS, opens a TCP
-  connection, fetches, and either lays out or downloads. Verified
-  end-to-end against both real, live websites and a local multi-page
-  CSS test site (see "How the browser works" below).
+  `<style>` blocks, external `<link rel="stylesheet">` sheets (fetched
+  over their own HTTP request), and inline `style=""`, with real
+  property inheritance), and a layout engine (`net/layout.c`) that walks
+  the DOM with resolved styles into block/inline boxes — real vertical
+  margins and padding, explicit `width`/`height`, a simplified `float:
+  left`/`right` (content narrows around an active float and flows back
+  to full width once it clears — see "How the browser works" for the
+  exact simplification), block-level background colors, `<hr>` rules,
+  list-item bullets, per-word wrapped individually-colored text runs,
+  and `<img>` — fetched over HTTP and decoded if it's a BMP (see
+  `net/bmp.c`; no JPEG/PNG/GIF decoder exists, a deliberate scope limit
+  same as WAV-only audio), sized to its natural dimensions or an
+  explicit CSS `width`/`height`, broken-image gray box if it isn't.
+  Links (and linked images) are genuinely clickable: clicking one
+  resolves the href (relative, absolute-path, or absolute-URL) against
+  the current page and navigates. Fetching something that *isn't* HTML
+  (by `Content-Type`, or the URL's extension as a fallback) doesn't try
+  to render it — it gets saved straight to the FAT32 disk instead, so a
+  song, video, or any other file you point the browser at ends up as a
+  real file in the File Manager. The GUI's "Browser" window has a real
+  address bar (with optional `host:port`); press Enter and it resolves
+  DNS, opens a TCP connection, fetches, and either lays out or
+  downloads. Verified end-to-end against both real, live websites and a
+  local multi-page CSS test site (see "How the browser works" below).
 - **A real JavaScript engine**: a from-scratch lexer, recursive-descent
   parser, and tree-walking interpreter (`js/`) for a pragmatic ES5-ish
   subset — variables (`var`/`let`/`const` with real block scoping),
@@ -130,18 +150,25 @@ you can keep building on.
   can decode video or compressed audio codecs — that's a multi-year
   codec-engineering effort even for established projects, and genuinely
   out of scope here. WAV (uncompressed PCM) is the only playable format.
-- **The browser's CSS support is a pragmatic subset, not real CSS**: no
-  horizontal box model (no width/height/floats/inline-block, no
-  centering or horizontal margins — only vertical stacking with a fixed
-  left indent), no tables/images, no descendant/child selectors (only
-  bare tag, `.class`, `#id`, and `tag.class`), no `<style>` media
-  queries. There's no HTTPS (plain HTTP only — no TLS, so `https://`
-  links are refused rather than fetched), the fetch is synchronous and
-  blocks GUI redraws while it runs, and only one TCP connection can be
-  open at a time (no fetching a page and its images concurrently).
-  Downloads are capped at just under 2MB (the whole file has to fit in
-  memory at once — no streaming-to-disk) and derive their saved filename
-  from the URL path verbatim (no percent-decoding).
+- **The browser's CSS support is a pragmatic subset, not real CSS**:
+  `width`/`height` and a simplified `float: left`/`right` exist now
+  (see "How the browser works" for exactly how simplified — one active
+  float per side, no side-by-side packing, no `clear`), but there's
+  still no `inline-block`, no `flex`/`grid`, no centering or automatic
+  horizontal margins, no tables, no descendant/child selectors (only
+  bare tag, `.class`, `#id`, and `tag.class`), no percentage widths, no
+  `<style>` media queries. Images are BMP-only (`net/bmp.c`) — no
+  JPEG/PNG/GIF decoder exists. There's no HTTPS (plain HTTP only — no
+  TLS, so `https://` links are refused rather than fetched), the fetch
+  is synchronous and blocks GUI redraws while it runs, and only one TCP
+  connection can be open at a time (external stylesheets and each
+  image are fetched one at a time, sequentially, not concurrently with
+  the page or each other). Downloads are capped at just under 2MB (the
+  whole file has to fit in memory at once — no streaming-to-disk) and
+  derive their saved filename from the URL path verbatim (no
+  percent-decoding). Images are additionally capped at 256x256 (decoded
+  pixels stay resident for as long as the page is displayed, on top of
+  everything else sharing the kernel heap).
 - **Filesystem writes still can't delete or rename** — `fat32_write_file`
   can create and overwrite, but there's no way to remove a directory
   entry or grow a file's directory *tree* (only its own cluster chain
@@ -271,7 +298,16 @@ From there, three layers turn the raw HTML bytes into pixels:
   width, and each *word* becomes its own item with its own color and
   link id — which is what makes individual links genuinely clickable
   (hit-testing is just "does the click point fall inside this word's
-  box"), not merely styled.
+  box"), not merely styled. `width`/`height` narrow or (as a floor, not
+  a hard clip) heighten a block beyond its natural content size.
+  `float: left`/`right` is deliberately simplified rather than a full
+  CSS float algorithm: each block formatting context tracks at most one
+  active float per side, which carves out horizontal space (narrowing
+  `x`/`width` for whatever follows) until the flow's own cursor passes
+  the float's bottom edge; a second same-side float that starts before
+  the first clears stacks *below* it rather than beside it. `<img>` is
+  laid out like a sized block (or float) using its decoded BMP's natural
+  size, or an explicit CSS `width`/`height` if the page set one.
 
 The GUI's Browser window (`gui/compositor.c`) draws that item list in
 three passes (backgrounds, then rules, then text, so a block's own
@@ -366,6 +402,34 @@ never been exercised by a transfer bigger than a small HTML page:
    down (bug #5/#6 above hid behind it at first). Fixed by sizing both
    buffers to comfortably coexist (2MB each) and logging the
    out-of-memory case.
+8. **The same class of bug as #7, from a totally different direction:
+   bumping the boot resolution broke every page load with "Out of
+   memory."** The framebuffer's double-buffer (`gui/framebuffer.c`'s
+   `back_buffer`) scales with resolution — at 1920x1080x32bpp it's
+   ~8MB on its own, which is the *entire* kernel heap that used to
+   exist. Every browser fetch, external stylesheet, and image now had
+   nothing left to allocate into. Fixed by growing the heap to 32MB
+   (physical RAM was never the constraint — `pmm` routinely reports
+   100MB+ free; the heap's *static* 8MB size just predated a
+   1920x1080 framebuffer needing to fit in it too).
+9. **Verifying this against a real page exposed how fragile the test
+   setup's synthetic mouse input was** — QEMU's monitor `mouse_move`,
+   driven fast enough (many small steps in quick succession, to type a
+   URL into the address bar programmatically), would occasionally land
+   short of the intended position, so a click meant to focus the
+   address bar sometimes landed on empty desktop instead, silently. Not
+   a kernel bug — re-verifying the actual cursor position from a fresh
+   screenshot before every click, rather than trusting the requested
+   delta, made it reliable. While chasing this down, one genuine kernel
+   issue *did* turn up alongside it: like the ATA drive-detection fix
+   earlier in this project, nothing ever explicitly unmasked IRQ1
+   (keyboard), IRQ2 (the master PIC's cascade to the slave), or IRQ12
+   (mouse) — `pic_remap()` just kept whatever mask it inherited from
+   the bootloader handoff. That happened to leave them usable on every
+   boot tested so far, which isn't the same as being guaranteed to.
+   Fixed defensively, the same way as the ATA bug: explicitly unmask
+   every IRQ line the kernel actually drives right after initializing
+   its driver, instead of trusting an inherited default.
 
 ## How the JS engine works
 
@@ -613,8 +677,8 @@ drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
                  RTL8139 NIC, ATA, AC97 codec, WAV file parsing
 gui/             framebuffer primitives, bitmap font, window compositor
 net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
-                 from-scratch TCP/IP stack -- plus DOM/CSS/layout, a
-                 real (if pragmatic) web browser backend
+                 from-scratch TCP/IP stack -- plus DOM/CSS/layout and a
+                 BMP decoder, a real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
 js/              a from-scratch JS engine: lexer, parser, tree-walking
                  interpreter, and the DOM bindings that connect it to net/dom.c
@@ -654,10 +718,12 @@ ISO, which the kernel never reads back from.
 Preemptive multitasking, ring-3 user mode, syscalls, a full
 Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write/create FAT32
 filesystem, a web browser with a real (if pragmatic) CSS box-model
-layout engine, clickable links, and file downloads, AC97 audio with
-WAV playback, and a from-scratch JavaScript engine (lexer, parser,
-tree-walking interpreter, and DOM bindings with onclick interactivity)
-are now done (see above). Rough order of what's next:
+layout engine — including external stylesheets, images, and a
+simplified float/width/height model — clickable links and images, and
+file downloads, AC97 audio with WAV playback, and a from-scratch
+JavaScript engine (lexer, parser, tree-walking interpreter, and DOM
+bindings with onclick interactivity) are now done (see above). Rough
+order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -682,8 +748,12 @@ are now done (see above). Rough order of what's next:
    `gui/compositor.c`; user-mode processes (the eventual browser
    included) need a message-passing syscall API to create/draw into
    their own windows rather than being baked into the compositor.
-6. **A CSS horizontal box model** — width/height, floats or flexbox,
-   centering — the layout engine only stacks blocks vertically today.
+6. **A full CSS box model** — the current `float`/`width`/`height`
+   support is a deliberate simplification (one active float per side,
+   same-side floats stack rather than pack side-by-side, no
+   `flex`/`grid`, no `clear`, no percentage widths). Real flexbox/grid
+   and proper float packing would close most of the remaining gap with
+   real-world pages.
 7. **File delete/rename** — the FAT32 driver can create and overwrite
    files now, but there's still no way to remove or rename one from the
    File Manager.
@@ -694,6 +764,10 @@ are now done (see above). Rough order of what's next:
    `-mno-sse -mno-80387`, so real floats need emulation, not just
    enabling the FPU), prototype-based objects, and wiring `<script src>`
    through the existing HTTP fetch code.
+9. **A real image decoder** — only uncompressed BMP is supported
+   (`net/bmp.c`); JPEG/PNG/GIF would need a real DEFLATE/DCT
+   decompressor, a substantial project on its own, to cover what most
+   real-world pages actually use for images.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.

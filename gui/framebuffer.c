@@ -62,6 +62,17 @@ void fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
+void fb_blit_rgb(int x, int y, int w, int h, const uint32_t *pixels, int src_w, int src_h) {
+    if (!pixels || src_w <= 0 || src_h <= 0 || w <= 0 || h <= 0) return;
+    for (int dy = 0; dy < h; dy++) {
+        int sy = dy * src_h / h;
+        for (int dx = 0; dx < w; dx++) {
+            int sx = dx * src_w / w;
+            fb_put_pixel(x + dx, y + dy, pixels[sy * src_w + sx]);
+        }
+    }
+}
+
 void fb_draw_rect(int x, int y, int w, int h, uint32_t color) {
     for (int i = x; i < x + w; i++) {
         fb_put_pixel(i, y, color);

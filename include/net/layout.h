@@ -15,6 +15,7 @@ enum layout_item_type {
     LAYOUT_ITEM_TEXT,
     LAYOUT_ITEM_RECT,
     LAYOUT_ITEM_HR,
+    LAYOUT_ITEM_IMAGE,
 };
 
 /* One positioned, already-styled thing to draw, in document pixel
@@ -30,7 +31,16 @@ struct layout_item {
     char text[LAYOUT_TEXT_LEN]; /* LAYOUT_ITEM_TEXT only */
     int link_id;                /* index into doc->links, -1 if none */
     const struct dom_node *owner; /* nearest enclosing element, for JS onclick dispatch; NULL if none */
+    const uint32_t *pixels;     /* LAYOUT_ITEM_IMAGE only; w*h, top-to-bottom, 0xRRGGBB */
 };
+
+/* Implemented by the GUI/browser layer (gui/compositor.c), which is the
+ * only thing that actually fetches and decodes images -- net/layout.c
+ * itself never touches the network. Returns 1 and fills out_w/out_h/
+ * out_pixels if `node` (an <img> element) has an already-loaded image,
+ * 0 if it doesn't (fetch/decode failed, or the format isn't supported --
+ * see net/bmp.h for what is). */
+int layout_get_image(const struct dom_node *node, int *out_w, int *out_h, const uint32_t **out_pixels);
 
 struct layout_link {
     char href[DOM_MAX_HREF];

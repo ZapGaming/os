@@ -300,6 +300,14 @@ static void apply_decl(struct css_computed *out, const char *prop, const char *v
         out->padding_bottom = parse_px(value);
     } else if (strcmp(prop, "padding-left") == 0) {
         out->padding_left = parse_px(value);
+    } else if (strcmp(prop, "width") == 0) {
+        if (strcmp(value, "auto") != 0) out->width = parse_px(value);
+    } else if (strcmp(prop, "height") == 0) {
+        if (strcmp(value, "auto") != 0) out->height = parse_px(value);
+    } else if (strcmp(prop, "float") == 0) {
+        if (strcmp(value, "left") == 0) out->cssfloat = CSS_FLOAT_LEFT;
+        else if (strcmp(value, "right") == 0) out->cssfloat = CSS_FLOAT_RIGHT;
+        else out->cssfloat = CSS_FLOAT_NONE;
     }
 }
 
@@ -353,6 +361,9 @@ void css_compute_style(const struct dom_node *node, const struct css_stylesheet 
     out->bold = parent ? parent->bold : 0;
     out->display = CSS_DISPLAY_INLINE;
     out->has_background = 0;
+    out->width = -1;
+    out->height = -1;
+    out->cssfloat = CSS_FLOAT_NONE;
 
     for (const struct css_rule *rule = sheet->head; rule; rule = rule->next) {
         int matched = 0;

@@ -9,6 +9,7 @@
 #define DOM_MAX_HREF   192
 #define DOM_MAX_STYLE  160
 #define DOM_MAX_TITLE  128
+#define DOM_MAX_REL    16
 
 enum dom_node_type {
     DOM_ELEMENT,
@@ -24,7 +25,8 @@ struct dom_node {
     char tag[DOM_MAX_TAG];      /* lowercase, e.g. "p", "a", "h1" */
     char id[DOM_MAX_ID];
     char class_name[DOM_MAX_CLASS]; /* raw space-separated class list */
-    char href[DOM_MAX_HREF];    /* only meaningful for <a> */
+    char href[DOM_MAX_HREF];    /* <a href>, <link href>, or <img src> */
+    char rel[DOM_MAX_REL];      /* only meaningful for <link> */
     char style[DOM_MAX_STYLE];  /* raw inline style="" attribute text */
     char *text;                 /* kmalloc'd decoded text, DOM_TEXT only */
 

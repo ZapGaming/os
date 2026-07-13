@@ -2,7 +2,14 @@
 #include <kernel/serial.h>
 #include <stdint.h>
 
-#define HEAP_SIZE (8u * 1024 * 1024)
+/* Was 8MB, comfortable back when the framebuffer was 1024x768 (a ~3MB
+ * back buffer). At the higher resolution boot/multiboot.asm now
+ * requests, the back buffer alone can be ~8MB (1920x1080x32bpp), which
+ * left almost nothing for the browser's own fetch/image/CSS buffers on
+ * top of everything else sharing this arena. There's no shortage of
+ * physical RAM to back a bigger static arena with (pmm typically finds
+ * well over 100MB free), so just give it more room. */
+#define HEAP_SIZE (32u * 1024 * 1024)
 
 static uint8_t heap_arena[HEAP_SIZE] __attribute__((aligned(16)));
 

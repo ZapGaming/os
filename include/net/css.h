@@ -37,6 +37,12 @@ enum css_display {
     CSS_DISPLAY_NONE,
 };
 
+enum css_float {
+    CSS_FLOAT_NONE,
+    CSS_FLOAT_LEFT,
+    CSS_FLOAT_RIGHT,
+};
+
 /* A resolved (cascaded + inherited) style for one element, ready for
  * the layout engine to consume. */
 struct css_computed {
@@ -45,6 +51,8 @@ struct css_computed {
     int has_background;
     int bold;
     enum css_display display;
+    enum css_float cssfloat;
+    int width, height;   /* pixels; -1 means unset/auto */
     int margin_top, margin_bottom;
     int padding_top, padding_bottom, padding_left;
 };

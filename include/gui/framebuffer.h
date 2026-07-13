@@ -17,6 +17,12 @@ uint32_t fb_get_pixel(int x, int y);
 void fb_blend_pixel(int x, int y, uint32_t color, uint8_t alpha);
 
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
+
+/* Nearest-neighbor blit of an RGB pixel buffer (src_w*src_h, top-to-
+ * bottom, 0xRRGGBB) into the dest rect (x,y,w,h) -- scaled if w/h don't
+ * match src_w/src_h. Per-pixel bounds-checked via fb_put_pixel, same as
+ * everything else here, so it clips safely against window edges. */
+void fb_blit_rgb(int x, int y, int w, int h, const uint32_t *pixels, int src_w, int src_h);
 void fb_draw_rect(int x, int y, int w, int h, uint32_t color);
 void fb_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
 void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t color);
