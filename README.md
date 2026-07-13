@@ -91,15 +91,16 @@ you can keep building on.
   to full width once it clears — see "How the browser works" for the
   exact simplification), block-level background colors, `<hr>` rules,
   list-item bullets, per-word wrapped individually-colored text runs,
-  and `<img>` — fetched over HTTP and decoded if it's a BMP (see
-  `net/bmp.c`; no JPEG/PNG/GIF decoder exists, a deliberate scope limit
-  same as WAV-only audio), sized to its natural dimensions or an
+  and `<img>` — fetched over HTTP and decoded if it's a BMP (`net/bmp.c`)
+  or a PNG (`net/png.c`; 8-bit depth, non-interlaced, color types
+  0/2/3/4/6 only — see "What's stubbed" below for the exact limits; no
+  GIF/JPEG decoder exists yet), sized to its natural dimensions or an
   explicit CSS `width`/`height`, broken-image gray box if it isn't. This
   is enough real CSS support to pull actual readable content out of a
   modern, framework-generated page (Next.js/Tailwind-style minified CSS,
   including its `:root`-defined theme variables and flex rows) even
   though the page won't look pixel-right -- there's still no web font
-  loading, no JPEG/PNG images, and no canvas/JS-rendered content (see
+  loading, no JPEG images, and no canvas/JS-rendered content (see
   "What's stubbed" below).
   Links (and linked images) are genuinely clickable: clicking one
   resolves the href (relative, absolute-path, or absolute-URL) against
@@ -301,9 +302,18 @@ you can keep building on.
   selectors), no percentage widths, no `<style>` media queries, and no
   `@font-face`/web fonts of any kind (every glyph is the one embedded
   8x8 bitmap font, regardless of what a page's CSS asks for). Images
-  are BMP-only (`net/bmp.c`) — no JPEG/PNG/GIF decoder exists, so a
-  modern page's actual images always show as a broken-image box, and
-  there's no canvas/WebGL of any kind, so anything a page draws via
+  decode via `net/bmp.c` (uncompressed BMP) or `net/png.c` (PNG --
+  8-bit depth only, non-interlaced only, color types 0/2/3/4/6 only:
+  grayscale, RGB, palette, grayscale+alpha, RGBA; alpha is composited
+  against opaque white at decode time since this browser's pixel format
+  has no alpha channel; CRCs are read but not verified, same
+  don't-check-what-we-don't-need-to stance as gzip's CRC32/ISIZE). PNG's
+  IDAT stream reuses `net/gzip.c`'s existing `deflate_decompress()`
+  wholesale — it's already zlib-wrapped DEFLATE, the exact format that
+  function was built for. No JPEG or GIF decoder exists yet (JPEG needs
+  a DCT decoder, a genuinely different algorithm, not a scope extension
+  of PNG's chunk/filter approach), so a page using either still shows a
+  broken-image box, and there's no canvas/WebGL of any kind, so anything a page draws via
   `<canvas>` or renders only through client-side JS/React just doesn't
   appear (see "How the browser works" for what a real Next.js/React
   page running into all of this at once actually looks like). There's
@@ -1034,6 +1044,20 @@ never been exercised by a transfer bigger than a small HTML page:
     no code with the gradient path) was unaffected throughout and
     rendered correctly the whole time, including Tailwind's
     scientific-notation `rounded-full`.
+11. **PNG alpha compositing was off by one on every partially-transparent
+    pixel.** `net/png.c`'s RGBA/grayscale+alpha paths composite each
+    color channel against opaque white with `(component * alpha + 255 *
+    (255 - alpha)) / 255` -- integer truncation, not round-to-nearest, so
+    a result like `1000/255 = 3.92` came out `3` instead of the correct
+    rounded `4`. A host-side test comparing the real decoder's output
+    against Pillow's `Image.alpha_composite` byte-for-byte (see "How
+    HTTPS/TLS works" for why that's the standing practice) caught it
+    immediately: the RGB/grayscale/palette test images matched exactly,
+    but the one RGBA image was off by 1 on scattered pixels -- isolating
+    the bug to the alpha-blend arithmetic specifically, not the
+    chunk/DEFLATE/unfilter logic all four images share. Fixed by adding
+    `+127` (half of 255) before the final division, matching Pillow's
+    rounding convention.
 
 **What actually happens on a real modern (React/Next.js) page.** Tested
 against `failure.fail`, a real Next.js/Tailwind site with client-side
@@ -1043,9 +1067,11 @@ input box, and suggestion-pill text are all in the initial HTML, not
 injected by JS afterward), so the DOM/CSS/layout pipeline above --
 including the var()/flex additions -- pulls out genuinely readable text
 content: the actual headline and button copy render as real text, laid
-out in the right rough shape. What still doesn't work, and isn't
-realistically going to without each being its own multi-week project:
-the page's PNG logo shows as a broken-image box (BMP-only decoder), none
+out in the right rough shape. Its PNG logo (`/brand/logo-nav.png`, 8-bit
+RGBA, non-interlaced -- squarely inside `net/png.c`'s supported subset)
+now decodes and renders for real, in place of the broken-image box it
+used to show. What still doesn't work, and isn't realistically going to
+without each being its own multi-week project: none
 of its custom web fonts load (everything draws in the one embedded 8x8
 bitmap font), and its canvas-drawn animated background and any content
 that only exists because client-side JS/React rendered it after the
@@ -1556,8 +1582,8 @@ net/             Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP, TLS, HTTP --
                  a from-scratch TCP/IP stack (TLS 1.2 in tls.c, its crypto
                  primitives split into their own sha256.c/hmac.c/x25519.c/
                  aes.c/gcm.c, see "How HTTPS/TLS works" above) -- plus a
-                 gzip/DEFLATE decoder (gzip.c), DOM/CSS/layout, and a BMP
-                 decoder, a real (if pragmatic) web browser backend
+                 gzip/DEFLATE decoder (gzip.c), DOM/CSS/layout, and BMP/PNG
+                 decoders, a real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing,
                  read/write/delete/rename/mkdir)
 js/              a from-scratch JS engine: lexer, parser, tree-walking
@@ -1687,10 +1713,12 @@ done (see above). Rough order of what's next:
    `-mno-sse -mno-80387`, so real floats need emulation, not just
    enabling the FPU), prototype-based objects, and wiring `<script src>`
    through the existing HTTP fetch code.
-9. **A real image decoder** — only uncompressed BMP is supported
-   (`net/bmp.c`); JPEG/PNG/GIF would need a real DEFLATE/DCT
-   decompressor, a substantial project on its own, to cover what most
-   real-world pages actually use for images.
+9. **More image formats** — BMP (`net/bmp.c`) and PNG (`net/png.c`,
+   reusing `net/gzip.c`'s DEFLATE decompressor for IDAT) both decode now.
+   JPEG (baseline sequential DCT only, no progressive/arithmetic coding)
+   and animated GIF remain -- JPEG needs a real DCT/Huffman decoder, a
+   genuinely different algorithm family from PNG's chunk/filter approach
+   and a substantial project on its own.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.

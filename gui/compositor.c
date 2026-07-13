@@ -15,6 +15,7 @@
 #include <net/css.h>
 #include <net/layout.h>
 #include <net/bmp.h>
+#include <net/png.h>
 #include <fs/fat32.h>
 #include <drivers/ac97.h>
 #include <drivers/wav.h>
@@ -1345,7 +1346,8 @@ static void br_load_subresources(br_tab_t *t, struct dom_node *node, const char 
                     if (http_get(is_https, host, port, path, &status, buf, BR_IMAGE_FETCH_CAP, &blen, NULL, 0) &&
                         status >= 200 && status < 300) {
                         struct bmp_image img;
-                        if (bmp_decode((const uint8_t *)buf, blen, &img)) {
+                        if (bmp_decode((const uint8_t *)buf, blen, &img) ||
+                            png_decode((const uint8_t *)buf, blen, &img)) {
                             t->images[t->image_count].node = child;
                             t->images[t->image_count].img = img;
                             t->image_count++;
