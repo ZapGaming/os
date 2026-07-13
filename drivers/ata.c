@@ -24,20 +24,35 @@
 #define STATUS_DF  0x20
 #define STATUS_BSY 0x80
 
+/* Some emulators (QEMU) report status 0x00 on a floating/absent ATA bus;
+ * others (e.g. v86, and some real hardware) leave the bus floating high,
+ * which reads back as 0xFF. Either one means "nothing is there." Treating
+ * only 0x00 as "absent" made ata_wait_bsy() spin forever below on a status
+ * register that was permanently stuck at 0xFF (BSY always appears set)
+ * whenever no drive was attached under one of those emulators. */
+#define ATA_STATUS_FLOATING(s) ((s) == 0x00 || (s) == 0xFF)
+#define ATA_WAIT_TIMEOUT 100000
+
 static int disk_present = 0;
 
-static void ata_wait_bsy(void) {
-    while (inb(REG_STATUS) & STATUS_BSY);
+/* Bounded poll -- returns 1 once BSY clears, 0 on timeout (no drive, or a
+ * drive that's wedged). Never spins forever on a floating/absent bus. */
+static int ata_wait_bsy(void) {
+    for (uint32_t i = 0; i < ATA_WAIT_TIMEOUT; i++) {
+        if (!(inb(REG_STATUS) & STATUS_BSY)) return 1;
+    }
+    return 0;
 }
 
 /* Polls until the drive is ready to transfer data or reports an error.
- * Returns 1 if DRQ is set (ready), 0 on ERR/DF. */
+ * Returns 1 if DRQ is set (ready), 0 on ERR/DF/timeout. */
 static int ata_wait_drq(void) {
-    for (;;) {
+    for (uint32_t i = 0; i < ATA_WAIT_TIMEOUT; i++) {
         uint8_t status = inb(REG_STATUS);
         if (status & (STATUS_ERR | STATUS_DF)) return 0;
         if (status & STATUS_DRQ) return 1;
     }
+    return 0;
 }
 
 int ata_init(void) {
@@ -49,12 +64,15 @@ int ata_init(void) {
     outb(REG_COMMAND, CMD_IDENTIFY);
 
     uint8_t status = inb(REG_STATUS);
-    if (status == 0) {
+    if (ATA_STATUS_FLOATING(status)) {
         serial_printf("ata: no drive on primary master\n");
         return 0;
     }
 
-    ata_wait_bsy();
+    if (!ata_wait_bsy()) {
+        serial_printf("ata: primary master timed out leaving BSY -- treating as absent\n");
+        return 0;
+    }
 
     /* A non-zero LBA mid/high signature here means this isn't a plain ATA
      * disk (e.g. an ATAPI CD-ROM) -- skip it, we only handle hard disks. */
@@ -87,7 +105,7 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buf) {
     if (!disk_present) return 0;
     uint16_t *out = (uint16_t *)buf;
 
-    ata_wait_bsy();
+    if (!ata_wait_bsy()) return 0;
     ata_setup_lba(lba, count);
     outb(REG_COMMAND, CMD_READ_SECTORS);
 
@@ -102,7 +120,7 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf) {
     if (!disk_present) return 0;
     const uint16_t *in = (const uint16_t *)buf;
 
-    ata_wait_bsy();
+    if (!ata_wait_bsy()) return 0;
     ata_setup_lba(lba, count);
     outb(REG_COMMAND, CMD_WRITE_SECTORS);
 
@@ -111,8 +129,8 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buf) {
         for (int i = 0; i < 256; i++) outw(REG_DATA, *in++);
     }
 
-    ata_wait_bsy();
+    if (!ata_wait_bsy()) return 0;
     outb(REG_COMMAND, CMD_CACHE_FLUSH);
-    ata_wait_bsy();
+    if (!ata_wait_bsy()) return 0;
     return 1;
 }
