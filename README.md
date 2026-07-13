@@ -76,13 +76,17 @@ you can keep building on.
   works" below.
 - **A real web browser with a CSS box-model layout engine**: an HTTP/1.1
   client on top of TCP (handles both `Content-Length` and chunked
-  transfer-encoding), a real DOM tree parser (`net/dom.c`), a CSS parser
-  and cascade (`net/css.c`, a UA default stylesheet plus a page's own
-  `<style>` blocks, external `<link rel="stylesheet">` sheets (fetched
-  over their own HTTP request), and inline `style=""`, with real
-  property inheritance), and a layout engine (`net/layout.c`) that walks
-  the DOM with resolved styles into block/inline boxes — real vertical
-  margins and padding, explicit `width`/`height`, a simplified `float:
+  transfer-encoding, and transparently caches cacheable responses in
+  memory -- see "How the browser cache works" below), a real DOM tree
+  parser (`net/dom.c`), a CSS parser and cascade (`net/css.c`, a UA
+  default stylesheet plus a page's own `<style>` blocks, external `<link
+  rel="stylesheet">` sheets (fetched over their own HTTP request), and
+  inline `style=""`, with real property inheritance, custom-property
+  (`var(--name)`) resolution, and a basic `display: flex` row layout --
+  see "How the browser works" for exactly how simplified each of those
+  is), and a layout engine (`net/layout.c`) that walks the DOM with
+  resolved styles into block/inline/flex boxes — real vertical margins
+  and padding, explicit `width`/`height`, a simplified `float:
   left`/`right` (content narrows around an active float and flows back
   to full width once it clears — see "How the browser works" for the
   exact simplification), block-level background colors, `<hr>` rules,
@@ -90,7 +94,13 @@ you can keep building on.
   and `<img>` — fetched over HTTP and decoded if it's a BMP (see
   `net/bmp.c`; no JPEG/PNG/GIF decoder exists, a deliberate scope limit
   same as WAV-only audio), sized to its natural dimensions or an
-  explicit CSS `width`/`height`, broken-image gray box if it isn't.
+  explicit CSS `width`/`height`, broken-image gray box if it isn't. This
+  is enough real CSS support to pull actual readable content out of a
+  modern, framework-generated page (Next.js/Tailwind-style minified CSS,
+  including its `:root`-defined theme variables and flex rows) even
+  though the page won't look pixel-right -- there's still no web font
+  loading, no JPEG/PNG images, and no canvas/JS-rendered content (see
+  "What's stubbed" below).
   Links (and linked images) are genuinely clickable: clicking one
   resolves the href (relative, absolute-path, or absolute-URL) against
   the current page and navigates. Fetching something that *isn't* HTML
@@ -173,24 +183,44 @@ you can keep building on.
   codec-engineering effort even for established projects, and genuinely
   out of scope here. WAV (uncompressed PCM) is the only playable format.
 - **The browser's CSS support is a pragmatic subset, not real CSS**:
-  `width`/`height` and a simplified `float: left`/`right` exist now
-  (see "How the browser works" for exactly how simplified — one active
-  float per side, no side-by-side packing, no `clear`), but there's
-  still no `inline-block`, no `flex`/`grid`, no centering or automatic
-  horizontal margins, no tables, no descendant/child selectors (only
-  bare tag, `.class`, `#id`, and `tag.class`), no percentage widths, no
-  `<style>` media queries. Images are BMP-only (`net/bmp.c`) — no
-  JPEG/PNG/GIF decoder exists. There's no HTTPS (plain HTTP only — no
-  TLS, so `https://` links are refused rather than fetched), the fetch
-  is synchronous and blocks GUI redraws while it runs, and only one TCP
-  connection can be open at a time (external stylesheets and each
-  image are fetched one at a time, sequentially, not concurrently with
-  the page or each other). Downloads are capped at just under 2MB (the
+  `width`/`height`, a simplified `float: left`/`right`, a simplified
+  `display: flex` (row direction only gets its own layout -- see "How
+  the browser works" for exactly how simplified each is: one active
+  float per side, no side-by-side packing, no `clear`; no `flex-wrap`,
+  no real grow/shrink weighting, no `align-items`), and a single
+  document-wide `var(--name)` table (populated from `*`/`:root`/`:host`/
+  `html`/`body` rules, not real per-element cascading custom
+  properties) now exist, but there's still no `inline-block`, no CSS
+  `grid`, no centering or automatic horizontal margins, no tables, no
+  descendant/child selectors (only bare tag, `.class`, `#id`, and
+  `tag.class` -- which, incidentally, is a reasonable fit for
+  Tailwind-style atomic utility classes even without descendant
+  selectors), no percentage widths, no `<style>` media queries, and no
+  `@font-face`/web fonts of any kind (every glyph is the one embedded
+  8x8 bitmap font, regardless of what a page's CSS asks for). Images
+  are BMP-only (`net/bmp.c`) — no JPEG/PNG/GIF decoder exists, so a
+  modern page's actual images always show as a broken-image box, and
+  there's no canvas/WebGL of any kind, so anything a page draws via
+  `<canvas>` or renders only through client-side JS/React just doesn't
+  appear (see "How the browser works" for what a real Next.js/React
+  page running into all of this at once actually looks like). There's
+  no HTTPS (plain HTTP only — no TLS, so `https://` links are refused
+  rather than fetched), the fetch is synchronous and blocks GUI redraws
+  while it runs, and only one TCP connection can be open at a time
+  (external stylesheets and each image are fetched one at a time,
+  sequentially, not concurrently with the page or each other) --
+  partially offset by the response cache (see "How the browser cache
+  works") when the same URL was already fetched with a cacheable
+  `Cache-Control`, but a page's *first* visit still pays for every
+  resource sequentially. Downloads are capped at just under 2MB (the
   whole file has to fit in memory at once — no streaming-to-disk) and
   derive their saved filename from the URL path verbatim (no
-  percent-decoding). Images are additionally capped at 256x256 (decoded
-  pixels stay resident for as long as the page is displayed, on top of
-  everything else sharing the kernel heap).
+  percent-decoding). Images are additionally capped at 300KB fetched /
+  256x256 decoded (decoded pixels stay resident for as long as the page
+  is displayed, on top of everything else sharing the kernel heap), and
+  external stylesheets at 128KB (large enough for a real minified
+  Tailwind/Next.js bundle, per "How the browser works" below, but still
+  a hard cap, not streaming).
 - **Filesystem writes still can't delete or rename** — `fat32_write_file`
   can create and overwrite, but there's no way to remove a directory
   entry or grow a file's directory *tree* (only its own cluster chain
@@ -432,7 +462,27 @@ From there, three layers turn the raw HTML bytes into pixels:
   blockquote spacing) plus whatever the page's own `<style>` blocks and
   inline `style=""` attributes add, resolved with real property
   inheritance and a simple cascade (later rules win per-property; inline
-  style wins over everything).
+  style wins over everything). `css_resolve_custom_properties()` runs
+  once per page (after every stylesheet, including external ones, has
+  loaded) and populates one document-wide `--name -> value` table from
+  every `*`/`:root`/`:host`/`html`/`body` rule's custom-property
+  declarations; `apply_decl()` then resolves any `var(--name)` (or
+  `var(--name, fallback)`) it finds in a regular declaration's value
+  against that table before parsing it as a color/length/etc. This
+  isn't real per-element custom-property cascading -- it's a single
+  global table -- but it matches how generated CSS (Tailwind, Next.js,
+  shadcn, ...) actually defines its theme in practice: once, at the
+  root, referenced everywhere. `display: flex` is also recognized now,
+  though only `flex-direction: row` gets a real (if simplified) layout
+  pass -- see `net/layout.c`'s `layout_flex_row()` and "How the browser
+  works" below for what "simplified" means there. The parser's own
+  buffers were also sized for real minified output rather than hand-
+  written test pages: a single rule body can run past a kilobyte in
+  practice (one universal-selector reset rule in a real Tailwind bundle
+  had 58 declarations in it, just to zero out custom properties for
+  gradients/shadows/transforms this browser doesn't implement anyway),
+  and `CSS_MAX_SELECTOR` grew from 40 to 144 for selector lists that
+  run well past what a hand-written stylesheet ever would.
 - **`net/layout.c`** walks the DOM with resolved styles into a flat list
   of positioned render items in document-pixel space: block children
   stack vertically with real margins/padding, inline content (text,
@@ -572,6 +622,53 @@ never been exercised by a transfer bigger than a small HTML page:
    Fixed defensively, the same way as the ATA bug: explicitly unmask
    every IRQ line the kernel actually drives right after initializing
    its driver, instead of trusting an inherited default.
+
+**What actually happens on a real modern (React/Next.js) page.** Tested
+against `failure.fail`, a real Next.js/Tailwind site with client-side
+React, a canvas-drawn background, custom web fonts, and a ~48KB minified
+CSS bundle. The page's own HTML is server-rendered (its real headline,
+input box, and suggestion-pill text are all in the initial HTML, not
+injected by JS afterward), so the DOM/CSS/layout pipeline above --
+including the var()/flex additions -- pulls out genuinely readable text
+content: the actual headline and button copy render as real text, laid
+out in the right rough shape. What still doesn't work, and isn't
+realistically going to without each being its own multi-week project:
+the page's PNG logo shows as a broken-image box (BMP-only decoder), none
+of its custom web fonts load (everything draws in the one embedded 8x8
+bitmap font), and its canvas-drawn animated background and any content
+that only exists because client-side JS/React rendered it after the
+initial HTML never appears (this browser only runs a page's *inline*
+`<script>` tags -- see "How the JS engine works" below -- and has
+nothing resembling a React runtime). The honest summary: this is enough
+real CSS to make a modern site's actual *content* legible, not enough to
+make it look right.
+
+## How the browser cache works
+
+`net/http.c` keeps a small in-memory table (`HTTP_CACHE_ENTRIES = 8`,
+each up to `HTTP_CACHE_MAX_BODY = 256KB`) keyed by `host:port+path`.
+Every `http_get()` call checks it first -- a hit skips DNS/TCP/HTTP
+entirely and returns the cached status/body/Content-Type straight away
+(logged as `CACHED` rather than a fresh fetch, so it's visible in the
+serial log). After a real fetch, a `200` response whose own
+`Cache-Control` header both permits caching (no `no-store`/`no-cache`)
+and gives a real `max-age` gets stored, with that `max-age` (converted
+to a `pit_ticks()` deadline) as its TTL; a full slot table evicts
+whichever entry was least-recently-used.
+
+Deliberately left out, to keep this a same-session, single-feature
+addition rather than a second HTTP-caching project: there's no ETag/
+`If-None-Match` conditional-GET revalidation, so a resource served
+`max-age=0, must-revalidate` (common on CDN-fronted static assets --
+`failure.fail`'s own JS/CSS/image chunks are all served exactly that
+way) is never cached at all, even though a real browser would still
+save the round-trip via a cheap `304 Not Modified`. There's also no
+`Expires` header fallback (only `Cache-Control: max-age`) and no
+per-origin cache size accounting beyond the fixed 8-entry table. Verified
+with a local test server serving a page with `Cache-Control:
+public, max-age=120`: the first fetch logged a normal `status=200`, and
+a second fetch of the same URL logged `CACHED status=200` with the same
+body, with no second DNS/TCP round-trip in between.
 
 ## How the JS engine works
 
@@ -875,9 +972,10 @@ ISO, which the kernel never reads back from.
 Preemptive multitasking, ring-3 user mode, syscalls, a full
 Ethernet/ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP stack, a real read/write/create
 FAT32 filesystem, a web browser with a real (if pragmatic) CSS box-model
-layout engine — including external stylesheets, images, and a
-simplified float/width/height model — clickable links and images, and
-file downloads, AC97 audio with WAV playback, a from-scratch JavaScript
+layout engine — including external stylesheets, images, a simplified
+float/width/height/flex model, custom-property (`var()`) resolution, and
+an in-memory response cache — clickable links and images, and file
+downloads, AC97 audio with WAV playback, a from-scratch JavaScript
 engine (lexer, parser, tree-walking interpreter, and DOM bindings with
 onclick interactivity), and a minimal ELF loader that runs real programs
 from disk are now done (see above). Rough order of what's next:
@@ -906,12 +1004,20 @@ from disk are now done (see above). Rough order of what's next:
    `gui/compositor.c`; user-mode processes (the eventual browser
    included) need a message-passing syscall API to create/draw into
    their own windows rather than being baked into the compositor.
-6. **A full CSS box model** — the current `float`/`width`/`height`
-   support is a deliberate simplification (one active float per side,
-   same-side floats stack rather than pack side-by-side, no
-   `flex`/`grid`, no `clear`, no percentage widths). Real flexbox/grid
-   and proper float packing would close most of the remaining gap with
-   real-world pages.
+6. **A full CSS box model** — `float`/`width`/`height` and a basic
+   `flex-direction: row` are deliberate simplifications (one active
+   float per side, same-side floats stack rather than pack side-by-
+   side, no `clear`; flex has no wrap/grow-shrink weighting/
+   `align-items`, and `column` direction is just normal block stacking).
+   No CSS `grid` at all, no percentage widths, no `<style>` media
+   queries, and no `@font-face`/web font loading (every glyph still
+   comes from the one embedded 8x8 bitmap font, so even a page whose
+   CSS now parses and lays out correctly won't ever look
+   typographically right). Real flexbox wrapping/weighting, grid, and
+   web fonts would close most of the remaining visual gap with
+   real-world pages — see "How the browser works"' notes on testing
+   against a real Next.js/Tailwind site for what specifically still
+   doesn't render.
 7. **File delete/rename** — the FAT32 driver can create and overwrite
    files now, but there's still no way to remove or rename one from the
    File Manager.

@@ -22,6 +22,13 @@ struct layout_ctx {
     int links_dropped;
 };
 
+static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent,
+                            const struct css_computed *parent_style, int x, int width,
+                            int cursor_y, int link_id, const struct dom_node *owner);
+static int layout_flex_row(struct layout_ctx *ctx, const struct dom_node *parent,
+                            const struct css_computed *parent_style, int x, int width, int y,
+                            int link_id);
+
 void layout_doc_alloc(struct layout_doc *doc) {
     doc->items = kmalloc(sizeof(struct layout_item) * LAYOUT_MAX_ITEMS);
     doc->item_count = 0;
@@ -126,6 +133,91 @@ static int flush_flow(struct layout_ctx *ctx, int x, int width, int cursor_y) {
     }
     ctx->word_count = 0;
     return y + LAYOUT_LINE_H;
+}
+
+/* A deliberately simplified flexbox, used only for `flex-direction:
+ * row` (column direction is close enough to normal block stacking
+ * that layout_children() below just handles it directly instead).
+ * Every visible child keeps its own explicit CSS width if it set one;
+ * whatever width is left over is split equally among the children
+ * that didn't -- there's no real flex-grow/shrink weighting, no wrap
+ * (a row that overflows just overflows), and `align-items` isn't
+ * implemented (children are always top-aligned within the row, at
+ * their own natural height). justify-content only visibly matters
+ * when there's leftover space to distribute, i.e. when at least one
+ * child has an explicit width smaller than its equal share. */
+static int layout_flex_row(struct layout_ctx *ctx, const struct dom_node *parent,
+                            const struct css_computed *parent_style, int x, int width, int y,
+                            int link_id) {
+    int n = 0, explicit_sum = 0, auto_count = 0;
+    for (const struct dom_node *c = parent->children; c; c = c->next) {
+        if (c->type == DOM_TEXT) continue;
+        struct css_computed cs;
+        css_compute_style(c, ctx->sheet, parent_style, &cs);
+        if (cs.display == CSS_DISPLAY_NONE) continue;
+        n++;
+        if (cs.width > 0) explicit_sum += cs.width; else auto_count++;
+    }
+    if (n == 0) return y;
+
+    int gap = parent_style->gap;
+    int gap_total = gap * (n - 1);
+    int remaining = width - explicit_sum - gap_total;
+    if (remaining < 0) remaining = 0;
+    int auto_w = auto_count > 0 ? remaining / auto_count : 0;
+    if (auto_w < LAYOUT_CHAR_W) auto_w = LAYOUT_CHAR_W;
+
+    int total_used = explicit_sum + auto_count * auto_w + gap_total;
+    int extra = width - total_used;
+    if (extra < 0) extra = 0;
+    int start_x = x, extra_gap = 0;
+    if (parent_style->justify == CSS_JUSTIFY_CENTER) start_x = x + extra / 2;
+    else if (parent_style->justify == CSS_JUSTIFY_END) start_x = x + extra;
+    else if (parent_style->justify == CSS_JUSTIFY_BETWEEN && n > 1) extra_gap = extra / (n - 1);
+
+    int cx = start_x, max_bottom = y;
+    for (const struct dom_node *c = parent->children; c; c = c->next) {
+        if (c->type == DOM_TEXT) continue;
+        struct css_computed cs;
+        css_compute_style(c, ctx->sheet, parent_style, &cs);
+        if (cs.display == CSS_DISPLAY_NONE) continue;
+
+        int child_link_id = link_id;
+        if (strcmp(c->tag, "a") == 0 && c->href[0]) child_link_id = register_link(ctx, c->href);
+
+        int child_w = cs.width > 0 ? cs.width : auto_w;
+
+        int cy = y + cs.margin_top;
+        int block_top = cy;
+        cy += cs.padding_top;
+
+        int rect_idx = -1;
+        if (cs.has_background) {
+            int before = ctx->doc->item_count;
+            add_item(ctx, LAYOUT_ITEM_RECT, cx, block_top, child_w, 0, cs.background_color, NULL, -1, c);
+            if (ctx->doc->item_count > before) rect_idx = before;
+        }
+
+        int inner_x = cx + cs.padding_left;
+        int inner_w = child_w - cs.padding_left;
+        if (inner_w < LAYOUT_CHAR_W) inner_w = LAYOUT_CHAR_W;
+
+        int child_bottom = (cs.display == CSS_DISPLAY_FLEX && cs.flex_row)
+                                ? layout_flex_row(ctx, c, &cs, inner_x, inner_w, cy, child_link_id)
+                                : layout_children(ctx, c, &cs, inner_x, inner_w, cy, child_link_id, c);
+        child_bottom = flush_flow(ctx, inner_x, inner_w, child_bottom);
+        child_bottom += cs.padding_bottom;
+        if (cs.height > 0 && block_top + cs.padding_top + cs.height > child_bottom) {
+            child_bottom = block_top + cs.padding_top + cs.height;
+        }
+        if (rect_idx >= 0) ctx->doc->items[rect_idx].h = child_bottom - block_top;
+
+        int full_bottom = child_bottom + cs.margin_bottom;
+        if (full_bottom > max_bottom) max_bottom = full_bottom;
+
+        cx += child_w + gap + extra_gap;
+    }
+    return max_bottom;
 }
 
 static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent,
@@ -282,7 +374,9 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
 
         if (strcmp(child->tag, "li") == 0) push_word(ctx, "-", 1, style.color, -1, child);
 
-        cursor_y = layout_children(ctx, child, &style, child_x, child_width, cursor_y, child_link_id, child);
+        cursor_y = (style.display == CSS_DISPLAY_FLEX && style.flex_row)
+                       ? layout_flex_row(ctx, child, &style, child_x, child_width, cursor_y, child_link_id)
+                       : layout_children(ctx, child, &style, child_x, child_width, cursor_y, child_link_id, child);
         cursor_y = flush_flow(ctx, child_x, child_width, cursor_y);
 
         cursor_y += style.padding_bottom;

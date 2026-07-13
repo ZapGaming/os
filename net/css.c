@@ -10,6 +10,19 @@ static char to_lower_ch(char c) {
 
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
+/* No strstr() in this kernel's minimal freestanding string.h -- only
+ * needed here (to spot "var(" inside a declaration value), so it's a
+ * local helper rather than a new addition to the shared string lib. */
+static char *find_substr(char *hay, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (char *p = hay; *p; p++) {
+        int i = 0;
+        for (; i < nlen && p[i] && p[i] == needle[i]; i++) { }
+        if (i == nlen) return p;
+    }
+    return NULL;
+}
+
 /* The built-in "browser" defaults -- parsed through the same
  * css_parse_into() a page's own <style> rules go through, so there's
  * only one cascade implementation. Page rules are appended after this
@@ -91,7 +104,7 @@ void css_parse_into(struct css_stylesheet *sheet, const char *text, uint32_t len
         skip_ws_comments(text, len, &i);
         if (i >= len) break;
 
-        char selectors_raw[200];
+        char selectors_raw[512];
         int slen = 0;
         while (i < len && text[i] != '{' && slen < (int)sizeof(selectors_raw) - 1) {
             selectors_raw[slen++] = text[i++];
@@ -100,7 +113,17 @@ void css_parse_into(struct css_stylesheet *sheet, const char *text, uint32_t len
         if (i >= len) break; /* no rule body -- trailing garbage */
         i++; /* consume '{' */
 
-        char decls_raw[600];
+        /* Sized to hold a whole rule body in one piece (up to ~1.5KB
+         * seen in real minified Tailwind/Next.js output, e.g. the
+         * universal `*,:before,:after{...}` reset that defines dozens
+         * of --tw-* custom properties at once) -- NOT just "however
+         * many declarations we'll keep" (CSS_MAX_DECLS). If this
+         * buffer were sized to the latter and a real body ran past it,
+         * the raw-copy loop below would stop mid-body without ever
+         * consuming the rule's closing '}', desyncing the outer parse
+         * loop and corrupting every rule after it in the stylesheet --
+         * not just truncating the one oversized rule. */
+        char decls_raw[4096];
         int dlen = 0;
         while (i < len && text[i] != '}' && dlen < (int)sizeof(decls_raw) - 1) {
             decls_raw[dlen++] = text[i++];
@@ -272,7 +295,137 @@ static int parse_px(const char *value) {
     return neg ? -v : v;
 }
 
-static void apply_decl(struct css_computed *out, const char *prop, const char *value) {
+/* Global custom-property table -- see css_resolve_custom_properties()
+ * in css.h for why this is document-wide rather than per-element. */
+#define CSS_MAX_CUSTOM_PROPS 128
+#define CSS_CUSTOM_NAME_LEN  40
+#define CSS_CUSTOM_VALUE_LEN 160
+
+struct css_custom_prop { char name[CSS_CUSTOM_NAME_LEN]; char value[CSS_CUSTOM_VALUE_LEN]; };
+static struct css_custom_prop custom_props[CSS_MAX_CUSTOM_PROPS];
+static int custom_prop_count = 0;
+
+static void custom_add_or_update(const char *name, const char *value) {
+    for (int i = 0; i < custom_prop_count; i++) {
+        if (strcmp(custom_props[i].name, name) == 0) {
+            strncpy(custom_props[i].value, value, CSS_CUSTOM_VALUE_LEN - 1);
+            custom_props[i].value[CSS_CUSTOM_VALUE_LEN - 1] = 0;
+            return;
+        }
+    }
+    if (custom_prop_count >= CSS_MAX_CUSTOM_PROPS) return;
+    struct css_custom_prop *p = &custom_props[custom_prop_count++];
+    strncpy(p->name, name, CSS_CUSTOM_NAME_LEN - 1);
+    p->name[CSS_CUSTOM_NAME_LEN - 1] = 0;
+    strncpy(p->value, value, CSS_CUSTOM_VALUE_LEN - 1);
+    p->value[CSS_CUSTOM_VALUE_LEN - 1] = 0;
+}
+
+static int custom_lookup(const char *name, char *out, int out_cap) {
+    for (int i = 0; i < custom_prop_count; i++) {
+        if (strcmp(custom_props[i].name, name) == 0) {
+            strncpy(out, custom_props[i].value, (size_t)out_cap - 1);
+            out[out_cap - 1] = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Replaces the first "var(--name)" or "var(--name, fallback)" found in
+ * `buf` with its resolved value (or the literal fallback if the name
+ * isn't in the table, or empty text if there's neither) and reports
+ * whether it found one to replace at all -- called in a bounded loop
+ * by css_resolve_var_refs() below so one level of var-inside-var
+ * indirection still resolves without ever looping forever on a
+ * reference this table can't satisfy. */
+static void resolve_one_var(char *buf, int cap, int *found) {
+    char *start = find_substr(buf, "var(");
+    if (!start) { *found = 0; return; }
+    *found = 1;
+
+    char *inner = start + 4;
+    int depth = 1;
+    char *p = inner;
+    while (*p && depth > 0) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { depth--; if (depth == 0) break; }
+        p++;
+    }
+    char *close = p; /* the matching ')', or the trailing NUL if malformed */
+
+    char inner_buf[CSS_CUSTOM_VALUE_LEN];
+    int ilen = (int)(close - inner);
+    if (ilen < 0) ilen = 0;
+    if (ilen > (int)sizeof(inner_buf) - 1) ilen = (int)sizeof(inner_buf) - 1;
+    memcpy(inner_buf, inner, (size_t)ilen);
+    inner_buf[ilen] = 0;
+
+    char *comma = strchr(inner_buf, ',');
+    char *name = inner_buf;
+    char *fallback = NULL;
+    if (comma) { *comma = 0; fallback = comma + 1; trim(fallback); }
+    trim(name);
+    for (char *q = name; *q; q++) *q = to_lower_ch(*q);
+
+    char resolved[CSS_CUSTOM_VALUE_LEN];
+    if (!custom_lookup(name, resolved, sizeof(resolved))) {
+        if (fallback) { strncpy(resolved, fallback, sizeof(resolved) - 1); resolved[sizeof(resolved) - 1] = 0; }
+        else resolved[0] = 0;
+    }
+
+    char tmp[256];
+    int tp = 0;
+    for (const char *q = buf; q < start && tp < (int)sizeof(tmp) - 1; q++) tmp[tp++] = *q;
+    for (const char *q = resolved; *q && tp < (int)sizeof(tmp) - 1; q++) tmp[tp++] = *q;
+    const char *after = (*close == ')') ? close + 1 : close;
+    for (const char *q = after; *q && tp < (int)sizeof(tmp) - 1; q++) tmp[tp++] = *q;
+    tmp[tp] = 0;
+
+    strncpy(buf, tmp, (size_t)cap - 1);
+    buf[cap - 1] = 0;
+}
+
+static void css_resolve_var_refs(char *buf, int cap) {
+    for (int iter = 0; iter < 6; iter++) {
+        int found;
+        resolve_one_var(buf, cap, &found);
+        if (!found) break;
+    }
+}
+
+static int is_global_selector(const char *sel) {
+    return strcmp(sel, "*") == 0 || strcmp(sel, ":root") == 0 || strcmp(sel, ":host") == 0 ||
+           strcmp(sel, "html") == 0 || strcmp(sel, "body") == 0;
+}
+
+void css_resolve_custom_properties(const struct css_stylesheet *sheet) {
+    custom_prop_count = 0;
+    for (const struct css_rule *rule = sheet->head; rule; rule = rule->next) {
+        int is_global = 0;
+        for (int g = 0; g < rule->selector_count; g++) {
+            if (is_global_selector(rule->selectors[g])) { is_global = 1; break; }
+        }
+        if (!is_global) continue;
+        for (int d = 0; d < rule->decl_count; d++) {
+            const char *prop = rule->decls[d].prop;
+            if (prop[0] == '-' && prop[1] == '-') custom_add_or_update(prop, rule->decls[d].value);
+        }
+    }
+    /* One extra pass so a custom property whose own value references
+     * another one (e.g. --font-mono: var(--font-geist-mono), ...)
+     * resolves too, as far as this table can take it. */
+    for (int i = 0; i < custom_prop_count; i++) {
+        css_resolve_var_refs(custom_props[i].value, CSS_CUSTOM_VALUE_LEN);
+    }
+}
+
+static void apply_decl(struct css_computed *out, const char *prop, const char *raw_value) {
+    char value[CSS_VALUE_LEN];
+    strncpy(value, raw_value, CSS_VALUE_LEN - 1);
+    value[CSS_VALUE_LEN - 1] = 0;
+    if (find_substr(value, "var(")) css_resolve_var_refs(value, CSS_VALUE_LEN);
+
     if (strcmp(prop, "color") == 0) {
         int has; uint32_t c = parse_color(value, &has);
         if (has) out->color = c;
@@ -285,7 +438,18 @@ static void apply_decl(struct css_computed *out, const char *prop, const char *v
     } else if (strcmp(prop, "display") == 0) {
         if (strcmp(value, "none") == 0) out->display = CSS_DISPLAY_NONE;
         else if (strcmp(value, "inline") == 0) out->display = CSS_DISPLAY_INLINE;
+        else if (strcmp(value, "flex") == 0 || strcmp(value, "inline-flex") == 0) out->display = CSS_DISPLAY_FLEX;
         else out->display = CSS_DISPLAY_BLOCK;
+    } else if (strcmp(prop, "flex-direction") == 0) {
+        out->flex_row = strncmp(value, "column", 6) != 0;
+    } else if (strcmp(prop, "gap") == 0 || strcmp(prop, "column-gap") == 0) {
+        out->gap = parse_px(value);
+    } else if (strcmp(prop, "justify-content") == 0) {
+        if (strcmp(value, "center") == 0) out->justify = CSS_JUSTIFY_CENTER;
+        else if (strcmp(value, "flex-end") == 0 || strcmp(value, "end") == 0) out->justify = CSS_JUSTIFY_END;
+        else if (strcmp(value, "space-between") == 0 || strcmp(value, "space-around") == 0 ||
+                 strcmp(value, "space-evenly") == 0) out->justify = CSS_JUSTIFY_BETWEEN;
+        else out->justify = CSS_JUSTIFY_START;
     } else if (strcmp(prop, "margin") == 0) {
         out->margin_top = out->margin_bottom = parse_px(value);
     } else if (strcmp(prop, "margin-top") == 0) {
@@ -364,6 +528,9 @@ void css_compute_style(const struct dom_node *node, const struct css_stylesheet 
     out->width = -1;
     out->height = -1;
     out->cssfloat = CSS_FLOAT_NONE;
+    out->flex_row = 1;
+    out->gap = 0;
+    out->justify = CSS_JUSTIFY_START;
 
     for (const struct css_rule *rule = sheet->head; rule; rule = rule->next) {
         int matched = 0;

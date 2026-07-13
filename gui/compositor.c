@@ -39,7 +39,11 @@
 #define BR_CONTENT_TYPE_MAX 64
 #define BR_MAX_IMAGES     8
 #define BR_IMAGE_FETCH_CAP (300u * 1024)
-#define BR_CSS_FETCH_CAP   (32u * 1024)
+/* Real minified CSS from a modern build pipeline (Tailwind, Next.js,
+ * etc.) routinely runs 40-60KB for one bundle -- 32KB used to silently
+ * truncate a chunk of the sheet (safely, just losing whatever rules
+ * fell past the cut, not corrupting anything earlier). */
+#define BR_CSS_FETCH_CAP   (128u * 1024)
 
 typedef struct {
     int x, y, w, h;
@@ -853,6 +857,14 @@ static void br_fetch(void) {
          * so the external rules are in the cascade and every image's
          * natural size is known by the time layout_run() needs it. */
         br_load_subresources(br_dom_root, host, port, path);
+
+        /* Custom-property (var()) resolution needs the FINAL stylesheet
+         * -- including whatever external sheets br_load_subresources()
+         * just appended, since a page's own theme variables commonly
+         * live in one of those rather than an inline <style> block --
+         * so this runs after subresources load and before anything
+         * else reads a computed style. */
+        css_resolve_custom_properties(&br_stylesheet);
 
         /* Scripts run before the first layout so DOM mutations they
          * make (innerHTML, textContent, style) show up immediately

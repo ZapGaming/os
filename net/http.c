@@ -6,6 +6,9 @@
 #include <kernel/serial.h>
 #include <string.h>
 
+static int ci_starts_with(const char *s, const char *prefix);
+static uint32_t parse_uint(const char *s, const char *end);
+
 /* Sized to hold a whole response (headers + body) in one shot -- big
  * enough for a short downloaded clip, not big enough to stream an
  * arbitrarily large file (no chunked-to-disk streaming exists yet).
@@ -18,6 +21,130 @@
 #define HTTP_RAW_BUF_SIZE (2u * 1024 * 1024)
 
 static uint8_t *raw_buf = NULL;
+
+/* A small in-memory response cache, keyed by "host:port/path", so a
+ * page revisited (or a stylesheet/image shared by several pages) in
+ * the same boot skips the network entirely. Deliberately modest: only
+ * successful (status 200) responses that fit in HTTP_CACHE_MAX_BODY
+ * and whose own Cache-Control actually permits it (a real max-age,
+ * not "no-store"/"no-cache"/absent) get cached; there's no ETag/
+ * If-None-Match revalidation of a stale entry, and no Expires header
+ * support -- once max-age's TTL passes, a stale entry is just evicted
+ * and re-fetched from scratch, same as a cold cache. That covers the
+ * common, high-value case (content-hashed static assets served with
+ * a long max-age, e.g. Next.js's `/_next/static/...` chunks) without
+ * the added complexity a fully spec-correct HTTP cache would need. */
+#define HTTP_CACHE_ENTRIES     8
+#define HTTP_CACHE_MAX_BODY    (256u * 1024)
+#define HTTP_CACHE_KEY_LEN     160
+#define HTTP_CACHE_CT_LEN      64
+
+struct http_cache_entry {
+    char key[HTTP_CACHE_KEY_LEN];
+    uint8_t *body;
+    uint32_t body_len;
+    char content_type[HTTP_CACHE_CT_LEN];
+    int status;
+    uint32_t expires_tick; /* pit_ticks() value after which this entry is stale */
+    uint32_t last_used;
+    int valid;
+};
+
+static struct http_cache_entry http_cache[HTTP_CACHE_ENTRIES];
+static uint32_t http_cache_clock = 0;
+
+static void make_cache_key(char *out, uint32_t cap, const char *host, uint16_t port, const char *path) {
+    char portbuf[8];
+    int pi = 0;
+    uint16_t p = port;
+    char rev[8]; int ri = 0;
+    if (p == 0) rev[ri++] = '0';
+    while (p > 0) { rev[ri++] = (char)('0' + (p % 10)); p = (uint16_t)(p / 10); }
+    while (ri > 0) portbuf[pi++] = rev[--ri];
+    portbuf[pi] = 0;
+
+    (void)cap; /* host/port/path are already bounded well under HTTP_CACHE_KEY_LEN */
+    strcpy(out, host);
+    strcat(out, ":");
+    strcat(out, portbuf);
+    strcat(out, path);
+}
+
+static struct http_cache_entry *cache_find(const char *key) {
+    for (int i = 0; i < HTTP_CACHE_ENTRIES; i++) {
+        if (http_cache[i].valid && strcmp(http_cache[i].key, key) == 0) {
+            if (pit_ticks() < http_cache[i].expires_tick) return &http_cache[i];
+            /* Stale -- free it now rather than waiting for eviction to
+             * bother, so a repeated miss on the same URL doesn't leak. */
+            kfree(http_cache[i].body);
+            http_cache[i].body = NULL;
+            http_cache[i].valid = 0;
+        }
+    }
+    return NULL;
+}
+
+/* Case-insensitively finds `token` (e.g. "no-store") as a whole
+ * comma-separated directive inside a Cache-Control value. */
+static int cache_control_has(const char *value, const char *end, const char *token) {
+    uint32_t tok_len = (uint32_t)strlen(token);
+    const char *p = value;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == ',')) p++;
+        const char *tok_start = p;
+        if ((uint32_t)(end - p) >= tok_len && ci_starts_with(p, token)) {
+            const char *after = p + tok_len;
+            if (after >= end || *after == ',' || *after == ' ' || *after == '=') return 1;
+        }
+        while (p < end && *p != ',') p++;
+        if (p == tok_start) p++;
+    }
+    return 0;
+}
+
+static int cache_control_max_age(const char *value, const char *end) {
+    const char *p = value;
+    while (p < end) {
+        if ((uint32_t)(end - p) >= 8 && ci_starts_with(p, "max-age=")) {
+            return (int)parse_uint(p + 8, end);
+        }
+        p++;
+    }
+    return -1;
+}
+
+static void cache_store(const char *key, int status, const char *content_type,
+                         const uint8_t *body, uint32_t body_len, uint32_t max_age_secs) {
+    if (status != 200 || body_len == 0 || body_len > HTTP_CACHE_MAX_BODY || max_age_secs == 0) return;
+
+    int slot = -1;
+    for (int i = 0; i < HTTP_CACHE_ENTRIES; i++) {
+        if (!http_cache[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        uint32_t oldest = 0xFFFFFFFFu;
+        for (int i = 0; i < HTTP_CACHE_ENTRIES; i++) {
+            if (http_cache[i].last_used < oldest) { oldest = http_cache[i].last_used; slot = i; }
+        }
+    }
+    if (slot < 0) return;
+
+    uint8_t *copy = (uint8_t *)kmalloc(body_len);
+    if (!copy) return;
+    memcpy(copy, body, body_len);
+
+    if (http_cache[slot].valid) kfree(http_cache[slot].body);
+    strncpy(http_cache[slot].key, key, HTTP_CACHE_KEY_LEN - 1);
+    http_cache[slot].key[HTTP_CACHE_KEY_LEN - 1] = 0;
+    http_cache[slot].body = copy;
+    http_cache[slot].body_len = body_len;
+    strncpy(http_cache[slot].content_type, content_type ? content_type : "", HTTP_CACHE_CT_LEN - 1);
+    http_cache[slot].content_type[HTTP_CACHE_CT_LEN - 1] = 0;
+    http_cache[slot].status = status;
+    http_cache[slot].expires_tick = pit_ticks() + max_age_secs * 100u; /* PIT runs at 100Hz */
+    http_cache[slot].last_used = http_cache_clock++;
+    http_cache[slot].valid = 1;
+}
 
 static int ci_char_eq(char a, char b) {
     if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
@@ -96,6 +223,23 @@ int http_get(const char *host, uint16_t port, const char *path,
     *body_len_out = 0;
     if (content_type_out && content_type_cap) content_type_out[0] = 0;
 
+    char cache_key[HTTP_CACHE_KEY_LEN];
+    make_cache_key(cache_key, sizeof(cache_key), host, port, path);
+    struct http_cache_entry *hit = cache_find(cache_key);
+    if (hit) {
+        *status_out = hit->status;
+        uint32_t n = hit->body_len < body_cap ? hit->body_len : body_cap;
+        memcpy(body_out, hit->body, n);
+        *body_len_out = n;
+        if (content_type_out && content_type_cap) {
+            strncpy(content_type_out, hit->content_type, content_type_cap - 1);
+            content_type_out[content_type_cap - 1] = 0;
+        }
+        hit->last_used = http_cache_clock++;
+        serial_printf("http: %s%s -> CACHED status=%d body=%u bytes\n", host, path, hit->status, n);
+        return 1;
+    }
+
     if (!raw_buf) raw_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
     if (!raw_buf) {
         serial_printf("http: out of memory allocating %u-byte receive buffer\n", HTTP_RAW_BUF_SIZE);
@@ -160,17 +304,23 @@ int http_get(const char *host, uint16_t port, const char *path,
     const char *chunked = find_header((const char *)raw_buf, header_end, "transfer-encoding");
     int is_chunked = chunked && ci_starts_with(chunked, "chunked");
 
-    if (content_type_out && content_type_cap) {
+    char content_type_buf[HTTP_CACHE_CT_LEN];
+    content_type_buf[0] = 0;
+    {
         const char *ct = find_header((const char *)raw_buf, header_end, "content-type");
         if (ct) {
             const char *line_end = ct;
             const char *hdr_end = (const char *)raw_buf + header_end;
             while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
             uint32_t n = (uint32_t)(line_end - ct);
-            if (n > content_type_cap - 1) n = content_type_cap - 1;
-            memcpy(content_type_out, ct, n);
-            content_type_out[n] = 0;
+            if (n > sizeof(content_type_buf) - 1) n = sizeof(content_type_buf) - 1;
+            memcpy(content_type_buf, ct, n);
+            content_type_buf[n] = 0;
         }
+    }
+    if (content_type_out && content_type_cap) {
+        strncpy(content_type_out, content_type_buf, content_type_cap - 1);
+        content_type_out[content_type_cap - 1] = 0;
     }
 
     uint32_t body_len;
@@ -187,5 +337,19 @@ int http_get(const char *host, uint16_t port, const char *path,
     *body_len_out = body_len;
     serial_printf("http: %s%s -> status=%d body=%u bytes%s\n",
                   host, path, *status_out, body_len, is_chunked ? " (chunked)" : "");
+
+    const char *cc = find_header((const char *)raw_buf, header_end, "cache-control");
+    if (cc) {
+        const char *hdr_end = (const char *)raw_buf + header_end;
+        const char *line_end = cc;
+        while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
+        if (!cache_control_has(cc, line_end, "no-store") && !cache_control_has(cc, line_end, "no-cache")) {
+            int max_age = cache_control_max_age(cc, line_end);
+            if (max_age > 0) {
+                cache_store(cache_key, *status_out, content_type_buf, (const uint8_t *)body_out,
+                            body_len, (uint32_t)max_age);
+            }
+        }
+    }
     return 1;
 }
