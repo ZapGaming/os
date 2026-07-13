@@ -46,7 +46,15 @@ static void tcp_send_segment(uint8_t flags, const void *data, uint16_t data_len)
     hdr->ack = net_htonl((flags & TCP_FLAG_ACK) ? conn.recv_seq : 0);
     hdr->data_offset = (uint8_t)(5 << 4); /* 20-byte header, no options */
     hdr->flags = flags;
-    hdr->window = net_htons(8192);
+    /* Advertise real available space, not a fixed number -- a static
+     * window means we never tell the sender to pause once recv_buf
+     * fills (window should drop to 0) or resume once tcp_recv() drains
+     * it back out (window should rise again). Without this, filling
+     * the buffer once left both sides permanently stuck: us waiting
+     * for data the sender no longer felt free to send, and the sender
+     * waiting for a window update that a fixed field could never
+     * give it. */
+    hdr->window = net_htons((uint16_t)(TCP_RECV_BUF_SIZE - conn.recv_len));
     hdr->checksum = 0;
     hdr->urgent_ptr = 0;
     if (data_len) memcpy(buf + sizeof(struct tcp_header), data, data_len);
@@ -202,11 +210,19 @@ void tcp_handle_packet(const uint8_t *data, uint16_t len, uint32_t src_ip) {
 
         case TCP_ESTABLISHED:
             if (payload_len > 0 && seq == conn.recv_seq) {
+                /* Only advance recv_seq (and thus what the ACK below
+                 * claims we've received) by what actually fit in
+                 * recv_buf -- acking bytes we had no room to store
+                 * would silently lose them forever instead of letting
+                 * the sender's retransmit timer resend them once
+                 * tcp_recv() has drained some space. This is exactly
+                 * what caused downloads past ~32KB (this buffer's
+                 * size) to come back truncated. */
                 uint32_t space = TCP_RECV_BUF_SIZE - conn.recv_len;
                 uint32_t copy_len = payload_len < space ? payload_len : space;
                 memcpy(conn.recv_buf + conn.recv_len, payload, copy_len);
                 conn.recv_len += copy_len;
-                conn.recv_seq += payload_len;
+                conn.recv_seq += copy_len;
                 tcp_send_segment(TCP_FLAG_ACK, NULL, 0);
             }
             if (hdr->flags & TCP_FLAG_FIN) {

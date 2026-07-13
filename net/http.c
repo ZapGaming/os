@@ -2,12 +2,22 @@
 #include <net/dns.h>
 #include <net/tcp.h>
 #include <kernel/pit.h>
+#include <kernel/kheap.h>
 #include <kernel/serial.h>
 #include <string.h>
 
-#define HTTP_RAW_BUF_SIZE (256 * 1024)
+/* Sized to hold a whole response (headers + body) in one shot -- big
+ * enough for a short downloaded clip, not big enough to stream an
+ * arbitrarily large file (no chunked-to-disk streaming exists yet).
+ * Allocated lazily on first use rather than as a permanent chunk of
+ * kernel BSS. Kept well under half the 8MB kheap arena on purpose: the
+ * browser's own per-fetch body buffer (roughly this size too) and any
+ * audio file already loaded by the File Manager all have to coexist
+ * in the same heap, and kmalloc() returning NULL here used to fail
+ * completely silently -- see the log line below. */
+#define HTTP_RAW_BUF_SIZE (2u * 1024 * 1024)
 
-static uint8_t raw_buf[HTTP_RAW_BUF_SIZE];
+static uint8_t *raw_buf = NULL;
 
 static int ci_char_eq(char a, char b) {
     if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
@@ -80,9 +90,17 @@ static uint32_t decode_chunked(const uint8_t *data, uint32_t len, uint8_t *out, 
 }
 
 int http_get(const char *host, uint16_t port, const char *path,
-             int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out) {
+             int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
+             char *content_type_out, uint32_t content_type_cap) {
     *status_out = 0;
     *body_len_out = 0;
+    if (content_type_out && content_type_cap) content_type_out[0] = 0;
+
+    if (!raw_buf) raw_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
+    if (!raw_buf) {
+        serial_printf("http: out of memory allocating %u-byte receive buffer\n", HTTP_RAW_BUF_SIZE);
+        return 0;
+    }
 
     uint32_t ip;
     if (!dns_resolve(host, &ip)) return 0;
@@ -111,7 +129,9 @@ int http_get(const char *host, uint16_t port, const char *path,
         } else {
             pit_sleep(20);
         }
-        if (total >= HTTP_RAW_BUF_SIZE - 4096) break;
+        if (total >= HTTP_RAW_BUF_SIZE - 4096) {
+            break;
+        }
     }
     tcp_close();
 
@@ -139,6 +159,19 @@ int http_get(const char *host, uint16_t port, const char *path,
 
     const char *chunked = find_header((const char *)raw_buf, header_end, "transfer-encoding");
     int is_chunked = chunked && ci_starts_with(chunked, "chunked");
+
+    if (content_type_out && content_type_cap) {
+        const char *ct = find_header((const char *)raw_buf, header_end, "content-type");
+        if (ct) {
+            const char *line_end = ct;
+            const char *hdr_end = (const char *)raw_buf + header_end;
+            while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
+            uint32_t n = (uint32_t)(line_end - ct);
+            if (n > content_type_cap - 1) n = content_type_cap - 1;
+            memcpy(content_type_out, ct, n);
+            content_type_out[n] = 0;
+        }
+    }
 
     uint32_t body_len;
     if (is_chunked) {

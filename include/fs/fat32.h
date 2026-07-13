@@ -30,7 +30,10 @@ int fat32_list_dir(uint32_t dir_cluster, struct fat_dirent_info *out, int max_en
 uint32_t fat32_read_file(uint32_t cluster, uint32_t file_size, void *buf, uint32_t max_len);
 
 /* Creates (or overwrites, if it already exists) an 8.3-named file in
- * `dir_cluster` with the given contents. Returns 1 on success. */
+ * `dir_cluster` with the given contents -- allocates a new directory
+ * entry (growing the directory by a cluster if every existing slot is
+ * in use) when the name doesn't already exist. Returns 1 on success,
+ * 0 if the disk is full. */
 int fat32_write_file(uint32_t dir_cluster, const char *name_8_3, const void *data, uint32_t len);
 
 #endif

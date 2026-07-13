@@ -58,24 +58,47 @@ you can keep building on.
   bullets, and per-word wrapped, individually-colored text runs. Links
   are genuinely clickable: clicking one resolves the href (relative,
   absolute-path, or absolute-URL) against the current page and
-  navigates. The GUI's "Browser" window has a real address bar (with
+  navigates. Fetching something that *isn't* HTML (by `Content-Type`,
+  or the URL's extension as a fallback) doesn't try to render it — it
+  gets saved straight to the FAT32 disk instead, so a song, video, or
+  any other file you point the browser at ends up as a real file in the
+  File Manager. The GUI's "Browser" window has a real address bar (with
   optional `host:port`); press Enter and it resolves DNS, opens a TCP
-  connection, fetches the page, and lays it out. Verified end-to-end
-  against both a real, live website and a local multi-page CSS test
-  site (see "How the browser works" below).
+  connection, fetches, and either lays out or downloads. Verified
+  end-to-end against both real, live websites and a local multi-page
+  CSS test site (see "How the browser works" below).
+- **Audio**: a real AC97 codec driver (`drivers/ac97.c`, bus-master DMA
+  via a descriptor list, matching what QEMU's `-device AC97` emulates)
+  and a WAV file parser (`drivers/wav.c`). The File Manager can play any
+  16-bit/48kHz WAV file on the disk (P to play, S to stop) — genuinely
+  through the hardware's DMA engine, not a software mixer. See "How
+  audio works" below for how this was actually verified (QEMU's default
+  "no backend" audio setup never exposed a real bug that a proper
+  backend did) and its real limits (WAV only — no MP3/video decoding of
+  any kind exists, or is realistically in scope for a from-scratch OS
+  built solo).
 - **Filesystem**: an ATA PIO disk driver and a real FAT32 driver (BPB
-  parsing, FAT-chain walking, directory listing, file read *and* write)
-  on a separate 64MB disk image. The GUI's "File Manager" window browses
-  it live — click a folder to navigate in, click a file to preview it,
-  and `NOTES.TXT` is actually editable: type into it, press Enter to
-  save, and it persists across a full reboot (verified end-to-end,
-  including through the GUI itself — see "How the filesystem works").
+  parsing, FAT-chain walking, directory listing, file read/write *and*
+  creating brand-new files — allocating a free directory entry, or
+  growing the directory by a cluster if it's full) on a separate 64MB
+  disk image. The GUI's "File Manager" window browses it live — click a
+  folder to navigate in, click a file to preview it (or play it, for
+  audio), and `NOTES.TXT` is actually editable: type into it, press
+  Enter to save, and it persists across a full reboot (verified
+  end-to-end, including through the GUI itself — see "How the
+  filesystem works"). The listing also shows a live item count and
+  color-codes/tags entries by type (directories, `.WAV` audio, plain
+  files).
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
 ## What's stubbed / not yet built
 
-- **Audio**: no sound driver yet.
+- **No video or compressed-audio playback of any kind**: the browser can
+  *download* a `.mkv`/`.mp3`/anything to disk, but nothing on this OS
+  can decode video or compressed audio codecs — that's a multi-year
+  codec-engineering effort even for established projects, and genuinely
+  out of scope here. WAV (uncompressed PCM) is the only playable format.
 - **The browser's CSS support is a pragmatic subset, not real CSS**: no
   horizontal box model (no width/height/floats/inline-block, no
   centering or horizontal margins — only vertical stacking with a fixed
@@ -85,14 +108,18 @@ you can keep building on.
   links are refused rather than fetched), the fetch is synchronous and
   blocks GUI redraws while it runs, and only one TCP connection can be
   open at a time (no fetching a page and its images concurrently).
-- **Filesystem writes are constrained**: `fat32_write_file` can only
-  overwrite a file that already exists in a directory (it doesn't create
-  new directory entries or grow a directory) — the shipped disk image
-  pre-creates `NOTES.TXT` as an empty placeholder for exactly this reason.
+  Downloads are capped at just under 2MB (the whole file has to fit in
+  memory at once — no streaming-to-disk) and derive their saved filename
+  from the URL path verbatim (no percent-decoding).
+- **Filesystem writes still can't delete or rename** — `fat32_write_file`
+  can create and overwrite, but there's no way to remove a directory
+  entry or grow a file's directory *tree* (only its own cluster chain
+  and, for the immediate parent, one additional directory cluster).
 - **No DHCP**: the IP config is static, matching QEMU's default SLIRP
   network so `make run` just works. Incoming packet checksums aren't
   validated (outgoing ones are computed correctly). TCP is client-only
-  (active-open) — there's no listening/server side.
+  (active-open), single-connection (no concurrent sockets) — there's no
+  listening/server side.
 - **Real process isolation**: every task (kernel and ring-3) shares the
   same identity-mapped address space — there's no per-process page
   directory yet, so a user task *could* read/write kernel memory or
@@ -185,10 +212,15 @@ blocks (with a timeout, via `pit_ticks()`) waiting for the reply,
 including handling DNS name compression pointers in the response.
 `net/tcp.c` is a single-connection, client-only, active-open state
 machine (`SYN_SENT` → `ESTABLISHED` → `FIN_WAIT1/2` → `LAST_ACK`) with
-stop-and-wait retransmission — send a segment, wait for its ACK before
-sending the next one, no windowing or congestion control. `net/http.c`
-drives that to do an HTTP/1.1 GET, and understands both `Content-Length`
-and chunked transfer-encoding responses.
+stop-and-wait retransmission for its *own* sends (write a segment, wait
+for its ACK before sending the next one — no congestion control), and a
+real (if fixed-size, 32KB) receive window that's actually advertised
+and enforced on the receive side — see bugs #5/#6 below for what that
+took to get right. `net/http.c` drives the connection to do an HTTP/1.1
+GET, and understands both `Content-Length` and chunked
+transfer-encoding responses, plus (now) the `Content-Type` header,
+which is what the browser uses to decide whether to render or download
+a response.
 
 From there, three layers turn the raw HTML bytes into pixels:
 
@@ -267,6 +299,81 @@ moot since that renderer (`net/html.c`) was deleted and fully replaced
 by the DOM/CSS/layout pipeline above: a style-flush-ordering bug and a
 line-truncation bug in the old flat HTML parser.
 
+Adding downloads (fetching anything non-HTML straight to disk) surfaced
+three more real bugs, all in code that pre-dated this pass but had
+never been exercised by a transfer bigger than a small HTML page:
+
+5. **Downloads over ~32KB came back silently truncated.** In
+   `tcp_handle_packet()`'s `TCP_ESTABLISHED` case, when an incoming
+   segment was bigger than the free space left in the 32KB receive
+   buffer, the code stored only what fit (`copy_len`) but advanced
+   `recv_seq` — and therefore what the ACK it sent claimed to have
+   received — by the *full* segment length. That silently acknowledged
+   bytes that were never actually stored anywhere, so they were gone
+   for good instead of being retransmitted once space freed up. Fixed
+   by only advancing `recv_seq` by `copy_len`.
+6. **Fixing #5 turned truncation into a permanent hang.** Once the
+   receive buffer legitimately filled up, both sides got stuck: the
+   real sender was still being told (via a *hardcoded* `window=8192` on
+   every segment we sent, success or not) that we always had room,
+   so it kept trying to push data we had nowhere to put; meanwhile we
+   had no way to tell it "wait" or "you can resume now" once we'd
+   drained space, because the window field never reflected our actual
+   buffer occupancy. Fixed by computing `hdr->window` from real free
+   space (`TCP_RECV_BUF_SIZE - conn.recv_len`) on every segment, so it
+   correctly drops toward 0 as the buffer fills and rises again once
+   `tcp_recv()` drains it — real TCP flow control instead of a constant
+   that happened to work only because nothing had ever filled the
+   buffer before.
+7. **A large download's failure was completely silent.** Bumping
+   `http.c`'s receive buffer to fit bigger responses meant it, the
+   browser's own fetch buffer, and anything already loaded (e.g. a WAV
+   file open in the File Manager) could collectively exceed the 8MB
+   kernel heap — and the lazy `kmalloc()` for that buffer had no log
+   line on failure, so `http_get()` just returned 0 with zero
+   indication why. This is what actually cost the most time to track
+   down (bug #5/#6 above hid behind it at first). Fixed by sizing both
+   buffers to comfortably coexist (2MB each) and logging the
+   out-of-memory case.
+
+## How audio works
+
+`drivers/ac97.c` finds the Intel ICH AC97 codec via PCI (vendor
+`0x8086` device `0x2415` — what QEMU's `-device AC97` emulates), resets
+its mixer, sets both volume registers to max, and drives PCM playback
+through the codec's bus-master DMA engine: a buffer descriptor list
+(up to 32 entries, each up to ~0.68s of 48kHz stereo audio) point
+directly at the already-in-RAM PCM samples (no copying needed — the
+whole address space is identity-mapped), and starting playback is just
+writing the list's address and length into two registers and setting
+the "run" bit. `drivers/wav.c` parses a RIFF/WAVE file's `fmt `/`data`
+chunks to hand `ac97_play_pcm()` a pointer straight into the file's own
+already-loaded bytes. The driver only supports the format that AC97's
+"fixed rate" mode actually runs at — 16-bit, 48000Hz — so
+`tools/make_disk_image.sh` generates its demo `SONG.WAV` at exactly
+that rate.
+
+The one real bug here is worth calling out because *how* it was found
+is the interesting part: the driver initially also enabled
+`CR_IOCE` (interrupt-on-completion) on the DMA engine, even though no
+interrupt handler was ever registered for it. With QEMU's default "no
+audio backend" setup (this container has no real sound card), the
+timed DMA never actually advanced far enough to trigger it, so testing
+looked fine. Only after explicitly attaching a real backend
+(`-audiodev wav,...`, to capture what the guest actually played and
+confirm it was real, non-silent audio and not just "the driver claims
+success") did the DMA genuinely run long enough to hit a buffer
+completion — at which point the codec's (level-triggered, and shared
+with the RTL8139's PCI IRQ line on QEMU's default chipset) interrupt
+line got asserted and never cleared, since nothing was listening for
+it. The whole guest froze silently within about one buffer's playback
+time. Fixed by simply not enabling `CR_IOCE` at all — the driver polls
+`CIV`/`SR` instead of using interrupts, so it never needed to assert
+one in the first place. This is a good example of why "the emulator
+didn't complain" isn't the same as "the driver is correct" — the bug
+was real and hardware-accurate, just invisible until audio was
+verified with an actual backend consuming the DMA output.
+
 ## How the filesystem works
 
 `drivers/ata.c` drives the primary IDE channel with plain PIO (IDENTIFY,
@@ -279,12 +386,20 @@ implements the FAT32 essentials from scratch: cluster↔LBA math, walking
 a 32-bit FAT chain, directory-entry parsing (8.3 names only — long
 filename entries are skipped, not decoded), reading a file's cluster
 chain, and writing one (allocate free clusters by scanning the FAT,
-chain them, write the data, update the existing directory entry).
+chain them, write the data). Writing looks for a directory entry with
+a matching name first (overwrite), then falls back to the first free
+slot (a deleted or never-used entry) in an existing directory cluster,
+and finally to growing the directory by one more cluster if every
+existing slot is already taken — real file *creation*, not just
+overwriting a name the disk image happened to ship with, which is what
+lets the browser save a download under whatever name the URL gave it.
 
 `tools/make_disk_image.sh` builds `zapos_disk.img` (and a `.vmdk`
 alongside it for VMware/VirtualBox) with `mtools` — no root or loop
-devices needed. It ships `README.TXT`, `DOCS/ABOUTFS.TXT`, and an empty
-`NOTES.TXT` that the File Manager can actually edit and save.
+devices needed. It ships `README.TXT`, `DOCS/ABOUTFS.TXT`, an empty
+`NOTES.TXT` that the File Manager can actually edit and save, and a
+generated `SONG.WAV` test tone (skipped if `python3` isn't available)
+for the audio playback demo.
 
 Getting this right needed one more fix on top of everything already
 running: with a hard disk attached, the BIOS's default boot order tries
@@ -316,29 +431,46 @@ things to know if you hit trouble in a different VM:
   answers ICMP (QEMU's user-mode/SLIRP networking does this by default).
   Some tools don't attach a NIC at all — ZapOS handles that gracefully
   (the Network window just shows "no NIC detected"), it's not an error.
+- Audio needs an **AC97** sound device attached. If the VM tool has no
+  audio backend configured at all, the AC97 device itself may still not
+  even be exposed to the guest depending on the tool — ZapOS handles a
+  missing codec gracefully either way (the File Manager just reports
+  "no audio device" when you try to play something). Note that a
+  *present but backend-less* codec (QEMU with no `-audiodev`, e.g.) can
+  behave differently from a real one — see "How audio works" above for
+  why that specifically mattered here.
 
 ## Building and running
 
 Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
 `xorriso`, `qemu-system-x86` (all installed via apt in this environment).
+`python3` is optional but recommended — `make disk` uses it to generate
+the demo `SONG.WAV`, skipping it gracefully if unavailable.
 
 ```sh
 make          # compile the kernel (build/kernel.elf)
 make iso      # package it as zapos.iso via GRUB
 make disk     # build zapos_disk.img + zapos_disk.vmdk (only if missing --
               # won't clobber anything you've saved via the File Manager)
-make run      # build both and boot in QEMU with a NIC + disk + serial on stdio
+make run      # build both and boot in QEMU with a NIC + AC97 + disk + serial on stdio
 ```
 
-`make run` attaches an RTL8139 NIC via QEMU's user-mode (SLIRP) networking
-and the FAT32 disk image, with `-boot order=d` so it boots the CD-ROM
-first (see above for why that matters once a hard disk is attached).
-Booting `zapos.iso` some other way (VirtualBox/VMware/real hardware, or
-without `zapos_disk.img` at all) works fine too — the GUI just shows "no
-NIC detected" / "no disk/FAT32 detected" for whichever piece isn't
-present, and everything else runs the same. Boot mode is legacy BIOS
-(not UEFI/Secure Boot yet — that would need a `grub-mkrescue --efi` build
-and a different Multiboot path).
+`make run` attaches an RTL8139 NIC and an AC97 codec via QEMU's default
+audio backend, plus the FAT32 disk image, with `-boot order=d` so it
+boots the CD-ROM first (see above for why that matters once a hard disk
+is attached). Booting `zapos.iso` some other way (VirtualBox/VMware/real
+hardware, or without `zapos_disk.img` at all) works fine too — the GUI
+just shows "no NIC detected" / "no disk/FAT32 detected" for whichever
+piece isn't present, and everything else runs the same. Boot mode is
+legacy BIOS (not UEFI/Secure Boot yet — that would need a
+`grub-mkrescue --efi` build and a different Multiboot path).
+
+To actually *hear* audio (rather than just verify the driver talks to
+the hardware correctly), QEMU needs a real `-audiodev` backend --
+`make run`'s default may silently have no backend in a container
+without a sound card. Add one explicitly, e.g.
+`-audiodev pa,id=snd0 -device AC97,audiodev=snd0` (PulseAudio) or
+whatever your host supports in place of the codec-only `-device AC97`.
 
 ## Architecture / directory layout
 
@@ -347,7 +479,8 @@ boot/            multiboot2 header + real assembly entry point
 kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  manager, kernel heap, multiboot info parser, serial console,
                  scheduler + context switch, TSS, ring-3 entry, syscalls
-drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC, ATA
+drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
+                 RTL8139 NIC, ATA, AC97 codec, WAV file parsing
 gui/             framebuffer primitives, bitmap font, window compositor
 net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
                  from-scratch TCP/IP stack -- plus DOM/CSS/layout, a
@@ -387,10 +520,10 @@ ISO, which the kernel never reads back from.
 ## Roadmap: making this an "everyday OS"
 
 Preemptive multitasking, ring-3 user mode, syscalls, a full
-Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write FAT32
-filesystem, and a web browser with a real (if pragmatic) CSS box-model
-layout engine and clickable links are now done (see above). Rough order
-of what's next:
+Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write/create FAT32
+filesystem, a web browser with a real (if pragmatic) CSS box-model
+layout engine, clickable links, and file downloads, and AC97 audio with
+WAV playback are now done (see above). Rough order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -415,8 +548,11 @@ of what's next:
    `gui/compositor.c`; user-mode processes (the eventual browser
    included) need a message-passing syscall API to create/draw into
    their own windows rather than being baked into the compositor.
-6. **Audio** — an AC97 or Intel HDA driver (AC97 is simpler and what QEMU's
-   `-device AC97` emulates), PCM playback via DMA buffers.
+6. **A CSS horizontal box model** — width/height, floats or flexbox,
+   centering — the layout engine only stacks blocks vertically today.
+7. **File delete/rename** — the FAT32 driver can create and overwrite
+   files now, but there's still no way to remove or rename one from the
+   File Manager.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.

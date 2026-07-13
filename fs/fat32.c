@@ -246,9 +246,27 @@ static void write_chain(uint32_t cluster, const uint8_t *data, uint32_t len) {
     }
 }
 
-/* Only overwrites a directory entry that already exists (this demo's
- * shipped disk image pre-creates the writable files) -- allocating a new
- * directory entry / growing the directory isn't implemented. */
+/* Writes `de` (already positioned at raw_name) with a freshly allocated
+ * cluster chain holding `data`/`len`, replacing whatever cluster/size it
+ * had before (0 for a brand-new entry, or a real chain being overwritten
+ * -- callers free the old chain first if there was one). */
+static int write_dirent_contents(struct fat_dirent *de, const void *data, uint32_t len) {
+    uint32_t cluster_bytes = sectors_per_cluster * ATA_SECTOR_SIZE;
+    uint32_t clusters_needed = len ? (len + cluster_bytes - 1) / cluster_bytes : 0;
+    uint32_t new_cluster = clusters_needed ? alloc_chain(clusters_needed) : 0;
+    if (clusters_needed && !new_cluster) return 0; /* disk full */
+    if (new_cluster) write_chain(new_cluster, (const uint8_t *)data, len);
+    de->cluster_high = (uint16_t)(new_cluster >> 16);
+    de->cluster_low = (uint16_t)(new_cluster & 0xFFFF);
+    de->file_size = len;
+    return 1;
+}
+
+/* Overwrites the file if a directory entry with this name already
+ * exists; otherwise creates a new entry (reusing a deleted/unused slot
+ * in an existing directory cluster, or growing the directory by one
+ * cluster if every slot in it is already in use) and writes it there.
+ * Returns 1 on success, 0 if the disk is completely full. */
 int fat32_write_file(uint32_t dir_cluster, const char *name_8_3, const void *data, uint32_t len) {
     if (!mounted) return 0;
 
@@ -257,36 +275,49 @@ int fat32_write_file(uint32_t dir_cluster, const char *name_8_3, const void *dat
 
     uint32_t cluster = dir_cluster;
     uint8_t sector[ATA_SECTOR_SIZE];
+    uint32_t last_cluster = dir_cluster;
 
     while (cluster >= 2 && cluster < FAT_EOC_MIN) {
+        last_cluster = cluster;
         uint32_t lba = cluster_to_lba(cluster);
         for (uint32_t s = 0; s < sectors_per_cluster; s++) {
             ata_read_sectors(lba + s, 1, sector);
             for (int off = 0; off < ATA_SECTOR_SIZE; off += 32) {
                 struct fat_dirent *de = (struct fat_dirent *)(sector + off);
-                if (de->name[0] == 0x00) return 0; /* end of directory, not found */
-                if (de->name[0] == 0xE5) continue;
-                if (de->attr == ATTR_LFN || (de->attr & ATTR_VOLUME_ID)) continue;
-                if (memcmp(de->name, raw_name, 11) != 0) continue;
+                int is_free = (de->name[0] == 0x00 || de->name[0] == 0xE5);
+                int is_match = !is_free && de->attr != ATTR_LFN && !(de->attr & ATTR_VOLUME_ID) &&
+                               memcmp(de->name, raw_name, 11) == 0;
+                if (!is_free && !is_match) continue;
 
-                uint32_t old_cluster = ((uint32_t)de->cluster_high << 16) | de->cluster_low;
-                if (old_cluster >= 2) free_chain(old_cluster);
+                if (is_match) {
+                    uint32_t old_cluster = ((uint32_t)de->cluster_high << 16) | de->cluster_low;
+                    if (old_cluster >= 2) free_chain(old_cluster);
+                } else {
+                    memset(de, 0, sizeof(*de));
+                    memcpy(de->name, raw_name, 11);
+                }
 
-                uint32_t cluster_bytes = sectors_per_cluster * ATA_SECTOR_SIZE;
-                uint32_t clusters_needed = len ? (len + cluster_bytes - 1) / cluster_bytes : 0;
-                uint32_t new_cluster = clusters_needed ? alloc_chain(clusters_needed) : 0;
-                if (clusters_needed && !new_cluster) return 0; /* disk full */
-
-                if (new_cluster) write_chain(new_cluster, (const uint8_t *)data, len);
-
-                de->cluster_high = (uint16_t)(new_cluster >> 16);
-                de->cluster_low = (uint16_t)(new_cluster & 0xFFFF);
-                de->file_size = len;
+                if (!write_dirent_contents(de, data, len)) return 0;
                 ata_write_sectors(lba + s, 1, sector);
                 return 1;
             }
         }
         cluster = fat_read_entry(cluster);
     }
-    return 0;
+
+    /* No name match and no free slot anywhere in the directory -- grow
+     * it by one cluster and use the first slot there. */
+    uint32_t new_dir_cluster = alloc_chain(1);
+    if (!new_dir_cluster) return 0;
+    memset(sector, 0, ATA_SECTOR_SIZE);
+    uint32_t lba = cluster_to_lba(new_dir_cluster);
+    for (uint32_t s = 0; s < sectors_per_cluster; s++) ata_write_sectors(lba + s, 1, sector);
+    fat_write_entry(last_cluster, new_dir_cluster);
+
+    ata_read_sectors(lba, 1, sector);
+    struct fat_dirent *de = (struct fat_dirent *)sector;
+    memcpy(de->name, raw_name, 11);
+    if (!write_dirent_contents(de, data, len)) return 0;
+    ata_write_sectors(lba, 1, sector);
+    return 1;
 }

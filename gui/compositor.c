@@ -15,6 +15,9 @@
 #include <net/css.h>
 #include <net/layout.h>
 #include <fs/fat32.h>
+#include <drivers/ac97.h>
+#include <drivers/wav.h>
+#include <kernel/kheap.h>
 #include <string.h>
 
 #define MAX_WINDOWS   8
@@ -23,8 +26,13 @@
 #define FM_ROW_H      16
 #define FM_MAX_ENTRIES 24
 #define FM_PREVIEW_MAX 2048
+#define FM_AUDIO_MAX   (2 * 1024 * 1024)
 #define BR_MAX_URL     96
-#define BR_BODY_MAX    16384
+/* Well under http.c's own HTTP_RAW_BUF_SIZE (2MB) -- both have to fit
+ * in the 8MB kheap arena at once, alongside anything else already
+ * resident (e.g. a WAV file the File Manager has open). */
+#define BR_FETCH_CAP   (2u * 1024 * 1024 - 65536)
+#define BR_CONTENT_TYPE_MAX 64
 
 typedef struct {
     int x, y, w, h;
@@ -62,8 +70,16 @@ static int fm_dirty = 0;
 static char fm_preview_name[FAT32_MAX_NAME];
 static char fm_preview_buf[FM_PREVIEW_MAX + 1];
 static int fm_preview_len = 0;
-static char fm_status_msg[32] = "";
+static char fm_status_msg[48] = "";
 static uint32_t fm_status_until = 0;
+
+/* Audio preview state -- set when the currently open file is a .WAV.
+ * fm_audio_buf must stay alive for as long as playback could still be
+ * reading from it via DMA, so it's only ever freed through
+ * fm_close_audio(), which stops playback first. */
+static int fm_is_audio = 0;
+static uint8_t *fm_audio_buf = NULL;
+static struct wav_info fm_wav;
 
 static void fm_refresh(void);
 
@@ -244,7 +260,21 @@ static void draw_network(const gui_window_t *w) {
     draw_labeled_uint(x, y + 108, "last rtt: ", icmp_last_rtt_ms(), COL_TEXT);
 }
 
+/* Stops any in-flight playback *before* freeing the buffer it's DMAing
+ * from -- ac97_play_pcm() reads directly out of fm_audio_buf, so
+ * freeing it while a clip is still playing would let the controller
+ * keep reading freed memory. */
+static void fm_close_audio(void) {
+    if (fm_audio_buf) {
+        ac97_stop();
+        kfree(fm_audio_buf);
+        fm_audio_buf = NULL;
+    }
+    fm_is_audio = 0;
+}
+
 static void fm_refresh(void) {
+    fm_close_audio();
     fm_entry_count = fat32_list_dir(fm_current_dir, fm_entries, FM_MAX_ENTRIES);
     fm_viewing_file = 0;
     fm_editing = 0;
@@ -255,9 +285,22 @@ static int fm_is_notes_txt(const char *name) {
     return strcmp(name, "NOTES.TXT") == 0;
 }
 
+static int fm_has_ext(const char *name, const char *ext) {
+    int nlen = (int)strlen(name), elen = (int)strlen(ext);
+    if (nlen < elen + 1 || name[nlen - elen - 1] != '.') return 0;
+    for (int i = 0; i < elen; i++) {
+        char a = name[nlen - elen + i], b = ext[i];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
 /* Called when a row in the listing is clicked: navigate into directories,
- * open a read-only preview for other files, or an editable one for the
- * demo's NOTES.TXT (the only file fat32_write_file knows how to save). */
+ * open an audio-preview screen for .WAV files, open a read-only preview
+ * for other files, or an editable one for the demo's NOTES.TXT (the
+ * only file fat32_write_file knows how to save). */
 static void fm_open_entry(int index) {
     if (index < 0 || index >= fm_entry_count) return;
     struct fat_dirent_info *e = &fm_entries[index];
@@ -269,12 +312,40 @@ static void fm_open_entry(int index) {
         return;
     }
 
+    fm_close_audio();
     strcpy(fm_preview_name, e->name);
+
+    if (fm_has_ext(e->name, "WAV")) {
+        uint32_t cap = e->size < FM_AUDIO_MAX ? e->size : FM_AUDIO_MAX;
+        fm_audio_buf = (uint8_t *)kmalloc(cap > 0 ? cap : 1);
+        uint32_t got = fm_audio_buf ? fat32_read_file(e->cluster, e->size, fm_audio_buf, cap) : 0;
+        fm_is_audio = fm_audio_buf && wav_parse(fm_audio_buf, got, &fm_wav);
+        if (fm_audio_buf && !fm_is_audio) { kfree(fm_audio_buf); fm_audio_buf = NULL; }
+        fm_viewing_file = 1;
+        fm_editing = 0;
+        fm_dirty = 0;
+        fm_status_msg[0] = 0;
+        return;
+    }
+
     fm_preview_len = fat32_read_file(e->cluster, e->size, fm_preview_buf, FM_PREVIEW_MAX);
     fm_preview_buf[fm_preview_len] = 0;
     fm_viewing_file = 1;
     fm_editing = fm_is_notes_txt(e->name);
     fm_dirty = 0;
+}
+
+static void fm_play_audio(void) {
+    if (!ac97_is_present()) {
+        strcpy(fm_status_msg, "No audio device detected");
+    } else if (fm_wav.bits_per_sample != 16 || fm_wav.sample_rate != 48000) {
+        strcpy(fm_status_msg, "Unsupported format (need 16-bit/48000Hz)");
+    } else if (!ac97_play_pcm(fm_wav.pcm, fm_wav.sample_count, fm_wav.channels == 2)) {
+        strcpy(fm_status_msg, "Clip too long to play (max ~21s)");
+    } else {
+        strcpy(fm_status_msg, "Playing... (press S to stop)");
+    }
+    fm_status_until = pit_ticks() + 300;
 }
 
 static void fm_save_notes(void) {
@@ -284,9 +355,19 @@ static void fm_save_notes(void) {
     fm_dirty = 0;
 }
 
-/* Feeds typed characters into the open NOTES.TXT buffer; Enter saves.
- * Called from gui_run() only when the File Manager has it open for edit. */
+/* Feeds typed characters into the open NOTES.TXT buffer (Enter saves),
+ * or -- while an audio file is open -- handles P/S for play/stop.
+ * Called from gui_run() unconditionally on every keypress. */
 static void fm_handle_key(char c) {
+    if (fm_viewing_file && fm_is_audio) {
+        if (c == 'p' || c == 'P') fm_play_audio();
+        else if (c == 's' || c == 'S') {
+            ac97_stop();
+            strcpy(fm_status_msg, "Stopped");
+            fm_status_until = pit_ticks() + 150;
+        }
+        return;
+    }
     if (!fm_editing) return;
     if (c == '\n' || c == '\r') {
         fm_save_notes();
@@ -332,7 +413,11 @@ static void fm_handle_click(const gui_window_t *w, int my) {
     int rel_y = my - (w->y + TITLEBAR_H + 12);
 
     if (fm_viewing_file) {
-        if (rel_y >= 0 && rel_y < FM_ROW_H) { fm_viewing_file = 0; fm_editing = 0; } /* "<- back" row */
+        if (rel_y >= 0 && rel_y < FM_ROW_H) { /* "<- back" row */
+            fm_close_audio();
+            fm_viewing_file = 0;
+            fm_editing = 0;
+        }
         return;
     }
     int row = (rel_y - 18) / FM_ROW_H;
@@ -352,6 +437,25 @@ static void draw_file_manager(const gui_window_t *w) {
     if (fm_viewing_file) {
         fb_draw_string(x, y, "<- back to listing", 0x62D8FF, 1);
         fb_draw_string(x, y + 18, fm_preview_name, COL_TEXT, 1);
+
+        if (fm_is_audio) {
+            char info[64], numbuf[12];
+            strcpy(info, "");
+            utoa(fm_wav.sample_rate, numbuf);
+            strcat(info, numbuf);
+            strcat(info, " Hz, ");
+            utoa((unsigned int)fm_wav.bits_per_sample, numbuf);
+            strcat(info, numbuf);
+            strcat(info, "-bit, ");
+            strcat(info, fm_wav.channels == 2 ? "stereo" : "mono");
+            fb_draw_string(x, y + 34, info, COL_MUTED, 1);
+            fb_draw_string(x, y + 52, "Press P to play, S to stop", COL_MUTED, 1);
+            if (pit_ticks() < fm_status_until) {
+                fb_draw_string(x, y + 70, fm_status_msg, 0x8FE3A8, 1);
+            }
+            return;
+        }
+
         if (fm_editing) {
             fb_draw_string(x, y + 34,
                            fm_dirty ? "editing -- press Enter to save" : "press Enter to save, Backspace to edit",
@@ -364,22 +468,37 @@ static void draw_file_manager(const gui_window_t *w) {
         return;
     }
 
-    fb_draw_string(x, y, fm_current_dir == fat32_root_cluster() ? "/" : "(subfolder)", COL_MUTED, 1);
+    char header[48], cntbuf[12];
+    strcpy(header, fm_current_dir == fat32_root_cluster() ? "/  " : "(subfolder)  ");
+    utoa((unsigned int)fm_entry_count, cntbuf);
+    strcat(header, cntbuf);
+    strcat(header, fm_entry_count == 1 ? " item" : " items");
+    fb_draw_string(x, y, header, COL_MUTED, 1);
+
     int max_rows = (w->h - TITLEBAR_H - 30) / FM_ROW_H;
     for (int i = 0; i < fm_entry_count && i < max_rows; i++) {
         char line[40];
+        uint32_t color;
         if (fm_entries[i].is_dir) {
             strcpy(line, "[DIR] ");
             strcat(line, fm_entries[i].name);
+            color = 0x62D8FF;
         } else {
             char sizebuf[12];
             utoa(fm_entries[i].size, sizebuf);
-            strcpy(line, fm_entries[i].name);
+            if (fm_has_ext(fm_entries[i].name, "WAV")) {
+                strcpy(line, "[WAV] ");
+                color = 0x8FE3A8;
+            } else {
+                line[0] = 0;
+                color = COL_TEXT;
+            }
+            strcat(line, fm_entries[i].name);
             strcat(line, "  ");
             strcat(line, sizebuf);
             strcat(line, "B");
         }
-        fb_draw_string(x, y + 18 + i * FM_ROW_H, line, fm_entries[i].is_dir ? 0x62D8FF : COL_TEXT, 1);
+        fb_draw_string(x, y + 18 + i * FM_ROW_H, line, color, 1);
     }
 }
 
@@ -425,47 +544,127 @@ static void br_content_area(int *x, int *y, int *w, int *h) {
     if (*h < 0) *h = 0;
 }
 
+static int ct_contains(const char *content_type, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (const char *p = content_type; *p; p++) {
+        int i = 0;
+        while (i < nlen && p[i] && (p[i] | 0x20) == (needle[i] | 0x20)) i++;
+        if (i == nlen) return 1;
+    }
+    return 0;
+}
+
+/* Builds an uppercased 8.3-ish filename for a download out of the URL
+ * path's last segment (e.g. "/music/song.wav" -> "SONG.WAV"), falling
+ * back to a generic name if the path has no real filename in it (a
+ * bare "/", or one ending in "/"). Query strings are stripped. */
+static void br_derive_filename(const char *path, char *out, int out_cap) {
+    const char *last_slash = path;
+    for (const char *p = path; *p; p++) if (*p == '/') last_slash = p + 1;
+
+    char tmp[64];
+    int i = 0;
+    while (last_slash[i] && last_slash[i] != '?' && i < (int)sizeof(tmp) - 1) {
+        tmp[i] = last_slash[i];
+        i++;
+    }
+    tmp[i] = 0;
+
+    if (tmp[0] == 0) strcpy(tmp, "DOWNLOAD.BIN");
+    for (int j = 0; tmp[j]; j++) {
+        if (tmp[j] >= 'a' && tmp[j] <= 'z') tmp[j] = (char)(tmp[j] - 32);
+    }
+    strncpy(out, tmp, out_cap - 1);
+    out[out_cap - 1] = 0;
+}
+
 /* Runs synchronously on the GUI's own task -- the screen won't redraw
- * until this returns (a few seconds for a small page). A real async
- * fetch would need a dedicated task and a way to hand the result back;
- * out of scope for this pass. */
+ * until this returns (a few seconds for a small page, longer for a
+ * multi-MB download). A real async fetch would need a dedicated task
+ * and a way to hand the result back; out of scope for this pass.
+ *
+ * HTML responses (by Content-Type, or a path ending in "/"/.htm/.html
+ * when the server sent no Content-Type at all) go through the usual
+ * DOM/CSS/layout pipeline. Everything else -- audio, video, archives,
+ * anything -- is saved to the FAT32 disk's root directory instead of
+ * being rendered, so it shows up in the File Manager afterward. There
+ * is no decoding of any kind: a saved .mkv or .mp3 is just bytes on
+ * disk, not something this OS can play (WAV is the only playable audio
+ * format, via the File Manager -- see fm_play_audio()). */
 static void br_fetch(void) {
     char host[64], path[64];
     uint16_t port;
     br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
 
-    static char body[BR_BODY_MAX];
+    char *body = (char *)kmalloc(BR_FETCH_CAP + 1);
+    if (!body) {
+        strcpy(br_status_msg, "Out of memory");
+        return;
+    }
+
     int status;
     uint32_t body_len;
+    char content_type[BR_CONTENT_TYPE_MAX];
 
-    if (!http_get(host, port, path, &status, body, sizeof(body) - 1, &body_len)) {
+    if (!http_get(host, port, path, &status, body, BR_FETCH_CAP, &body_len,
+                   content_type, sizeof(content_type))) {
         strcpy(br_status_msg, "Failed to load (DNS/TCP error)");
         br_layout.item_count = 0;
         br_layout.link_count = 0;
+        kfree(body);
         return;
     }
     body[body_len] = 0;
 
-    char title[DOM_MAX_TITLE];
-    struct dom_node *root = dom_parse(body, body_len, title, sizeof(title));
+    int path_len = (int)strlen(path);
+    int looks_like_page = path_len == 0 || path[path_len - 1] == '/' ||
+                           (path_len > 5 && strcmp(path + path_len - 5, ".html") == 0) ||
+                           (path_len > 4 && strcmp(path + path_len - 4, ".htm") == 0);
+    int is_html = content_type[0] ? ct_contains(content_type, "text/html") : looks_like_page;
 
-    struct css_stylesheet sheet;
-    css_stylesheet_init(&sheet);
-    css_extract_style_blocks(&sheet, body, body_len);
+    if (is_html) {
+        char title[DOM_MAX_TITLE];
+        struct dom_node *root = dom_parse(body, body_len, title, sizeof(title));
 
-    int content_x, content_y, content_w, content_h;
-    br_content_area(&content_x, &content_y, &content_w, &content_h);
-    layout_run(root, &sheet, content_w, &br_layout);
-    strncpy(br_layout.title, title, DOM_MAX_TITLE - 1);
+        struct css_stylesheet sheet;
+        css_stylesheet_init(&sheet);
+        css_extract_style_blocks(&sheet, body, body_len);
 
-    css_stylesheet_free(&sheet);
-    dom_free(root);
-    br_scroll = 0;
+        int content_x, content_y, content_w, content_h;
+        br_content_area(&content_x, &content_y, &content_w, &content_h);
+        layout_run(root, &sheet, content_w, &br_layout);
+        strncpy(br_layout.title, title, DOM_MAX_TITLE - 1);
 
-    char numbuf[12];
-    utoa((unsigned int)status, numbuf);
-    strcpy(br_status_msg, status >= 200 && status < 300 ? "OK " : "HTTP ");
-    strcat(br_status_msg, numbuf);
+        css_stylesheet_free(&sheet);
+        dom_free(root);
+        kfree(body);
+        br_scroll = 0;
+
+        char numbuf[12];
+        utoa((unsigned int)status, numbuf);
+        strcpy(br_status_msg, status >= 200 && status < 300 ? "OK " : "HTTP ");
+        strcat(br_status_msg, numbuf);
+        return;
+    }
+
+    char fname[32];
+    br_derive_filename(path, fname, sizeof(fname));
+
+    if (!fat32_is_mounted()) {
+        strcpy(br_status_msg, "Fetched, but no disk to save it to");
+    } else if (fat32_write_file(fat32_root_cluster(), fname, body, body_len)) {
+        char numbuf[16];
+        utoa(body_len, numbuf);
+        strcpy(br_status_msg, "Downloaded ");
+        strcat(br_status_msg, fname);
+        strcat(br_status_msg, " (");
+        strcat(br_status_msg, numbuf);
+        strcat(br_status_msg, "B)");
+        fm_refresh();
+    } else {
+        strcpy(br_status_msg, "Download failed (disk full?)");
+    }
+    kfree(body);
 }
 
 /* Resolves `href` (as found on an <a> in the just-loaded page) against

@@ -55,7 +55,7 @@ iso: $(KERNEL)
 
 run: iso disk
 	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 \
-		-serial stdio -m 256M -netdev user,id=net0 -device rtl8139,netdev=net0
+		-serial stdio -m 256M -netdev user,id=net0 -device rtl8139,netdev=net0 -device AC97
 
 clean:
 	rm -rf $(BUILD) $(ISODIR) $(ISO)

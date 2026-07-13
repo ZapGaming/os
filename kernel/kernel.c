@@ -21,6 +21,7 @@
 #include <kernel/ping_task.h>
 #include <net/net.h>
 #include <drivers/ata.h>
+#include <drivers/ac97.h>
 #include <fs/fat32.h>
 #include <stdint.h>
 #include <string.h>
@@ -83,6 +84,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     int fs_up = ata_init() && fat32_init();
     serial_printf(fs_up ? "Filesystem: FAT32 mounted\n" : "Filesystem: no disk/FAT32 found\n");
+
+    int audio_up = ac97_init();
+    serial_printf(audio_up ? "Audio: AC97 ready\n" : "Audio: no codec found\n");
 
     scheduler_init();
     task_create(bg_task_entry);

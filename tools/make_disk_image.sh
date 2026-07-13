@@ -42,6 +42,38 @@ mcopy -i "$IMG" "$STAGE/README.TXT" ::/README.TXT
 mcopy -i "$IMG" "$STAGE/NOTES.TXT" ::/NOTES.TXT
 mcopy -i "$IMG" "$STAGE/ABOUTFS.TXT" ::/DOCS/ABOUTFS.TXT
 
+# A short 48kHz/16-bit/stereo test tone for the File Manager's audio
+# playback (net/ac97.c only supports that exact format -- no
+# resampling). Generated on the fly rather than committed as a binary
+# asset; skipped gracefully if python3 isn't available.
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$STAGE/SONG.WAV" <<'PYEOF'
+import wave, struct, math, sys
+
+rate = 48000
+seconds = 2.5
+amplitude = 12000
+
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(2)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    frames = bytearray()
+    n = int(rate * seconds)
+    for i in range(n):
+        t = i / rate
+        # a little melody instead of a flat tone: three notes in sequence
+        freq = 440.0 if t < seconds / 3 else (554.37 if t < 2 * seconds / 3 else 659.25)
+        sample = int(amplitude * math.sin(2 * math.pi * freq * t))
+        frames += struct.pack("<hh", sample, sample)
+    w.writeframes(bytes(frames))
+PYEOF
+  mcopy -i "$IMG" "$STAGE/SONG.WAV" ::/SONG.WAV
+  echo "Added SONG.WAV (48kHz/16-bit/stereo test tone)"
+else
+  echo "python3 not found -- skipping SONG.WAV test asset"
+fi
+
 echo "Built $IMG"
 mdir -i "$IMG" ::
 
