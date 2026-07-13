@@ -1,5 +1,7 @@
 #include <kernel/elf.h>
 #include <kernel/scheduler.h>
+#include <kernel/paging.h>
+#include <kernel/pmm.h>
 #include <kernel/serial.h>
 #include <string.h>
 
@@ -37,14 +39,29 @@ struct elf32_phdr {
 #define EM_386 3
 #define PT_LOAD 1
 
-/* Fixed window reserved for user programs -- there's no per-process
- * page directories yet (every task shares this one identity-mapped
- * address space), so a loaded program's segments just have to fall
- * inside a range known not to collide with the kernel's own image
- * plus its 32MB heap arena (kernel_end measures ~33.24 MiB). A
- * program's linker script must target this same range. */
-#define USER_LOAD_MIN 0x04000000u /* 64MB -- comfortably above kernel_end */
-#define USER_LOAD_MAX 0x0F000000u /* 240MB -- comfortably below the 256MB QEMU is run with */
+/* Fixed window reserved for user programs -- a loaded program's own
+ * linker script has to target this same range (see userprogs/user.ld).
+ * Every task now gets a PRIVATE mapping for its own slice of this
+ * window (see paging_new_isolated_directory()/paging_map_user_page()
+ * in kernel/paging.c) rather than sharing one identity-mapped window
+ * across every task -- two different loaded programs can both use
+ * vaddr 0x04000000 and genuinely not see each other's memory, since
+ * each program's page directory maps that address to its own private
+ * physical frames. The window itself just bounds how big a program's
+ * segments (and its stack, carved out of the top of it -- see
+ * USER_STACK_TOP below) are allowed to be; it's not shared storage. */
+#define USER_LOAD_MIN 0x04000000u /* 64MB */
+#define USER_LOAD_MAX 0x0F000000u /* 240MB */
+
+/* The stack lives at a fixed offset near the top of the same window,
+ * comfortably above where any realistically-sized program's own
+ * segments (which start at USER_LOAD_MIN and grow upward) would reach
+ * -- checked explicitly below rather than just assumed. */
+#define USER_STACK_TOP (USER_LOAD_MIN + 0x00F00000u) /* 15MB into the window */
+
+#define PAGE_SIZE 4096u
+static uint32_t page_floor(uint32_t x) { return x & ~(PAGE_SIZE - 1); }
+static uint32_t page_ceil(uint32_t x) { return (x + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1); }
 
 static int in_user_window(uint32_t addr, uint32_t size) {
     if (addr < USER_LOAD_MIN) return 0;
@@ -97,6 +114,9 @@ int elf_load_and_run(const uint8_t *data, uint32_t len) {
         return -1;
     }
 
+    /* Validate every segment before mapping anything -- a partially
+     * set-up address space is harder to reason about than simply not
+     * starting. */
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const struct elf32_phdr *ph = (const struct elf32_phdr *)
             (data + eh->e_phoff + (uint32_t)i * eh->e_phentsize);
@@ -115,18 +135,81 @@ int elf_load_and_run(const uint8_t *data, uint32_t len) {
                           i, ph->p_vaddr, ph->p_memsz);
             return -1;
         }
-
-        memcpy((void *)ph->p_vaddr, data + ph->p_offset, ph->p_filesz);
-        if (ph->p_memsz > ph->p_filesz) {
-            memset((void *)(ph->p_vaddr + ph->p_filesz), 0, ph->p_memsz - ph->p_filesz);
+        uint32_t seg_start = page_floor(ph->p_vaddr);
+        uint32_t seg_end = page_ceil(ph->p_vaddr + ph->p_memsz);
+        if (seg_end > USER_STACK_TOP - TASK_STACK_SIZE && seg_start < USER_STACK_TOP) {
+            serial_printf("elf: segment %d reaches into the reserved stack region\n", i);
+            return -1;
         }
     }
 
-    struct task *t = task_create_user((void (*)(void))eh->e_entry);
-    if (!t) {
-        serial_printf("elf: task_create_user failed\n");
+    uint32_t dir_phys = paging_new_isolated_directory();
+    if (!dir_phys) {
+        serial_printf("elf: out of memory allocating a page directory\n");
         return -1;
     }
-    serial_printf("elf: loaded, entry=%x pid=%d\n", eh->e_entry, t->pid);
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const struct elf32_phdr *ph = (const struct elf32_phdr *)
+            (data + eh->e_phoff + (uint32_t)i * eh->e_phentsize);
+        if (ph->p_type != PT_LOAD) continue;
+
+        uint32_t seg_start = page_floor(ph->p_vaddr);
+        uint32_t seg_end = page_ceil(ph->p_vaddr + ph->p_memsz);
+
+        for (uint32_t page_vaddr = seg_start; page_vaddr < seg_end; page_vaddr += PAGE_SIZE) {
+            uint32_t frame = pmm_alloc_frame();
+            if (!frame) {
+                serial_printf("elf: out of memory allocating program pages\n");
+                paging_free_isolated_directory(dir_phys);
+                return -1;
+            }
+            memset((void *)frame, 0, PAGE_SIZE);
+
+            /* Copy whatever part of this page overlaps the segment's
+             * file-backed range; anything beyond p_filesz (BSS) stays
+             * zero from the memset above. */
+            uint32_t file_start = ph->p_vaddr;
+            uint32_t file_end = ph->p_vaddr + ph->p_filesz;
+            uint32_t ov_start = page_vaddr > file_start ? page_vaddr : file_start;
+            uint32_t ov_end = (page_vaddr + PAGE_SIZE) < file_end ? (page_vaddr + PAGE_SIZE) : file_end;
+            if (ov_start < ov_end) {
+                memcpy((uint8_t *)frame + (ov_start - page_vaddr),
+                       data + ph->p_offset + (ov_start - file_start),
+                       ov_end - ov_start);
+            }
+
+            if (!paging_map_user_page(dir_phys, page_vaddr, frame)) {
+                serial_printf("elf: out of memory building page tables\n");
+                pmm_free_frame(frame);
+                paging_free_isolated_directory(dir_phys);
+                return -1;
+            }
+        }
+    }
+
+    for (uint32_t off = 0; off < TASK_STACK_SIZE; off += PAGE_SIZE) {
+        uint32_t frame = pmm_alloc_frame();
+        if (!frame) {
+            serial_printf("elf: out of memory allocating the user stack\n");
+            paging_free_isolated_directory(dir_phys);
+            return -1;
+        }
+        memset((void *)frame, 0, PAGE_SIZE);
+        if (!paging_map_user_page(dir_phys, USER_STACK_TOP - TASK_STACK_SIZE + off, frame)) {
+            serial_printf("elf: out of memory building page tables\n");
+            pmm_free_frame(frame);
+            paging_free_isolated_directory(dir_phys);
+            return -1;
+        }
+    }
+
+    struct task *t = task_create_user_isolated((void (*)(void))eh->e_entry, dir_phys, USER_STACK_TOP);
+    if (!t) {
+        serial_printf("elf: task_create_user_isolated failed\n");
+        paging_free_isolated_directory(dir_phys);
+        return -1;
+    }
+    serial_printf("elf: loaded, entry=%x pid=%d (isolated address space)\n", eh->e_entry, t->pid);
     return t->pid;
 }

@@ -151,13 +151,24 @@ you can keep building on.
   filesystem works"). The listing also shows a live item count and
   color-codes/tags entries by type (directories, `.WAV` audio, plain
   files).
-- **Running real programs from disk**: a minimal ELF32 loader
-  (`kernel/elf.c`) that validates and loads a static (`ET_EXEC`) i386
-  executable's `PT_LOAD` segments and launches it as a genuine ring-3
-  task — the File Manager runs any `.ELF` file the same way it opens a
-  `.WAV` or text file (click it; `[ELF]`-tagged in the listing). See
-  "How the ELF loader works" below for what makes this safe (or rather,
-  not fully safe yet) given there's no per-process memory isolation.
+- **Running real programs from disk, genuinely isolated**: a minimal
+  ELF32 loader (`kernel/elf.c`) that validates and loads a static
+  (`ET_EXEC`) i386 executable's `PT_LOAD` segments and launches it as a
+  ring-3 task with its *own private page directory* (`kernel/paging.c`)
+  — a loaded program's code/data/stack are backed by physical frames no
+  other task's directory maps, and the shared kernel region is present
+  but supervisor-only in that directory, so ring-3 code faults
+  immediately if it touches kernel memory or another task's private
+  frames, instead of silently reading/corrupting them. A ring-3 fault
+  (page fault, GPF, anything) now kills just the offending task
+  (`kernel/exceptions.c`) instead of halting the whole kernel — verified
+  with a deliberately misbehaving test program (`userprogs/evil.c`)
+  that tries to write to kernel memory and gets killed cleanly while
+  every other task keeps running. The File Manager runs any `.ELF` file
+  the same way it opens a `.WAV` or text file (click it;
+  `[ELF]`-tagged in the listing). See "How the ELF loader works" below
+  for exactly what is and isn't isolated (the compiled-in demo task
+  still isn't, deliberately).
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
@@ -228,22 +239,30 @@ you can keep building on.
 - **Incoming packet checksums aren't validated** (outgoing ones are
   computed correctly). TCP is client-only (active-open), single-
   connection (no concurrent sockets) — there's no listening/server side.
-- **Real process isolation**: every task (kernel and ring-3) shares the
-  same identity-mapped address space — there's no per-process page
-  directory yet, so a user task *could* read/write kernel memory or
-  another task's memory. The ring-3 mechanics (privilege transitions,
-  syscalls, faulting on privileged instructions) are real; the memory
-  protection between processes is not, yet. The ELF loader's only
-  defense given that gap is a fixed address window
-  (`kernel/elf.c`'s `USER_LOAD_MIN`/`MAX`, 64MB-240MB) that every loaded
-  program's segments are bounds-checked against before anything is
-  copied — it stops a program from *accidentally* colliding with the
-  kernel's own memory, but does nothing to stop one from deliberately
-  reading/writing outside its own segments, since it's still the same
-  address space as everything else.
-- **Process lifecycle**: exited tasks are marked terminated and skipped by
-  the scheduler, but their stack memory is never freed, and there's no
-  `wait()`/parent-child relationship, exit codes, or process reaping.
+- **Real process isolation exists, but only for ELF-loaded programs**:
+  each one gets its own page directory (see "How the ELF loader works"
+  below) with a private mapping for its own code/data/stack and no
+  access to kernel memory or any other task's private frames — a real,
+  verified boundary, not just a bounds check. The compiled-in ring-3
+  demo task (`kernel/demo_user_task.c`) deliberately still runs in the
+  original, fully shared, fully user-accessible address space every
+  task used before this existed — it's kernel-authored code the kernel
+  already trusts, not something loaded from an untrusted file, so
+  giving it the same isolation treatment wasn't the priority; it's a
+  documented scope choice, not an oversight. There's also no isolation
+  *between* kernel-mode tasks (the background counter task, the ping
+  task, the GUI) — they all still share one address space, same as
+  before, since none of them run untrusted code either.
+- **Process lifecycle**: exited tasks are marked terminated and skipped
+  by the scheduler; an isolated ELF-loaded task's private page
+  directory, page tables, and frames *are* freed on exit (including
+  when it's killed for faulting -- see `paging_free_isolated_directory()`),
+  but its kernel-mode stack (kmalloc'd from the kernel heap, like every
+  task's) never is, and there's still no `wait()`/parent-child
+  relationship, exit codes, or task-slot reuse (`MAX_TASKS = 16` total,
+  ever, for the life of one boot -- a long-running system that kept
+  launching ELF programs would eventually run out of task slots even
+  though their memory is being reclaimed correctly).
 
 See "Roadmap" below for how each of these would actually get built.
 
@@ -399,39 +418,107 @@ static `ET_EXEC` (no PIE/shared/relocatable), 32-bit little-endian,
 `EM_386` executable, with every `PT_LOAD` segment's `p_vaddr`/`p_memsz`
 (and the entry point) bounds-checked against a fixed window
 (`USER_LOAD_MIN`/`USER_LOAD_MAX`, 64MB-240MB) before anything is
-touched. That window, not a real memory-protection mechanism, is what
-keeps a loaded program from colliding with the kernel's own image —
-there's no per-process page directory yet (see the roadmap and the
-"Real process isolation" limitation above), so every task, including
-one loaded from an arbitrary file, still shares the same identity-
-mapped 4 GiB address space. 64MB was picked because the kernel's own
-static footprint (code, data, and its 32MB heap arena) measures to
-`kernel_end ≈ 33.24 MiB` (`nm build/kernel.elf`); 240MB leaves headroom
-under the 256MB QEMU is run with. A user program's own linker script
-has to target that same base by convention (see `userprogs/user.ld`) —
-the loader only *checks* the range, it doesn't relocate anything into
-it.
+touched. 64MB was picked because the kernel's own static footprint
+(code, data, and its 32MB heap arena) measures to `kernel_end ≈
+33.24 MiB` (`nm build/kernel.elf`); 240MB leaves headroom under the
+256MB QEMU is run with. A user program's own linker script has to
+target that same base by convention (see `userprogs/user.ld`).
 
-Once validated, each `PT_LOAD` segment's file bytes are `memcpy`'d to
-its `p_vaddr` (a real pointer, since the address space is identity-
-mapped) and any BSS tail beyond `p_filesz` is zeroed, then
-`task_create_user()` starts a new ring-3 task at the ELF's entry point
-— the exact same mechanism the compiled-in demo task uses, since a C
-function pointer doesn't care whether the code it points to was linked
-into the kernel image or loaded from disk at runtime.
+Unlike the first version of this loader, that window is no longer
+shared, borrowed storage every task reaches into with a plain
+`memcpy` — each loaded program gets its own private address space:
 
-`userprogs/hello.c` is the test program exercising this: a few lines
-using the same `int 0x80` `sys_write`/`sys_yield`/`sys_exit` ABI as
-`kernel/demo_user_task.c`, linked at the loader's base address by
-`userprogs/user.ld` and built fresh by `tools/make_disk_image.sh` (same
-freestanding flags as the kernel itself) into `TEST.ELF` on the disk
-image, not committed as a binary. Clicking it in the File Manager
-(tagged `[ELF]` in the listing) reads it via `fat32_read_file`, calls
-`elf_load_and_run()`, and shows "Launched as pid N" (or a failure
-reason) in the status line — verified in QEMU: the serial log shows
-`elf: loaded, entry=4000000 pid=4` followed by the program's own five
-`sys_write` lines and a clean `scheduler: task pid=4 exited`, with ping
-traffic and every other task continuing uninterrupted throughout.
+- **`kernel/paging.c`** gained a real page-directory/page-table API on
+  top of the existing 4MB-page identity map: `paging_new_isolated_directory()`
+  builds a fresh directory that identity-maps all of physical memory
+  the same way the original one does, but **supervisor-only** (no user
+  bit) — so kernel code (interrupts, syscalls, the scheduler) keeps
+  working no matter which task's directory is loaded, while ring-3 code
+  running under it faults immediately on touching any of it.
+  `paging_map_user_page()` then punches a private, user-accessible 4KB
+  mapping into that directory wherever a specific program actually
+  needs one (its segments, and a small reserved stack region near the
+  top of the window) — a fresh page table replaces the restricted
+  identity super-page for just that 4MB region on first use, backed by
+  a physical frame from `pmm_alloc_frame()` that no other task's
+  directory points to. Two different loaded programs can both use
+  vaddr `0x04000000` and genuinely not see each other's memory, because
+  each one's directory maps that address to different physical frames.
+- **`kernel/elf.c`** now allocates one fresh frame per page a segment
+  actually spans (zeroed, then whatever part of it overlaps the
+  segment's file-backed range is `memcpy`'d in — BSS stays zero for
+  free), maps each into the new directory, then does the same for a
+  private stack, and starts the task via the new
+  **`task_create_user_isolated()`** instead of the plain
+  `task_create_user()` the compiled-in demo task still uses.
+- **`kernel/scheduler.c`**'s `struct task` carries a `page_dir_phys`
+  field now; `schedule()` reloads `CR3` to whichever directory the next
+  task should run under on *every* switch (a cheap register write even
+  when it's "the same" directory, and the TLB flush that comes free
+  with it is exactly what makes two tasks mapping the same vaddr to
+  different frames actually work). On exit,
+  `paging_free_isolated_directory()` walks the directory, frees every
+  private frame and page table it finds, and frees the directory itself
+  — repeated launches don't leak physical memory.
+- **`kernel/exceptions.c`** used to `cli; hlt` forever on *any* CPU
+  exception, kernel or ring-3. That's fine for a genuine kernel bug,
+  but it meant an isolated task hitting its own sandbox boundary (a
+  page fault touching kernel memory, say) would take the *entire
+  machine* down with it — isolation that faults safely into a total
+  freeze isn't durable isolation. Now a fault whose saved `CS` shows it
+  came from ring 3 kills just that task (the same `task_exited()` path
+  a normal `sys_exit` uses, which is also where the cleanup above
+  runs) and lets everything else keep running; only a fault that
+  originated in the kernel itself (ring 0) still halts, since that
+  really is unrecoverable.
+
+**Verification.** `userprogs/hello.c` (built into `TEST.ELF`) is the
+well-behaved case — unchanged behavior from before, just now running in
+its own address space: serial log shows `elf: loaded, entry=4000000
+pid=N` followed by its five `sys_write` lines and a clean `scheduler:
+task pid=N exited`. `userprogs/evil.c` (built into `EVIL.ELF`) is the
+adversarial case, written specifically to prove containment isn't just
+theoretical: it prints one message, then writes to `0x00100000` —
+comfortably inside the kernel's own image, present in every directory,
+but supervisor-only. The actual QEMU run:
+
+```
+scheduler: created isolated user task pid=5
+elf: loaded, entry=4000000 pid=5 (isolated address space)
+[pid 5 syscall] EVIL.ELF: about to touch kernel memory at 0x00100000...
+
+*** CPU EXCEPTION 14 (Page fault) ***
+err=7 eip=400000f cs=1b eflags=200206 cr2=100000
+*** killing pid 5 for this (ring-3 fault contained) ***
+scheduler: task pid=5 exited
+icmp: echo reply from id=48879 seq=508 rtt=0ms
+```
+
+`err=7` decodes to present + write + user — exactly the write EVIL.ELF
+attempted, correctly rejected. `EVIL.ELF`'s *second* message ("if you
+see this, isolation FAILED") never printed, and ping kept replying
+(508 and counting) without so much as a hiccup: one task did something
+illegal, the kernel contained it, everything else never noticed.
+Launching `TEST.ELF` again afterward (pid 6) worked identically to the
+first time, confirming the killed task's resources were reclaimed
+cleanly rather than leaving the allocator in a bad state.
+
+**What's deliberately still out of scope.** The compiled-in ring-3
+demo task (`kernel/demo_user_task.c`) still runs in the original,
+fully shared, fully user-accessible address space every task used
+before any of this existed — relocating it into the same isolated
+scheme would mean either giving it a narrow, special-cased exception
+to the kernel's now-supervisor-only memory (defeating a lot of the
+point) or turning it into a real position-independent relocation
+target (a correctness minefield for ordinary compiler output, which
+bakes in absolute addresses for things like string literals). Since
+it's kernel-authored code the kernel already trusts — not the
+security-relevant case — leaving it as-is and spending the effort on
+the actually-untrusted case (arbitrary code loaded from a disk file)
+was the deliberate call. There's also still no isolation *between*
+two kernel-mode tasks (the background counter, the ping task, the
+GUI) — none of them run untrusted code, so that gap doesn't matter the
+way it would for ELF-loaded ones.
 
 ## How the browser works
 
@@ -943,15 +1030,20 @@ iso/grub.cfg     GRUB menu entry (multiboot2 /boot/kernel.elf)
 tools/make_disk_image.sh  builds the companion FAT32 disk image (mtools, no root needed)
 ```
 
-The whole 4 GiB address space is identity-mapped (no higher-half kernel,
-no per-process page directories yet), and there are currently up to four
-concurrently scheduled tasks: the boot/GUI task (ring 0), a background
+The whole 4 GiB address space is identity-mapped (no higher-half kernel),
+and every kernel-mode task plus the compiled-in ring-3 demo task still
+shares that one mapping, same as before -- but a program loaded via the
+ELF loader (see "How the ELF loader works" above) now runs under its
+own page directory, genuinely isolated from the kernel and from every
+other task. There are currently up to four concurrently scheduled
+kernel-managed tasks at boot: the boot/GUI task (ring 0), a background
 counter task (ring 0), a demo task that runs at ring 3 and talks to the
 kernel only via `int 0x80` syscalls, and (if a NIC is present) the ping
-task. The GUI's own event loop (`gui_run()`) is itself just one of these
-tasks — it polls the mouse/keyboard and redraws at roughly 60 fps via a
-PIT-timed sleep, same as before, but now it's preemptible rather than the
-only thing running.
+task -- plus one more for each `.ELF` program launched from the File
+Manager afterward. The GUI's own event loop (`gui_run()`) is itself
+just one of these tasks — it polls the mouse/keyboard and redraws at
+roughly 60 fps via a PIT-timed sleep, same as before, but now it's
+preemptible rather than the only thing running.
 
 ## Third-party assets
 
@@ -977,21 +1069,27 @@ float/width/height/flex model, custom-property (`var()`) resolution, and
 an in-memory response cache — clickable links and images, and file
 downloads, AC97 audio with WAV playback, a from-scratch JavaScript
 engine (lexer, parser, tree-walking interpreter, and DOM bindings with
-onclick interactivity), and a minimal ELF loader that runs real programs
-from disk are now done (see above). Rough order of what's next:
+onclick interactivity), and a minimal ELF loader that runs real
+programs from disk in their own genuinely isolated, per-process page
+directory are now done (see above). Rough order of what's next:
 
-1. **Per-process page directories** — give each task its own CR3 instead
-   of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
-   mechanics work" into "processes are actually isolated," and is a
-   prerequisite for safely running untrusted code — including the ELF
-   loader, which today only checks a loaded program's segments against a
-   fixed address window (see "How the ELF loader works" above), not real
-   isolation.
-2. **`fork`/`exec`-style process management** — the ELF loader (see
-   above) can already load and run a program from disk, but there's
-   still no way for a running program to launch another one itself, no
-   process hierarchy/exit codes, and (see "Process lifecycle" above) no
-   reaping of exited tasks' resources.
+1. **Extend per-process isolation to every task, not just ELF-loaded
+   ones** — the compiled-in ring-3 demo task and every kernel-mode task
+   (background counter, ping, the GUI itself) still share the original
+   identity-mapped space (see "What's deliberately still out of scope"
+   in "How the ELF loader works" above for why that was the pragmatic
+   line to draw this pass). Closing that gap for the demo task
+   specifically means either relocating it into the same private-frame
+   scheme ELF programs use (needs real handling of its absolute-address
+   references, e.g. the string literals it passes to `sys_write`, not
+   just a raw byte copy) or accepting a narrow, explicit exception to
+   the kernel's otherwise-supervisor-only memory.
+2. **`fork`/`exec`-style process management** — the ELF loader can
+   already load and run a program from disk in its own isolated address
+   space, but there's still no way for a running program to launch
+   another one itself, no process hierarchy/exit codes, and (see
+   "Process lifecycle" above) no task-slot reuse once `MAX_TASKS` is
+   exhausted.
 3. **HTTPS** — a TLS client is a substantial project on its own
    (certificate parsing/validation, at minimum a static-RSA or ECDHE
    cipher suite), but it's the single biggest thing keeping the browser

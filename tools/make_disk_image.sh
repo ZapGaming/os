@@ -85,8 +85,18 @@ if command -v gcc >/dev/null 2>&1 && command -v ld >/dev/null 2>&1; then
   ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/TEST.ELF" "$STAGE/hello.o"
   mcopy -i "$IMG" "$STAGE/TEST.ELF" ::/TEST.ELF
   echo "Added TEST.ELF (sample ELF32 program for the File Manager to run)"
+
+  # A second, deliberately misbehaving program that proves the ELF
+  # loader's per-process isolation actually contains a bad program
+  # instead of just being decoration -- see userprogs/evil.c.
+  gcc -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector -fno-builtin -nostdlib -O2 \
+      -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mgeneral-regs-only \
+      -c userprogs/evil.c -o "$STAGE/evil.o"
+  ld -m elf_i386 -T userprogs/user.ld -nostdlib -o "$STAGE/EVIL.ELF" "$STAGE/evil.o"
+  mcopy -i "$IMG" "$STAGE/EVIL.ELF" ::/EVIL.ELF
+  echo "Added EVIL.ELF (misbehaving program to test isolation containment)"
 else
-  echo "gcc/ld not found -- skipping TEST.ELF test asset"
+  echo "gcc/ld not found -- skipping TEST.ELF/EVIL.ELF test assets"
 fi
 
 echo "Built $IMG"
