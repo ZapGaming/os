@@ -29,6 +29,7 @@ struct layout_item {
     uint32_t color;
     char text[LAYOUT_TEXT_LEN]; /* LAYOUT_ITEM_TEXT only */
     int link_id;                /* index into doc->links, -1 if none */
+    const struct dom_node *owner; /* nearest enclosing element, for JS onclick dispatch; NULL if none */
 };
 
 struct layout_link {

@@ -17,6 +17,8 @@
 #include <fs/fat32.h>
 #include <drivers/ac97.h>
 #include <drivers/wav.h>
+#include <js/js.h>
+#include <js/dom_binding.h>
 #include <kernel/kheap.h>
 #include <string.h>
 
@@ -85,9 +87,15 @@ static void fm_refresh(void);
 
 /* Browser state -- a single instance, one page loaded at a time. Pages
  * are rendered with a real (if pragmatic) CSS box-model layout: fetch
- * -> dom_parse -> css_extract_style_blocks -> layout_run -> a flat
- * list of positioned, styled render items in br_layout, which is what
- * draw_browser() and the link click hit-test actually walk. */
+ * -> dom_parse -> css_extract_style_blocks -> (run inline <script>s,
+ * which may mutate the DOM before it's ever drawn) -> layout_run -> a
+ * flat list of positioned, styled render items in br_layout, which is
+ * what draw_browser() and the link/onclick click hit-tests actually
+ * walk. Unlike the old reader-mode renderer, the DOM tree and
+ * stylesheet are kept alive for as long as the page is loaded (not
+ * freed right after the first layout) so a JS onclick handler can
+ * mutate the tree and trigger a br_relayout() -- both are only torn
+ * down right before the next page replaces them. */
 static char br_url[BR_MAX_URL] = "example.com/";
 static int br_url_len = 12;
 static int br_editing_url = 0;
@@ -95,6 +103,9 @@ static int br_scroll = 0;
 static char br_status_msg[64] = "Type a URL and press Enter";
 static struct layout_doc br_layout;
 static int br_window_idx = -1;
+static struct dom_node *br_dom_root = NULL;
+static struct css_stylesheet br_stylesheet;
+static int br_stylesheet_valid = 0;
 
 static int add_window(int x, int y, int w, int h, const char *title,
                        const char *l1, const char *l2, uint32_t accent) {
@@ -623,20 +634,33 @@ static void br_fetch(void) {
     int is_html = content_type[0] ? ct_contains(content_type, "text/html") : looks_like_page;
 
     if (is_html) {
-        char title[DOM_MAX_TITLE];
-        struct dom_node *root = dom_parse(body, body_len, title, sizeof(title));
+        /* Tear down the previous page's DOM/stylesheet/JS state before
+         * building the new one -- all three only need to live as long
+         * as the page that owns them is displayed. */
+        if (br_dom_root) { dom_free(br_dom_root); br_dom_root = NULL; }
+        if (br_stylesheet_valid) { css_stylesheet_free(&br_stylesheet); br_stylesheet_valid = 0; }
+        js_arena_reset();
+        js_dom_reset();
 
-        struct css_stylesheet sheet;
-        css_stylesheet_init(&sheet);
-        css_extract_style_blocks(&sheet, body, body_len);
+        char title[DOM_MAX_TITLE];
+        br_dom_root = dom_parse(body, body_len, title, sizeof(title));
+
+        css_stylesheet_init(&br_stylesheet);
+        css_extract_style_blocks(&br_stylesheet, body, body_len);
+        br_stylesheet_valid = 1;
+
+        /* Scripts run before the first layout so DOM mutations they
+         * make (innerHTML, textContent, style) show up immediately
+         * rather than requiring a second pass. */
+        struct js_env *global_env = js_make_global_env(br_dom_root);
+        js_run_inline_scripts(body, body_len, global_env);
+        js_dom_clear_relayout_flag();
 
         int content_x, content_y, content_w, content_h;
         br_content_area(&content_x, &content_y, &content_w, &content_h);
-        layout_run(root, &sheet, content_w, &br_layout);
+        layout_run(br_dom_root, &br_stylesheet, content_w, &br_layout);
         strncpy(br_layout.title, title, DOM_MAX_TITLE - 1);
 
-        css_stylesheet_free(&sheet);
-        dom_free(root);
         kfree(body);
         br_scroll = 0;
 
@@ -732,6 +756,17 @@ static void br_navigate(const char *href) {
     if (br_resolve_href(href)) br_fetch();
 }
 
+/* Re-runs layout against the (possibly JS-mutated) live DOM tree and
+ * stylesheet -- called after an onclick handler changes innerHTML,
+ * textContent, or style. Does not touch scroll position or the DOM
+ * tree/stylesheet themselves. */
+static void br_relayout(void) {
+    if (!br_dom_root || !br_stylesheet_valid) return;
+    int content_x, content_y, content_w, content_h;
+    br_content_area(&content_x, &content_y, &content_w, &content_h);
+    layout_run(br_dom_root, &br_stylesheet, content_w, &br_layout);
+}
+
 static void br_handle_click(const gui_window_t *w, int mx, int my) {
     int rel_y = my - (w->y + TITLEBAR_H + 8);
     br_editing_url = (rel_y >= 0 && rel_y < 20);
@@ -746,9 +781,18 @@ static void br_handle_click(const gui_window_t *w, int mx, int my) {
 
     for (int i = 0; i < br_layout.item_count; i++) {
         const struct layout_item *it = &br_layout.items[i];
-        if (it->type != LAYOUT_ITEM_TEXT || it->link_id < 0) continue;
-        if (doc_x >= it->x && doc_x < it->x + it->w && doc_y >= it->y && doc_y < it->y + it->h) {
+        if (it->type != LAYOUT_ITEM_TEXT) continue;
+        if (doc_x < it->x || doc_x >= it->x + it->w || doc_y < it->y || doc_y >= it->y + it->h) continue;
+
+        if (it->link_id >= 0) {
             br_navigate(br_layout.links[it->link_id].href);
+            return;
+        }
+        if (it->owner && js_dom_dispatch_click((struct dom_node *)it->owner)) {
+            if (js_dom_needs_relayout()) {
+                br_relayout();
+                js_dom_clear_relayout_flag();
+            }
             return;
         }
     }

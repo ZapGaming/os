@@ -37,6 +37,7 @@ static void append_child(struct dom_node *parent, struct dom_node *child) {
     if (parent->last_child) parent->last_child->next = child;
     else parent->children = child;
     parent->last_child = child;
+    child->parent = parent;
 }
 
 /* Decodes a `&...;` entity starting at data[i] (data[i] == '&'). Returns
@@ -271,4 +272,45 @@ void dom_free(struct dom_node *node) {
     }
     if (node->text) kfree(node->text);
     kfree(node);
+}
+
+void dom_replace_children(struct dom_node *parent, struct dom_node *new_children) {
+    struct dom_node *child = parent->children;
+    while (child) {
+        struct dom_node *next = child->next;
+        dom_free(child);
+        child = next;
+    }
+    parent->children = new_children;
+    parent->last_child = NULL;
+    for (struct dom_node *c = new_children; c; c = c->next) {
+        c->parent = parent;
+        parent->last_child = c;
+    }
+}
+
+void dom_set_text_content(struct dom_node *element, const char *text) {
+    struct dom_node *tn = (struct dom_node *)kmalloc(sizeof(struct dom_node));
+    memset(tn, 0, sizeof(*tn));
+    tn->type = DOM_TEXT;
+    uint32_t len = (uint32_t)strlen(text);
+    tn->text = (char *)kmalloc(len + 1);
+    memcpy(tn->text, text, len + 1);
+    dom_replace_children(element, tn);
+}
+
+static void dom_text_content_rec(const struct dom_node *node, char *out, int cap, int *pos) {
+    for (const struct dom_node *c = node->children; c && *pos < cap - 1; c = c->next) {
+        if (c->type == DOM_TEXT && c->text) {
+            for (const char *p = c->text; *p && *pos < cap - 1; p++) out[(*pos)++] = *p;
+        } else if (c->type == DOM_ELEMENT) {
+            dom_text_content_rec(c, out, cap, pos);
+        }
+    }
+}
+
+void dom_text_content(const struct dom_node *node, char *out, int cap) {
+    int pos = 0;
+    dom_text_content_rec(node, out, cap, &pos);
+    out[pos] = 0;
 }

@@ -31,6 +31,7 @@ struct dom_node {
     struct dom_node *children;
     struct dom_node *last_child; /* parse-time bookkeeping only */
     struct dom_node *next;       /* next sibling */
+    struct dom_node *parent;     /* NULL for the synthetic root -- used for JS click event bubbling */
 };
 
 /* Parses `html` (length `len`) into a DOM tree rooted at a synthetic
@@ -42,5 +43,17 @@ struct dom_node {
 struct dom_node *dom_parse(const char *html, uint32_t len, char *title_out, int title_cap);
 
 void dom_free(struct dom_node *node);
+
+/* Mutation helpers used by the JS DOM bindings to update an already
+ * laid-out page in place (element.innerHTML/textContent). Both assume
+ * `parent`/`element` are still part of the live tree the browser is
+ * currently displaying -- the caller is responsible for triggering a
+ * re-layout afterward. */
+void dom_replace_children(struct dom_node *parent, struct dom_node *new_children);
+void dom_set_text_content(struct dom_node *element, const char *text);
+
+/* Concatenates the decoded text of every DOM_TEXT descendant of `node`
+ * (depth-first) into out (truncated to cap-1 bytes, NUL-terminated). */
+void dom_text_content(const struct dom_node *node, char *out, int cap);
 
 #endif

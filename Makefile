@@ -14,8 +14,8 @@ ASFLAGS := -f elf32
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui net fs -name '*.c')
-ASM_SOURCES := $(shell find boot kernel drivers gui net fs -name '*.asm')
+C_SOURCES   := $(shell find boot kernel drivers gui net fs js -name '*.c')
+ASM_SOURCES := $(shell find boot kernel drivers gui net fs js -name '*.asm')
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES))
 ASM_OBJECTS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SOURCES))

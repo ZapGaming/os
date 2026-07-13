@@ -67,6 +67,23 @@ you can keep building on.
   connection, fetches, and either lays out or downloads. Verified
   end-to-end against both real, live websites and a local multi-page
   CSS test site (see "How the browser works" below).
+- **A real JavaScript engine**: a from-scratch lexer, recursive-descent
+  parser, and tree-walking interpreter (`js/`) for a pragmatic ES5-ish
+  subset — variables (`var`/`let`/`const` with real block scoping),
+  functions with genuine closures, `if`/`for`/`while`, all the standard
+  operators, array/object literals — wired to a minimal but real DOM API
+  (`document.getElementById`, `element.textContent`/`innerHTML` get and
+  set, `element.style.property = ...`, `element.onclick = fn` with
+  event bubbling, `console.log`, `Math`). Inline `<script>` bodies run
+  once after the page's DOM is parsed but before its first layout (so
+  a script can build page content before anything is ever drawn), and
+  clicking an element re-invokes its registered handler and re-lays-out
+  the page live if the handler mutated the DOM — a JS-driven counter
+  button and a click-to-recolor button both work for real, closures
+  and all (see "How the JS engine works" below). Numbers are 32-bit
+  integers only, not IEEE754 doubles — this kernel is built with
+  `-mno-80387 -mno-sse`, so no FPU/SSE state is ever initialized and
+  floating point genuinely cannot be generated anywhere in it.
 - **Audio**: a real AC97 codec driver (`drivers/ac97.c`, bus-master DMA
   via a descriptor list, matching what QEMU's `-device AC97` emulates)
   and a WAV file parser (`drivers/wav.c`). The File Manager can play any
@@ -94,6 +111,20 @@ you can keep building on.
 
 ## What's stubbed / not yet built
 
+- **The JS engine is a pragmatic ES5-ish subset, not real JavaScript**:
+  no prototypes/classes, no `try`/`catch`, no template literals, no
+  `for-in`/`for-of`, no destructuring, no arrow functions, no
+  `Promise`/`async`/`await`, no `setTimeout`/`setInterval` (there's no
+  event loop at all beyond "a click runs a handler synchronously"), and
+  no `<script src="...">` fetching (only inline `<script>` bodies run —
+  an external one is detected and skipped with a log line, never
+  fetched). No garbage collector either: everything a page's scripts
+  allocate lives in one fixed 256KB arena that's thrown away whole on
+  the next navigation, so a script that allocates enough across many
+  repeated clicks without ever navigating away could exhaust it (logged
+  to serial, not a crash — allocation just starts silently no-opping).
+  Numbers are 32-bit integers, not doubles (see above) — arithmetic
+  that would produce a fraction in real JS just truncates.
 - **No video or compressed-audio playback of any kind**: the browser can
   *download* a `.mkv`/`.mp3`/anything to disk, but nothing on this OS
   can decode video or compressed audio codecs — that's a multi-year
@@ -336,6 +367,105 @@ never been exercised by a transfer bigger than a small HTML page:
    buffers to comfortably coexist (2MB each) and logging the
    out-of-memory case.
 
+## How the JS engine works
+
+`js/lexer.c` tokenizes source into numbers (integers only — see the
+FPU note above), strings (with the common escapes), identifiers/
+keywords, and operators (longest-match-first, so `===` doesn't get
+split into `==` `=`). `js/parser.c` is a straightforward recursive-
+descent parser with one function per precedence level (assignment →
+conditional → `||` → `&&` → equality → relational → additive →
+multiplicative → unary → postfix → primary) producing an AST
+(`js.h`'s `struct js_node`, a tagged union). `js/interp.c` walks that
+AST against a real scope chain (`struct js_env`, one per function call
+and per block — `var` hoists to the nearest function/global scope,
+`let`/`const` are block-scoped) with proper control-flow propagation
+for `return`/`break`/`continue` threaded back up through nested
+statements. Closures work because a function value just carries a
+pointer to the `js_env` that was active when it was defined
+(`fn->closure_env`), and calling it later builds a fresh call-local env
+with *that* as its parent — the classic tree-walking-interpreter
+closure trick.
+
+Everything the interpreter allocates (AST nodes, strings, objects,
+environments) comes out of one 256KB bump-allocated arena
+(`js_alloc()` in `js/value.c`) that's simply thrown away and
+re-created on the next page navigation — there's no garbage collector,
+and there doesn't need to be one, since nothing a page's scripts
+create needs to outlive that page.
+
+`js/dom_binding.c` is the only part that knows about `net/dom.h`: it
+wraps a `dom_node*` as a `JS_OBJ_DOM_ELEMENT` value, implements
+`document.getElementById` by walking the live DOM tree, and gives
+`element.style` its own object kind (`JS_OBJ_DOM_STYLE`) whose
+property *setters* rewrite the element's inline style text in place
+(converting `backgroundColor` → `background-color` generically, not
+via a lookup table) rather than storing arbitrary JS values — so
+`this.style.backgroundColor = "..."` genuinely flows through the same
+CSS cascade every other background color does. `onclick` handlers are
+kept in a small side table keyed by `dom_node*` (a fresh
+`JS_OBJ_DOM_ELEMENT` wrapper gets created every time JS code reads
+`document.getElementById(...)`, so the handler can't live *on* that
+wrapper object — it has to be keyed by the stable node pointer
+instead). Dispatching a click walks up the clicked element's `parent`
+chain looking for a registered handler (simple bubbling: first handler
+found wins, no `stopPropagation`), which is also why `net/dom.c` grew
+a `parent` field on `dom_node` in this pass.
+
+The browser (`gui/compositor.c`) now keeps a page's DOM tree and
+resolved stylesheet alive for as long as it's displayed (previously
+both were freed the instant the first layout finished, since nothing
+needed them afterward) so that a click can mutate the live tree and
+`br_relayout()` can re-run `layout_run()` against the *same* tree
+afterward. Making a specific element clickable at all needed the
+layout engine to remember, for every rendered word, which DOM element
+it actually belongs to — a small generalization of the link-hit-testing
+threading that already existed for `<a>` tags (`net/layout.c`'s
+`layout_children` already threaded a `link_id` down through recursion;
+this pass added an `owner` pointer alongside it, updated to the current
+element at each element boundary during the walk).
+
+Two real, and one very educational, bugs came out of building this:
+
+1. **A `<div>`'s own background color never showed up if any ancestor
+   (even `<body>`) also had one.** `net/layout.c` originally appended
+   each block's background rect to the render-item list *after*
+   laying out its children (since the rect's height isn't known until
+   then) — which meant a parent's rect always landed at a *later*
+   array index than its children's rects, and the draw loop paints a
+   whole pass front-to-back in array order. A later index means
+   "painted on top," so any container with its own background
+   (`<body>` in particular, since nearly every real page's `<body>`
+   sets one) silently painted over every background nested inside it.
+   This had been live and wrong since the CSS milestone before this
+   one — it just never got *caught*, because the one page that
+   exercised it used two similarly dark colors that looked fine at a
+   glance in a screenshot. It took a test page with two loudly
+   different colors (bright blue and purple) to make the bug
+   impossible to miss. Fixed by reserving the parent's rect's array
+   slot *before* recursing into its children (so it's always earlier,
+   and therefore painted first/underneath), then patching its height
+   in place once the real value is known.
+2. **`&&`/`||` were being parsed as eagerly-evaluated binary operators**,
+   not short-circuiting logical ones — the parser's shared precedence-
+   climbing helper always built a `JS_BINARY` node regardless of which
+   operator table it was given, so `a && b` would evaluate `b`
+   unconditionally (and `eval_binary` didn't even have a case for
+   `&&`/`||`, so the result would've been wrong regardless). Caught by
+   re-reading the parser before ever running it, not by a failing test
+   — fixed by having the shared helper take the AST node type to build
+   as a parameter, so the logical-operator levels produce real
+   `JS_LOGICAL` nodes that the interpreter actually short-circuits.
+3. An `ASSIGN` expression node originally stashed its right-hand side
+   in the AST's shared `->next` sibling-link field to avoid growing
+   the node's union — which silently breaks the moment an assignment
+   appears as, say, a function call argument or array element, since
+   *those* also use `->next` to link list items and would have
+   clobbered (or been clobbered by) the assignment's own RHS pointer.
+   Caught the same way as #2 (re-reading before running), fixed by
+   giving `JS_ASSIGN` its own `value` field instead of overloading a
+   field with an unrelated meaning.
+
 ## How audio works
 
 `drivers/ac97.c` finds the Intel ICH AC97 codec via PCI (vendor
@@ -486,7 +616,9 @@ net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
                  from-scratch TCP/IP stack -- plus DOM/CSS/layout, a
                  real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
-include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/
+js/              a from-scratch JS engine: lexer, parser, tree-walking
+                 interpreter, and the DOM bindings that connect it to net/dom.c
+include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/, js/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
 iso/grub.cfg     GRUB menu entry (multiboot2 /boot/kernel.elf)
@@ -522,8 +654,10 @@ ISO, which the kernel never reads back from.
 Preemptive multitasking, ring-3 user mode, syscalls, a full
 Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write/create FAT32
 filesystem, a web browser with a real (if pragmatic) CSS box-model
-layout engine, clickable links, and file downloads, and AC97 audio with
-WAV playback are now done (see above). Rough order of what's next:
+layout engine, clickable links, and file downloads, AC97 audio with
+WAV playback, and a from-scratch JavaScript engine (lexer, parser,
+tree-walking interpreter, and DOM bindings with onclick interactivity)
+are now done (see above). Rough order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -553,6 +687,13 @@ WAV playback are now done (see above). Rough order of what's next:
 7. **File delete/rename** — the FAT32 driver can create and overwrite
    files now, but there's still no way to remove or rename one from the
    File Manager.
+8. **Growing the JS engine** — the interpreter is deliberately minimal
+   today (integer-only numbers, no prototypes/classes, no `try`/`catch`,
+   no external `<script src>` fetching). Next steps there would be a
+   software fixed-point or soft-float number type (the kernel is built
+   `-mno-sse -mno-80387`, so real floats need emulation, not just
+   enabling the FPU), prototype-based objects, and wiring `<script src>`
+   through the existing HTTP fetch code.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.
