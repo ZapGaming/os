@@ -20,7 +20,10 @@
 #include <kernel/demo_user_task.h>
 #include <kernel/ping_task.h>
 #include <net/net.h>
+#include <drivers/ata.h>
+#include <fs/fat32.h>
 #include <stdint.h>
+#include <string.h>
 
 static volatile uint32_t bg_counter = 0;
 
@@ -77,6 +80,9 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     int net_up = net_init();
     serial_printf(net_up ? "Network: rtl8139 up\n" : "Network: no NIC found\n");
+
+    int fs_up = ata_init() && fat32_init();
+    serial_printf(fs_up ? "Filesystem: FAT32 mounted\n" : "Filesystem: no disk/FAT32 found\n");
 
     scheduler_init();
     task_create(bg_task_entry);

@@ -9,11 +9,15 @@
 #include <net/net.h>
 #include <net/arp.h>
 #include <net/icmp.h>
+#include <fs/fat32.h>
 #include <string.h>
 
-#define MAX_WINDOWS   6
+#define MAX_WINDOWS   7
 #define TITLEBAR_H    28
 #define TASKBAR_H     44
+#define FM_ROW_H      16
+#define FM_MAX_ENTRIES 24
+#define FM_PREVIEW_MAX 2048
 
 typedef struct {
     int x, y, w, h;
@@ -23,6 +27,7 @@ typedef struct {
     uint32_t accent;
     int is_process_monitor;
     int is_network;
+    int is_file_manager;
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -38,6 +43,22 @@ static const uint32_t COL_BG_BOTTOM = 0x05060F;
 static const uint32_t COL_TEXT      = 0xF2F4FF;
 static const uint32_t COL_MUTED     = 0xA8AFD6;
 
+/* File manager state -- a single instance, since there's only ever one
+ * File Manager window. */
+static uint32_t fm_current_dir = 0;
+static struct fat_dirent_info fm_entries[FM_MAX_ENTRIES];
+static int fm_entry_count = 0;
+static int fm_viewing_file = 0;
+static int fm_editing = 0;
+static int fm_dirty = 0;
+static char fm_preview_name[FAT32_MAX_NAME];
+static char fm_preview_buf[FM_PREVIEW_MAX + 1];
+static int fm_preview_len = 0;
+static char fm_status_msg[32] = "";
+static uint32_t fm_status_until = 0;
+
+static void fm_refresh(void);
+
 static int add_window(int x, int y, int w, int h, const char *title,
                        const char *l1, const char *l2, uint32_t accent) {
     int idx = window_count;
@@ -49,6 +70,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->accent = accent;
     win->is_process_monitor = 0;
     win->is_network = 0;
+    win->is_file_manager = 0;
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -78,6 +100,13 @@ void gui_init(void) {
 
     int net = add_window(120, 460, 340, 190, "Network", NULL, NULL, 0x3ED0D8);
     windows[net].is_network = 1;
+
+    if (fat32_is_mounted()) {
+        int fm = add_window(480, 560, 380, 220, "File Manager", NULL, NULL, 0xF2C14E);
+        windows[fm].is_file_manager = 1;
+        fm_current_dir = fat32_root_cluster();
+        fm_refresh();
+    }
 }
 
 static void utoa(unsigned int val, char *buf) {
@@ -186,6 +215,140 @@ static void draw_network(const gui_window_t *w) {
     draw_labeled_uint(x, y + 108, "last rtt: ", icmp_last_rtt_ms(), COL_TEXT);
 }
 
+static void fm_refresh(void) {
+    fm_entry_count = fat32_list_dir(fm_current_dir, fm_entries, FM_MAX_ENTRIES);
+    fm_viewing_file = 0;
+    fm_editing = 0;
+    fm_dirty = 0;
+}
+
+static int fm_is_notes_txt(const char *name) {
+    return strcmp(name, "NOTES.TXT") == 0;
+}
+
+/* Called when a row in the listing is clicked: navigate into directories,
+ * open a read-only preview for other files, or an editable one for the
+ * demo's NOTES.TXT (the only file fat32_write_file knows how to save). */
+static void fm_open_entry(int index) {
+    if (index < 0 || index >= fm_entry_count) return;
+    struct fat_dirent_info *e = &fm_entries[index];
+
+    if (e->is_dir) {
+        if (strcmp(e->name, ".") == 0) return;
+        fm_current_dir = (e->cluster < 2) ? fat32_root_cluster() : e->cluster;
+        fm_refresh();
+        return;
+    }
+
+    strcpy(fm_preview_name, e->name);
+    fm_preview_len = fat32_read_file(e->cluster, e->size, fm_preview_buf, FM_PREVIEW_MAX);
+    fm_preview_buf[fm_preview_len] = 0;
+    fm_viewing_file = 1;
+    fm_editing = fm_is_notes_txt(e->name);
+    fm_dirty = 0;
+}
+
+static void fm_save_notes(void) {
+    int ok = fat32_write_file(fm_current_dir, "NOTES.TXT", fm_preview_buf, fm_preview_len);
+    strcpy(fm_status_msg, ok ? "Saved -- persists across reboot" : "Save failed");
+    fm_status_until = pit_ticks() + 200;
+    fm_dirty = 0;
+}
+
+/* Feeds typed characters into the open NOTES.TXT buffer; Enter saves.
+ * Called from gui_run() only when the File Manager has it open for edit. */
+static void fm_handle_key(char c) {
+    if (!fm_editing) return;
+    if (c == '\n' || c == '\r') {
+        fm_save_notes();
+    } else if (c == '\b') {
+        if (fm_preview_len > 0) { fm_preview_len--; fm_dirty = 1; }
+    } else if (c >= 32 && c < 127 && fm_preview_len < FM_PREVIEW_MAX) {
+        fm_preview_buf[fm_preview_len++] = c;
+        fm_dirty = 1;
+    }
+    fm_preview_buf[fm_preview_len] = 0;
+}
+
+static void draw_wrapped_text(int x, int y, int max_width, int max_rows, const char *text, uint32_t color) {
+    int chars_per_line = max_width / 8;
+    if (chars_per_line < 1) chars_per_line = 1;
+    if (chars_per_line > 62) chars_per_line = 62;
+
+    char line[64];
+    int col = 0, row = 0, li = 0;
+    for (const char *p = text; *p && row < max_rows; p++) {
+        if (*p == '\n' || col >= chars_per_line) {
+            line[li] = 0;
+            fb_draw_string(x, y + row * FM_ROW_H, line, color, 1);
+            li = 0; col = 0; row++;
+            if (*p == '\n') continue;
+        }
+        line[li++] = *p;
+        col++;
+    }
+    if (li > 0 && row < max_rows) {
+        line[li] = 0;
+        fb_draw_string(x, y + row * FM_ROW_H, line, color, 1);
+    }
+}
+
+static void fm_handle_click(const gui_window_t *w, int my) {
+    if (!fat32_is_mounted()) return;
+    int rel_y = my - (w->y + TITLEBAR_H + 12);
+
+    if (fm_viewing_file) {
+        if (rel_y >= 0 && rel_y < FM_ROW_H) fm_viewing_file = 0; /* "<- back" row */
+        return;
+    }
+    int row = (rel_y - 18) / FM_ROW_H;
+    if (row >= 0) fm_open_entry(row);
+}
+
+static void draw_file_manager(const gui_window_t *w) {
+    int x = w->x + 14;
+    int y = w->y + TITLEBAR_H + 12;
+    int content_w = w->w - 28;
+
+    if (!fat32_is_mounted()) {
+        fb_draw_string(x, y, "no disk/FAT32 detected", 0xE05252, 1);
+        return;
+    }
+
+    if (fm_viewing_file) {
+        fb_draw_string(x, y, "<- back to listing", 0x62D8FF, 1);
+        fb_draw_string(x, y + 18, fm_preview_name, COL_TEXT, 1);
+        if (fm_editing) {
+            fb_draw_string(x, y + 34,
+                           fm_dirty ? "editing -- press Enter to save" : "press Enter to save, Backspace to edit",
+                           COL_MUTED, 1);
+        }
+        draw_wrapped_text(x, y + 52, content_w, (w->h - TITLEBAR_H - 70) / FM_ROW_H, fm_preview_buf, COL_TEXT);
+        if (pit_ticks() < fm_status_until) {
+            fb_draw_string(x, w->y + w->h - 18, fm_status_msg, 0x8FE3A8, 1);
+        }
+        return;
+    }
+
+    fb_draw_string(x, y, fm_current_dir == fat32_root_cluster() ? "/" : "(subfolder)", COL_MUTED, 1);
+    int max_rows = (w->h - TITLEBAR_H - 30) / FM_ROW_H;
+    for (int i = 0; i < fm_entry_count && i < max_rows; i++) {
+        char line[40];
+        if (fm_entries[i].is_dir) {
+            strcpy(line, "[DIR] ");
+            strcat(line, fm_entries[i].name);
+        } else {
+            char sizebuf[12];
+            utoa(fm_entries[i].size, sizebuf);
+            strcpy(line, fm_entries[i].name);
+            strcat(line, "  ");
+            strcat(line, sizebuf);
+            strcat(line, "B");
+        }
+        fb_draw_string(x, y + 18 + i * FM_ROW_H, line, fm_entries[i].is_dir ? 0x62D8FF : COL_TEXT, 1);
+    }
+}
+
 static void draw_shadow(int x, int y, int w, int h) {
     int offset = 8;
     for (int i = 0; i < offset; i++) {
@@ -222,6 +385,7 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->body_line2) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 34, w->body_line2, COL_MUTED, 1);
     if (w->is_process_monitor) draw_process_monitor(w);
     if (w->is_network) draw_network(w);
+    if (w->is_file_manager) draw_file_manager(w);
 }
 
 static void draw_taskbar(void) {
@@ -265,6 +429,7 @@ void gui_run(void) {
         int left_edge = left_down && !prev_left;
 
         if (left_edge) {
+            int hit_titlebar = 0;
             for (int oi = window_count - 1; oi >= 0; oi--) {
                 int wi = window_order[oi];
                 gui_window_t *w = &windows[wi];
@@ -273,7 +438,19 @@ void gui_run(void) {
                     dragging_window = wi;
                     drag_dx = mx - w->x;
                     drag_dy = my - w->y;
+                    hit_titlebar = 1;
                     break;
+                }
+            }
+            if (!hit_titlebar) {
+                for (int oi = window_count - 1; oi >= 0; oi--) {
+                    int wi = window_order[oi];
+                    gui_window_t *w = &windows[wi];
+                    if (mx >= w->x && mx < w->x + w->w && my >= w->y + TITLEBAR_H && my < w->y + w->h) {
+                        bring_to_front(oi);
+                        if (w->is_file_manager) fm_handle_click(w, my);
+                        break;
+                    }
                 }
             }
         }
@@ -291,7 +468,9 @@ void gui_run(void) {
 
         prev_left = left_down;
 
-        while (keyboard_getchar()) { /* drain; no text widgets yet */ }
+        for (char c = keyboard_getchar(); c; c = keyboard_getchar()) {
+            fm_handle_key(c);
+        }
 
         draw_frame(mx, my);
         fb_swap_buffers();

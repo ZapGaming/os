@@ -14,8 +14,8 @@ ASFLAGS := -f elf32
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui net -name '*.c')
-ASM_SOURCES := $(shell find boot kernel drivers gui net -name '*.asm')
+C_SOURCES   := $(shell find boot kernel drivers gui net fs -name '*.c')
+ASM_SOURCES := $(shell find boot kernel drivers gui net fs -name '*.asm')
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES))
 ASM_OBJECTS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SOURCES))
@@ -23,10 +23,16 @@ OBJECTS     := $(ASM_OBJECTS) $(C_OBJECTS)
 
 KERNEL  := $(BUILD)/kernel.elf
 ISO     := zapos.iso
+DISK    := zapos_disk.img
 
-.PHONY: all clean run iso
+.PHONY: all clean run iso disk
 
 all: $(KERNEL)
+
+$(DISK):
+	./tools/make_disk_image.sh
+
+disk: $(DISK)
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -45,9 +51,9 @@ iso: $(KERNEL)
 	cp iso/grub.cfg $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR)
 
-run: iso
-	qemu-system-i386 -cdrom $(ISO) -serial stdio -m 256M \
-		-netdev user,id=net0 -device rtl8139,netdev=net0
+run: iso disk
+	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 \
+		-serial stdio -m 256M -netdev user,id=net0 -device rtl8139,netdev=net0
 
 clean:
 	rm -rf $(BUILD) $(ISODIR) $(ISO)

@@ -43,13 +43,26 @@ you can keep building on.
   "Network" window shows the NIC's real MAC, our IP, the resolved gateway,
   and live ping stats. Verified against a real packet capture (see "How
   networking works" below) — the gateway's replies genuinely round-trip.
+- **Filesystem**: an ATA PIO disk driver and a real FAT32 driver (BPB
+  parsing, FAT-chain walking, directory listing, file read *and* write)
+  on a separate 64MB disk image. The GUI's "File Manager" window browses
+  it live — click a folder to navigate in, click a file to preview it,
+  and `NOTES.TXT` is actually editable: type into it, press Enter to
+  save, and it persists across a full reboot (verified end-to-end,
+  including through the GUI itself — see "How the filesystem works").
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
 ## What's stubbed / not yet built
 
 - **Audio**: no sound driver yet.
-- **Filesystem**: no on-disk filesystem or persistent storage driver (ATA/AHCI).
+- **A real web browser**: no TCP, no HTTP client, no HTML/CSS renderer —
+  all prerequisites for an actual browser and each a substantial project
+  on its own. See the roadmap for how this builds on what exists now.
+- **Filesystem writes are constrained**: `fat32_write_file` can only
+  overwrite a file that already exists in a directory (it doesn't create
+  new directory entries or grow a directory) — the shipped disk image
+  pre-creates `NOTES.TXT` as an empty placeholder for exactly this reason.
 - **Networking is Ethernet/ARP/IPv4/ICMP only**: no UDP or TCP yet, no DHCP
   (the IP config is static, matching QEMU's default SLIRP network so
   `make run` just works), and incoming packet checksums aren't validated
@@ -137,6 +150,56 @@ consequences of preemption happening on *every* PIT tick, unconditionally:
    see `pending_outstanding` still 0, and silently drop a perfectly valid
    reply. Fixed by setting that state *before* sending.
 
+## How the filesystem works
+
+`drivers/ata.c` drives the primary IDE channel with plain PIO (IDENTIFY,
+then 28-bit LBA read/write) and deliberately only looks at the primary
+*master* — the boot CD-ROM is an ATAPI device and gets skipped by
+checking the IDENTIFY signature. `fs/fat32.c` reads the BPB from LBA 0
+(the companion disk image has no partition table — it's a FAT32
+"superfloppy," so the filesystem starts right at sector 0), then
+implements the FAT32 essentials from scratch: cluster↔LBA math, walking
+a 32-bit FAT chain, directory-entry parsing (8.3 names only — long
+filename entries are skipped, not decoded), reading a file's cluster
+chain, and writing one (allocate free clusters by scanning the FAT,
+chain them, write the data, update the existing directory entry).
+
+`tools/make_disk_image.sh` builds `zapos_disk.img` (and a `.vmdk`
+alongside it for VMware/VirtualBox) with `mtools` — no root or loop
+devices needed. It ships `README.TXT`, `DOCS/ABOUTFS.TXT`, and an empty
+`NOTES.TXT` that the File Manager can actually edit and save.
+
+Getting this right needed one more fix on top of everything already
+running: with a hard disk attached, the BIOS's default boot order tries
+the hard disk *before* the CD-ROM, and since `zapos_disk.img` has no
+boot code on it, that's a silent hang before any of our own code even
+runs. `-boot order=d` (CD-ROM first) fixes it — `make run` and the
+troubleshooting notes below both account for this.
+
+## Testing in other VMs (VMware, VirtualBox, browser-based emulators)
+
+ZapOS is a completely standard Multiboot2 kernel on a standard El Torito
+bootable ISO, so it isn't tied to QEMU. It was also verified booting
+correctly under [v86](https://github.com/copy/v86) (a WASM x86 emulator
+used by some browser-based "run an OS in a tab" tools) — GUI, scheduler,
+ring-3, and syscalls all confirmed working there identically to QEMU. Two
+things to know if you hit trouble in a different VM:
+
+- **Give it a boot CD/DVD, not a floppy or generic disk**, and if you
+  also attach `zapos_disk.img`/`zapos_disk.vmdk`, make sure the CD-ROM is
+  first in boot order (see above) — otherwise it'll try to boot from the
+  data disk and hang.
+- **Don't over-allocate RAM.** ZapOS itself needs only a few MB. One
+  browser-based emulator tested here would reliably crash *itself*
+  (inside its own BIOS-loading code, before ZapOS ever runs) when given
+  4GB of guest RAM, but worked perfectly at 256MB — if a VM tool offers
+  a RAM slider or "compatibility" preset, prefer the smaller option.
+- Networking needs an **RTL8139** NIC specifically (that's the only
+  driver written so far) attached with a network backend that actually
+  answers ICMP (QEMU's user-mode/SLIRP networking does this by default).
+  Some tools don't attach a NIC at all — ZapOS handles that gracefully
+  (the Network window just shows "no NIC detected"), it's not an error.
+
 ## Building and running
 
 Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
@@ -145,14 +208,18 @@ Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
 ```sh
 make          # compile the kernel (build/kernel.elf)
 make iso      # package it as zapos.iso via GRUB
-make run      # build the ISO and boot it in QEMU with a NIC + serial on stdio
+make disk     # build zapos_disk.img + zapos_disk.vmdk (only if missing --
+              # won't clobber anything you've saved via the File Manager)
+make run      # build both and boot in QEMU with a NIC + disk + serial on stdio
 ```
 
 `make run` attaches an RTL8139 NIC via QEMU's user-mode (SLIRP) networking
-(`-netdev user -device rtl8139`) so ping-the-gateway works out of the box.
-Booting `zapos.iso` some other way (VirtualBox/VMware/real hardware) works
-fine without a NIC too — the GUI's Network window just shows "no NIC
-detected" and everything else runs the same. Boot mode is legacy BIOS
+and the FAT32 disk image, with `-boot order=d` so it boots the CD-ROM
+first (see above for why that matters once a hard disk is attached).
+Booting `zapos.iso` some other way (VirtualBox/VMware/real hardware, or
+without `zapos_disk.img` at all) works fine too — the GUI just shows "no
+NIC detected" / "no disk/FAT32 detected" for whichever piece isn't
+present, and everything else runs the same. Boot mode is legacy BIOS
 (not UEFI/Secure Boot yet — that would need a `grub-mkrescue --efi` build
 and a different Multiboot path).
 
@@ -163,13 +230,15 @@ boot/            multiboot2 header + real assembly entry point
 kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  manager, kernel heap, multiboot info parser, serial console,
                  scheduler + context switch, TSS, ring-3 entry, syscalls
-drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC
+drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC, ATA
 gui/             framebuffer primitives, bitmap font, window compositor
 net/             Ethernet, ARP, IPv4, ICMP -- a minimal from-scratch TCP/IP stack
-include/         public headers, mirroring kernel/, drivers/, gui/, net/
+fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
+include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
 iso/grub.cfg     GRUB menu entry (multiboot2 /boot/kernel.elf)
+tools/make_disk_image.sh  builds the companion FAT32 disk image (mtools, no root needed)
 ```
 
 The whole 4 GiB address space is identity-mapped (no higher-half kernel,
@@ -198,31 +267,43 @@ ISO, which the kernel never reads back from.
 
 ## Roadmap: making this an "everyday OS"
 
-Preemptive multitasking, ring-3 user mode, syscalls, and basic networking
-(Ethernet/ARP/IPv4/ICMP, ping working) are now done (see above). Rough
-order of what's next, and concretely how:
+Preemptive multitasking, ring-3 user mode, syscalls, basic networking
+(Ethernet/ARP/IPv4/ICMP, ping working), and a real read/write FAT32
+filesystem are now done (see above). Rough order of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
    mechanics work" into "processes are actually isolated," and is a
-   prerequisite for loading untrusted code safely.
-2. **Filesystem** — an ATA PIO (or AHCI) disk driver, then a simple
-   filesystem (FAT32 is the pragmatic choice: well-documented, and lets
-   you exchange files with a real OS by mounting the disk image). Combined
-   with #1, this is what lets user programs be loaded from disk instead
-   of compiled into the kernel image as demo tasks.
+   prerequisite for loading untrusted code (like a future browser binary)
+   safely.
+2. **Loading programs from disk** — right now every task is compiled
+   into the kernel image; with a filesystem and per-process page
+   directories both in place, the natural next step is a minimal ELF
+   loader plus `fork`/`exec`-style syscalls, so user programs can be
+   files on `zapos_disk.img` instead of demo functions in `kernel.c`.
 3. **UDP + TCP + DHCP** — the Ethernet/ARP/IPv4/ICMP foundation is there;
    UDP is a small addition (no connection state), TCP is the real work
    (connection state machine, retransmission, windowing), and DHCP would
    replace the current static IP config with a real handshake.
-4. **Audio** — an AC97 or Intel HDA driver (AC97 is simpler and what QEMU's
-   `-device AC97` emulates), PCM playback via DMA buffers.
+4. **A real web browser** — the actual next-big-thing target, and it's
+   large enough to deserve its own multi-session build once #3 lands:
+   - an HTTP/1.1 client on top of TCP
+   - an HTML parser (even a simplified subset) and a CSS box-model layout
+     engine
+   - wiring that layout tree into the existing framebuffer primitives
+     (`gui/framebuffer.c` already has rects/text/gradients — enough to
+     paint a basic page once there's a layout tree telling it where)
+   - a browser "app" window in the compositor, using #2 above so it's a
+     real loaded program rather than another hardcoded kernel task
+   A JS engine is out of scope even after all that — a static-HTML/CSS
+   renderer that can fetch and display a real page over TCP is already a
+   substantial, multi-session project by itself.
 5. **A real windowing API** — right now windows are hardcoded in
-   `gui/compositor.c`; the next step is a message-passing syscall API so
-   user-mode processes can create/draw into their own windows, which is
-   what turns this from "one big demo GUI" into an actual application
-   platform. More syscalls generally (`fork`/`exec`-equivalents once #1
-   and #2 land, proper process exit/reaping) fall under this too.
+   `gui/compositor.c`; user-mode processes (the eventual browser
+   included) need a message-passing syscall API to create/draw into
+   their own windows rather than being baked into the compositor.
+6. **Audio** — an AC97 or Intel HDA driver (AC97 is simpler and what QEMU's
+   `-device AC97` emulates), PCM playback via DMA buffers.
 
 Each of these is independently a multi-day-to-multi-week task; happy to
 keep building on any of them next.
