@@ -97,7 +97,8 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     }
 
     int net_up = net_init();
-    serial_printf(net_up ? "Network: rtl8139 up\n" : "Network: no NIC found\n");
+    if (net_up) serial_printf("Network: %s up\n", net_get_driver_name());
+    else serial_printf("Network: no NIC found\n");
 
     int fs_up = ata_init() && fat32_init();
     serial_printf(fs_up ? "Filesystem: FAT32 mounted\n" : "Filesystem: no disk/FAT32 found\n");

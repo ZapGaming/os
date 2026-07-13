@@ -290,8 +290,13 @@ static void draw_network(const gui_window_t *w) {
         }
         macbuf[i] = 0;
     }
-    fb_draw_string(x, y, "rtl8139  ", COL_MUTED, 1);
-    fb_draw_string(x + fb_text_width("rtl8139  ", 1), y, macbuf, COL_TEXT, 1);
+    char namebuf[16];
+    strcpy(namebuf, net_get_driver_name());
+    int nlen = (int)strlen(namebuf);
+    while (nlen < 9 && nlen < (int)sizeof(namebuf) - 1) namebuf[nlen++] = ' ';
+    namebuf[nlen] = 0;
+    fb_draw_string(x, y, namebuf, COL_MUTED, 1);
+    fb_draw_string(x + fb_text_width(namebuf, 1), y, macbuf, COL_TEXT, 1);
 
     format_ip(net_get_ip(), buf);
     fb_draw_string(x, y + 20, "ip      ", COL_MUTED, 1);

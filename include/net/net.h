@@ -26,6 +26,15 @@ uint32_t net_get_gateway_ip(void);
 uint32_t net_get_netmask(void);
 int net_is_local(uint32_t ip);
 
+/* Name of whichever NIC driver net_init() actually brought up (e.g.
+ * "rtl8139", "e1000"), for display -- empty string if none. */
+const char *net_get_driver_name(void);
+
+/* Hands a fully-built Ethernet frame to whichever NIC driver is active.
+ * eth_send() is the only caller; a NIC driver is never referenced by
+ * name outside net_init() itself. */
+void net_send_frame(const void *data, uint16_t len);
+
 /* RFC 1071 internet checksum over `len` bytes (odd trailing byte handled). */
 uint16_t net_checksum(const void *data, int len);
 

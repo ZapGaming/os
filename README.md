@@ -48,8 +48,16 @@ you can keep building on.
   kernel. The GUI's "Process Monitor" window shows this live: task count,
   a live-incrementing counter from a background kernel task, and the
   actual string the ring-3 task sent via syscall.
-- **Networking**: PCI enumeration, an RTL8139 driver (IRQ-driven RX ring +
-  TX descriptors), and a real stack built up in layers — Ethernet, ARP
+- **Networking**: PCI enumeration, two NIC drivers — an RTL8139 driver
+  (IRQ-driven RX ring + TX descriptors, I/O-space registers) and an
+  Intel 8254x ("e1000") driver (MMIO registers, descriptor rings the
+  hardware DMAs into/out of directly) — tried in that order at boot, so
+  whichever one actually finds hardware wins; QEMU defaults to RTL8139,
+  VMware's virtual NICs and QEMU's own `-device e1000` show up as e1000.
+  `net_init()` doesn't hardcode either driver into the rest of the
+  stack: `net_send_frame()` dispatches to whichever one initialized
+  successfully, and the GUI's "Network" window shows the real driver
+  name it's using. On top of that, a real stack built up in layers — Ethernet, ARP
   (request/reply, with a cache), IPv4 (with header checksums *and*
   gateway routing for off-subnet destinations), ICMP echo, UDP, a DNS
   resolver (A records, over UDP/53), and a client-only TCP (active-open
@@ -225,13 +233,37 @@ into ring 0.
 ## How networking works
 
 `drivers/pci.c` enumerates the PCI bus (legacy 0xCF8/0xCFC config-space
-access) to find the RTL8139 (vendor 0x10EC, device 0x8139 — what QEMU's
-`-device rtl8139` emulates). `drivers/rtl8139.c` resets it, gives it a
-receive ring buffer and four transmit descriptor slots, and hooks its PCI
-interrupt line. `net/` layers Ethernet → ARP → IPv4 → ICMP on top, each in
+access) to find a NIC. `net_init()` tries two drivers in order and uses
+whichever one actually finds hardware:
+
+- `drivers/rtl8139.c` — vendor 0x10EC, device 0x8139 (what QEMU's
+  `-device rtl8139`, and its default NIC, emulate). I/O-space registers
+  (BAR0's low bit marks it as an I/O-space BAR); resets it, gives it a
+  receive ring buffer and four transmit descriptor slots, hooks its PCI
+  interrupt line.
+- `drivers/e1000.c` — Intel 8254x-family (vendor 0x8086, checked against
+  a list of common device IDs — QEMU's `-device e1000` shows up as
+  82540EM/0x100E, VMware's virtual "E1000" NIC as 82545EM/0x100F, plus a
+  handful of others). Memory-mapped registers instead of I/O ports —
+  BAR0 is used directly as a pointer, relying on this kernel's flat
+  identity-mapped address space rather than a separate MMIO remap step.
+  Resets it, zeroes the required multicast table, sets up 32 RX and 8 TX
+  descriptors (16-byte-aligned, which `kmalloc()` doesn't guarantee on
+  its own — see the aligned-allocation note in the source), and reads
+  the MAC straight from the receive-address registers (RAL0/RAH0, which
+  QEMU and VMware both pre-load) rather than doing an EEPROM read.
+
+Neither driver is referenced by name outside `net_init()`: `net/ethernet.c`
+calls `net_send_frame()`, which dispatches to whichever driver
+initialized successfully, and the GUI's "Network" window displays
+`net_get_driver_name()` rather than a hardcoded label. `net/` layers
+Ethernet → ARP → IPv4 → ICMP on top of whichever NIC is active, each in
 its own file, dispatching by ethertype/protocol number. The IP config
 (`10.0.2.15`, gateway `10.0.2.2`) is static and matches QEMU SLIRP's
-defaults, so there's no DHCP client yet.
+defaults, so there's no DHCP client yet — this also means a real VMware
+network (not QEMU's SLIRP) would need this static config to happen to
+fit whatever network VMware bridges/NATs to, until a real DHCP client
+exists (see the roadmap).
 
 Verifying this actually worked took a real packet capture (`tcpdump -r`
 on a `-object filter-dump` pcap), which is worth calling out because it
@@ -620,11 +652,22 @@ things to know if you hit trouble in a different VM:
   (inside its own BIOS-loading code, before ZapOS ever runs) when given
   4GB of guest RAM, but worked perfectly at 256MB — if a VM tool offers
   a RAM slider or "compatibility" preset, prefer the smaller option.
-- Networking needs an **RTL8139** NIC specifically (that's the only
-  driver written so far) attached with a network backend that actually
-  answers ICMP (QEMU's user-mode/SLIRP networking does this by default).
-  Some tools don't attach a NIC at all — ZapOS handles that gracefully
-  (the Network window just shows "no NIC detected"), it's not an error.
+- Networking needs an **RTL8139 or Intel e1000-family** NIC (the two
+  drivers written so far — `net_init()` tries both and uses whichever
+  it finds) attached with a network backend that actually answers ICMP.
+  QEMU's default NIC and user-mode/SLIRP networking (RTL8139) work out
+  of the box; VMware's virtual "E1000" NIC is also detected and works
+  at the hardware level (verified against QEMU's own `-device e1000` as
+  a stand-in, since a real VMware install isn't available to test
+  against directly here) — **but** the IP config is still the static
+  `10.0.2.15`/gateway `10.0.2.2` that matches QEMU SLIRP specifically,
+  with no DHCP client yet, so on a real VMware network (which typically
+  hands out a different subnet, e.g. `192.168.x.x`) the NIC will come
+  up but ARP/ping/the browser won't actually reach anything unless
+  VMware's virtual network is configured to match that subnet, or until
+  a DHCP client exists (see the roadmap). Some tools don't attach a NIC
+  at all — ZapOS handles that gracefully (the Network window just shows
+  "no NIC detected"), it's not an error.
 - Audio needs an **AC97** sound device attached. If the VM tool has no
   audio backend configured at all, the AC97 device itself may still not
   even be exposed to the guest depending on the tool — ZapOS handles a
@@ -674,7 +717,7 @@ kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  manager, kernel heap, multiboot info parser, serial console,
                  scheduler + context switch, TSS, ring-3 entry, syscalls
 drivers/         PS/2 controller, keyboard, mouse, PCI enumeration,
-                 RTL8139 NIC, ATA, AC97 codec, WAV file parsing
+                 RTL8139 + Intel e1000 NICs, ATA, AC97 codec, WAV file parsing
 gui/             framebuffer primitives, bitmap font, window compositor
 net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
                  from-scratch TCP/IP stack -- plus DOM/CSS/layout and a

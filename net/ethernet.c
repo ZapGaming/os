@@ -2,7 +2,6 @@
 #include <net/net.h>
 #include <net/arp.h>
 #include <net/ip.h>
-#include <drivers/rtl8139.h>
 #include <string.h>
 
 const uint8_t ETH_BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -19,7 +18,7 @@ void eth_send(const uint8_t dst_mac[6], uint16_t ethertype, const void *payload,
     if (len > max_payload) len = max_payload;
     memcpy(frame + sizeof(struct eth_header), payload, len);
 
-    rtl8139_send(frame, (uint16_t)(sizeof(struct eth_header) + len));
+    net_send_frame(frame, (uint16_t)(sizeof(struct eth_header) + len));
 }
 
 void eth_handle_frame(const uint8_t *frame, uint16_t len) {
