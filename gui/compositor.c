@@ -6,9 +6,12 @@
 #include <kernel/scheduler.h>
 #include <kernel/demo.h>
 #include <kernel/syscall.h>
+#include <net/net.h>
+#include <net/arp.h>
+#include <net/icmp.h>
 #include <string.h>
 
-#define MAX_WINDOWS   5
+#define MAX_WINDOWS   6
 #define TITLEBAR_H    28
 #define TASKBAR_H     44
 
@@ -19,6 +22,7 @@ typedef struct {
     const char *body_line2;
     uint32_t accent;
     int is_process_monitor;
+    int is_network;
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -44,6 +48,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->body_line2 = l2;
     win->accent = accent;
     win->is_process_monitor = 0;
+    win->is_network = 0;
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -65,11 +70,14 @@ void gui_init(void) {
                "Kernel heap + paging: online",
                "PS/2 keyboard + mouse: online", 0x2FBF71);
     add_window(260, 340, 320, 150, "Roadmap",
-               "Next up: networking + audio",
+               "Next up: process isolation + a filesystem",
                "See README.md for the plan", 0xE0954C);
 
     int pm = add_window(640, 420, 320, 190, "Process Monitor", NULL, NULL, 0xB05CE0);
     windows[pm].is_process_monitor = 1;
+
+    int net = add_window(120, 460, 340, 190, "Network", NULL, NULL, 0x3ED0D8);
+    windows[net].is_network = 1;
 }
 
 static void utoa(unsigned int val, char *buf) {
@@ -122,6 +130,62 @@ static void draw_process_monitor(const gui_window_t *w) {
     fb_draw_string(x, y + 86, syscall_last_message(), COL_TEXT, 1);
 }
 
+static void format_ip(uint32_t ip, char *buf) {
+    char part[4];
+    int i = 0;
+    utoa((ip >> 24) & 0xFF, part); for (char *p = part; *p; p++) buf[i++] = *p;
+    buf[i++] = '.';
+    utoa((ip >> 16) & 0xFF, part); for (char *p = part; *p; p++) buf[i++] = *p;
+    buf[i++] = '.';
+    utoa((ip >> 8) & 0xFF, part); for (char *p = part; *p; p++) buf[i++] = *p;
+    buf[i++] = '.';
+    utoa(ip & 0xFF, part); for (char *p = part; *p; p++) buf[i++] = *p;
+    buf[i] = 0;
+}
+
+static void draw_network(const gui_window_t *w) {
+    int x = w->x + 14;
+    int y = w->y + TITLEBAR_H + 14;
+    char buf[20];
+
+    if (!net_is_up()) {
+        fb_draw_string(x, y, "no NIC detected", 0xE05252, 1);
+        return;
+    }
+
+    const uint8_t *mac = net_get_mac();
+    char macbuf[24];
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        int i = 0;
+        for (int b = 0; b < 6; b++) {
+            macbuf[i++] = hex[mac[b] >> 4];
+            macbuf[i++] = hex[mac[b] & 0xF];
+            if (b < 5) macbuf[i++] = ':';
+        }
+        macbuf[i] = 0;
+    }
+    fb_draw_string(x, y, "rtl8139  ", COL_MUTED, 1);
+    fb_draw_string(x + fb_text_width("rtl8139  ", 1), y, macbuf, COL_TEXT, 1);
+
+    format_ip(net_get_ip(), buf);
+    fb_draw_string(x, y + 20, "ip      ", COL_MUTED, 1);
+    fb_draw_string(x + fb_text_width("ip      ", 1), y + 20, buf, COL_TEXT, 1);
+
+    format_ip(net_get_gateway_ip(), buf);
+    uint8_t gw_mac[6];
+    int resolved = arp_resolve(net_get_gateway_ip(), gw_mac);
+    fb_draw_string(x, y + 40, "gateway ", COL_MUTED, 1);
+    fb_draw_string(x + fb_text_width("gateway ", 1), y + 40, buf, COL_TEXT, 1);
+    fb_draw_string(x + fb_text_width("gateway ", 1) + fb_text_width(buf, 1) + 8,
+                   y + 40, resolved ? "(resolved)" : "(resolving...)",
+                   resolved ? 0x8FE3A8 : 0xE0954C, 1);
+
+    draw_labeled_uint(x, y + 68, "pings sent: ", (unsigned int)icmp_requests_sent(), COL_TEXT);
+    draw_labeled_uint(x, y + 88, "replies received: ", (unsigned int)icmp_replies_received(), 0x8FE3A8);
+    draw_labeled_uint(x, y + 108, "last rtt: ", icmp_last_rtt_ms(), COL_TEXT);
+}
+
 static void draw_shadow(int x, int y, int w, int h) {
     int offset = 8;
     for (int i = 0; i < offset; i++) {
@@ -157,6 +221,7 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->body_line1) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 16, w->body_line1, COL_TEXT, 1);
     if (w->body_line2) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 34, w->body_line2, COL_MUTED, 1);
     if (w->is_process_monitor) draw_process_monitor(w);
+    if (w->is_network) draw_network(w);
 }
 
 static void draw_taskbar(void) {

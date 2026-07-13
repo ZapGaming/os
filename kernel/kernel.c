@@ -18,6 +18,8 @@
 #include <kernel/tss.h>
 #include <kernel/syscall.h>
 #include <kernel/demo_user_task.h>
+#include <kernel/ping_task.h>
+#include <net/net.h>
 #include <stdint.h>
 
 static volatile uint32_t bg_counter = 0;
@@ -73,9 +75,13 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
                  mb_info.fb_width, mb_info.fb_height, mb_info.fb_bpp);
     }
 
+    int net_up = net_init();
+    serial_printf(net_up ? "Network: rtl8139 up\n" : "Network: no NIC found\n");
+
     scheduler_init();
     task_create(bg_task_entry);
     task_create_user(demo_user_task_entry);
+    if (net_up) task_create(ping_task_entry);
     pit_set_tick_callback(schedule);
     scheduler_start();
     serial_printf("Scheduler started with %d tasks\n", scheduler_task_count());

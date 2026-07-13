@@ -14,8 +14,8 @@ ASFLAGS := -f elf32
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui -name '*.c')
-ASM_SOURCES := $(shell find boot kernel drivers gui -name '*.asm')
+C_SOURCES   := $(shell find boot kernel drivers gui net -name '*.c')
+ASM_SOURCES := $(shell find boot kernel drivers gui net -name '*.asm')
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES))
 ASM_OBJECTS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SOURCES))
@@ -46,7 +46,8 @@ iso: $(KERNEL)
 	grub-mkrescue -o $(ISO) $(ISODIR)
 
 run: iso
-	qemu-system-i386 -cdrom $(ISO) -serial stdio -m 256M
+	qemu-system-i386 -cdrom $(ISO) -serial stdio -m 256M \
+		-netdev user,id=net0 -device rtl8139,netdev=net0
 
 clean:
 	rm -rf $(BUILD) $(ISODIR) $(ISO)

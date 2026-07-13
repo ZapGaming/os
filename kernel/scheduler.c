@@ -101,7 +101,7 @@ void schedule(void) {
     }
     if (next == prev) return; /* nothing else runnable */
 
-    prev->state = TASK_READY;
+    if (prev->state != TASK_TERMINATED) prev->state = TASK_READY;
     next->state = TASK_RUNNING;
     current_task = next;
 
@@ -123,6 +123,14 @@ struct task *scheduler_current(void) {
 void task_exited(void) {
     current_task->state = TASK_TERMINATED;
     serial_printf("scheduler: task pid=%d exited\n", current_task->pid);
+    /* This never returns, so the interrupt gate that got us here (a
+     * syscall, or the trampoline calling us after a task's entry point
+     * returned) never reaches its own `iret` -- which is normally what
+     * restores EFLAGS.IF. Without an explicit `sti`, this task's saved
+     * context (and switch_task never touches EFLAGS) permanently carries
+     * IF=0, so every time it's rescheduled it eventually `hlt`s with
+     * interrupts disabled and the whole system freezes for good. */
+    __asm__ volatile ("sti");
     for (;;) {
         schedule();
         __asm__ volatile ("hlt");

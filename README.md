@@ -36,14 +36,24 @@ you can keep building on.
   kernel. The GUI's "Process Monitor" window shows this live: task count,
   a live-incrementing counter from a background kernel task, and the
   actual string the ring-3 task sent via syscall.
+- **Networking**: PCI enumeration, an RTL8139 driver (IRQ-driven RX ring +
+  TX descriptors), and a real minimal stack — Ethernet, ARP (request/reply,
+  with a cache), IPv4 (with header checksums), and ICMP echo. A background
+  task resolves the gateway and pings it once a second; the GUI's
+  "Network" window shows the NIC's real MAC, our IP, the resolved gateway,
+  and live ping stats. Verified against a real packet capture (see "How
+  networking works" below) — the gateway's replies genuinely round-trip.
 - **Serial debug console** (COM1) for early boot logging — see it with
   `make run` or `-serial stdio`.
 
 ## What's stubbed / not yet built
 
-- **Networking**: no NIC driver, no TCP/IP stack yet.
 - **Audio**: no sound driver yet.
 - **Filesystem**: no on-disk filesystem or persistent storage driver (ATA/AHCI).
+- **Networking is Ethernet/ARP/IPv4/ICMP only**: no UDP or TCP yet, no DHCP
+  (the IP config is static, matching QEMU's default SLIRP network so
+  `make run` just works), and incoming packet checksums aren't validated
+  (outgoing ones are computed correctly).
 - **Real process isolation**: every task (kernel and ring-3) shares the
   same identity-mapped address space — there's no per-process page
   directory yet, so a user task *could* read/write kernel memory or
@@ -88,6 +98,45 @@ stack; the kernel stack is kept around too, since the CPU needs it (via
 the TSS's `esp0`) the moment that task takes an interrupt or syscall back
 into ring 0.
 
+## How networking works
+
+`drivers/pci.c` enumerates the PCI bus (legacy 0xCF8/0xCFC config-space
+access) to find the RTL8139 (vendor 0x10EC, device 0x8139 — what QEMU's
+`-device rtl8139` emulates). `drivers/rtl8139.c` resets it, gives it a
+receive ring buffer and four transmit descriptor slots, and hooks its PCI
+interrupt line. `net/` layers Ethernet → ARP → IPv4 → ICMP on top, each in
+its own file, dispatching by ethertype/protocol number. The IP config
+(`10.0.2.15`, gateway `10.0.2.2`) is static and matches QEMU SLIRP's
+defaults, so there's no DHCP client yet.
+
+Verifying this actually worked took a real packet capture (`tcpdump -r`
+on a `-object filter-dump` pcap), which is worth calling out because it
+caught two real concurrency bugs that pure code review missed — both are
+consequences of preemption happening on *every* PIT tick, unconditionally:
+
+1. **A frozen system, again.** `task_exited()` (used for both a normal
+   ring-3 `exit` syscall and a kernel task returning normally) loops
+   forever and never reaches an `iret`. But `switch_task` only saves/
+   restores four callee-saved registers — never `EFLAGS`. Every task that
+   was ever interrupted by a real hardware interrupt has `IF=1` baked into
+   its own saved trapframe, restored automatically when it eventually
+   `iret`s. A task stuck in `task_exited()`'s loop never does that, so it
+   permanently carries whatever `IF` happened to be when the interrupt
+   gate that got it there was entered — 0. The first time that zombie task
+   got rescheduled, it ran, hit its own `hlt` with interrupts disabled,
+   and froze the machine for good (a real timer tick that had already
+   fired stayed masked forever, since `hlt` with `IF=0` only wakes on an
+   NMI). Fixed with an explicit `sti` at the top of `task_exited()`.
+2. **Pings that should have worked, silently didn't.** A packet capture
+   showed the gateway replying correctly, with matching IDs and sequence
+   numbers, in well under a millisecond — faster than our own sender task
+   could get scheduled back in to finish updating its own bookkeeping.
+   `icmp_send_echo_request` recorded "reply we're expecting" *after*
+   calling `ip_send()`; the RX interrupt for the reply (handled
+   independently of whichever task is current) could get serviced first,
+   see `pending_outstanding` still 0, and silently drop a perfectly valid
+   reply. Fixed by setting that state *before* sending.
+
 ## Building and running
 
 Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
@@ -96,13 +145,16 @@ Requires: `gcc` (with 32-bit multilib support), `nasm`, `grub-mkrescue`,
 ```sh
 make          # compile the kernel (build/kernel.elf)
 make iso      # package it as zapos.iso via GRUB
-make run      # build the ISO and boot it in QEMU with serial output on stdio
+make run      # build the ISO and boot it in QEMU with a NIC + serial on stdio
 ```
 
-To run the ISO in VirtualBox/VMware/real hardware instead: just point the
-VM's CD/DVD drive at `zapos.iso`, boot mode = legacy BIOS (not UEFI/Secure
-Boot yet — that would need a `grub-mkrescue --efi` build and a different
-Multiboot path).
+`make run` attaches an RTL8139 NIC via QEMU's user-mode (SLIRP) networking
+(`-netdev user -device rtl8139`) so ping-the-gateway works out of the box.
+Booting `zapos.iso` some other way (VirtualBox/VMware/real hardware) works
+fine without a NIC too — the GUI's Network window just shows "no NIC
+detected" and everything else runs the same. Boot mode is legacy BIOS
+(not UEFI/Secure Boot yet — that would need a `grub-mkrescue --efi` build
+and a different Multiboot path).
 
 ## Architecture / directory layout
 
@@ -111,23 +163,24 @@ boot/            multiboot2 header + real assembly entry point
 kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  manager, kernel heap, multiboot info parser, serial console,
                  scheduler + context switch, TSS, ring-3 entry, syscalls
-drivers/         PS/2 controller, keyboard, mouse (ps2.c/keyboard.c/mouse.c)
+drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC
 gui/             framebuffer primitives, bitmap font, window compositor
-include/         public headers, mirroring kernel/ and drivers/ and gui/
+net/             Ethernet, ARP, IPv4, ICMP -- a minimal from-scratch TCP/IP stack
+include/         public headers, mirroring kernel/, drivers/, gui/, net/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
 Makefile         freestanding i386 build (gcc -m32 -ffreestanding -nostdlib)
 iso/grub.cfg     GRUB menu entry (multiboot2 /boot/kernel.elf)
 ```
 
 The whole 4 GiB address space is identity-mapped (no higher-half kernel,
-no per-process page directories yet), and there are currently three
+no per-process page directories yet), and there are currently up to four
 concurrently scheduled tasks: the boot/GUI task (ring 0), a background
-counter task (ring 0), and a demo task that runs at ring 3 and talks to
-the kernel only via `int 0x80` syscalls. The GUI's own event loop
-(`gui_run()`) is itself just one of these tasks — it polls the
-mouse/keyboard and redraws at roughly 60 fps via a PIT-timed sleep,
-same as before, but now it's preemptible rather than the only thing
-running.
+counter task (ring 0), a demo task that runs at ring 3 and talks to the
+kernel only via `int 0x80` syscalls, and (if a NIC is present) the ping
+task. The GUI's own event loop (`gui_run()`) is itself just one of these
+tasks — it polls the mouse/keyboard and redraws at roughly 60 fps via a
+PIT-timed sleep, same as before, but now it's preemptible rather than the
+only thing running.
 
 ## Third-party assets
 
@@ -145,8 +198,9 @@ ISO, which the kernel never reads back from.
 
 ## Roadmap: making this an "everyday OS"
 
-Preemptive multitasking, ring-3 user mode, and syscalls are now done (see
-above). Rough order of what's next, and concretely how:
+Preemptive multitasking, ring-3 user mode, syscalls, and basic networking
+(Ethernet/ARP/IPv4/ICMP, ping working) are now done (see above). Rough
+order of what's next, and concretely how:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -157,12 +211,10 @@ above). Rough order of what's next, and concretely how:
    you exchange files with a real OS by mounting the disk image). Combined
    with #1, this is what lets user programs be loaded from disk instead
    of compiled into the kernel image as demo tasks.
-3. **Networking** — PCI enumeration (a natural next addition to
-   `drivers/`) to find a NIC, a driver for a well-documented,
-   QEMU-friendly chip (RTL8139 or the Intel E1000 — both have public
-   datasheets and are the standard hobby-OS starting point), then a
-   minimal TCP/IP stack (ARP → IP → ICMP/UDP → TCP) — ping working is the
-   first real milestone, DHCP + a TCP client after that.
+3. **UDP + TCP + DHCP** — the Ethernet/ARP/IPv4/ICMP foundation is there;
+   UDP is a small addition (no connection state), TCP is the real work
+   (connection state machine, retransmission, windowing), and DHCP would
+   replace the current static IP config with a real handshake.
 4. **Audio** — an AC97 or Intel HDA driver (AC97 is simpler and what QEMU's
    `-device AC97` emulates), PCM playback via DMA buffers.
 5. **A real windowing API** — right now windows are hardcoded in
