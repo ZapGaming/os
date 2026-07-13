@@ -12,6 +12,7 @@ static uint8_t key_state[128];
 
 static int shift_held = 0;
 static int ctrl_held = 0;
+static int alt_held = 0;
 static int caps_lock = 0;
 
 static const char scancode_ascii[128] = {
@@ -87,6 +88,13 @@ static void keyboard_handler(struct registers *regs) {
     switch (sc) {
         case 0x2A: case 0x36: shift_held = !release; return; /* shift */
         case 0x1D: ctrl_held = !release; return;              /* ctrl */
+        /* Left Alt is 0x38 unprefixed; Right Alt arrives as E0 38, but
+         * the E0 lead byte is never special-cased anywhere in this
+         * handler (see the up/down-arrow scancodes below, which rely on
+         * the same thing) -- it just gets treated as a harmless
+         * make/break of scancode 0x60, and the real 0x38 that follows
+         * still lands here either way. */
+        case 0x38: alt_held = !release; return;               /* alt */
         case 0x3A: if (!release) caps_lock = !caps_lock; return; /* capslock */
         default: break;
     }
@@ -105,6 +113,10 @@ static void keyboard_handler(struct registers *regs) {
         else if (ctrl_held && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
         if (c) ring_push(c);
     }
+}
+
+int keyboard_alt_held(void) {
+    return alt_held;
 }
 
 void keyboard_init(void) {

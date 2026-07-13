@@ -47,6 +47,19 @@
  * truncate a chunk of the sheet (safely, just losing whatever rules
  * fell past the cut, not corrupting anything earlier). */
 #define BR_CSS_FETCH_CAP   (128u * 1024)
+/* No dynamic collections anywhere in this file -- tabs, history, and
+ * bookmarks are all fixed-size arrays, same as windows[]/fm_entries[]. */
+#define BR_MAX_TABS       6
+#define BR_MAX_HISTORY    20
+#define BR_MAX_BOOKMARKS  32
+#define BR_TAB_H          18
+#define BR_TAB_W          74
+#define BR_TAB_GAP        2
+#define BR_TAB_CLOSE_W    14
+#define BR_NAVBTN_W       18
+#define BR_NAVBTN_GAP     2
+#define BR_URL_ROW_H      20
+#define BR_BM_ROW_H       16
 
 typedef struct {
     int x, y, w, h;
@@ -123,27 +136,225 @@ static struct wav_info fm_wav;
 
 static void fm_refresh(void);
 
-/* Browser state -- a single instance, one page loaded at a time. Pages
- * are rendered with a real (if pragmatic) CSS box-model layout: fetch
- * -> dom_parse -> css_extract_style_blocks -> (run inline <script>s,
- * which may mutate the DOM before it's ever drawn) -> layout_run -> a
- * flat list of positioned, styled render items in br_layout, which is
- * what draw_browser() and the link/onclick click hit-tests actually
- * walk. Unlike the old reader-mode renderer, the DOM tree and
- * stylesheet are kept alive for as long as the page is loaded (not
- * freed right after the first layout) so a JS onclick handler can
- * mutate the tree and trigger a br_relayout() -- both are only torn
- * down right before the next page replaces them. */
-static char br_url[BR_MAX_URL] = "example.com/";
-static int br_url_len = 12;
+/* Browser state -- up to BR_MAX_TABS pages open at once (a fixed array,
+ * same convention as every other collection in this file, e.g.
+ * windows[]/fm_entries[] -- no dynamic growth anywhere in this kernel).
+ * Each tab owns its own DOM tree / stylesheet / layout / scroll /
+ * decoded-image cache / back-forward history, so switching the active
+ * tab is just repointing br_active_tab at a different slot -- nothing
+ * needs re-fetching or re-laying-out. Pages are rendered with a real
+ * (if pragmatic) CSS box-model layout: fetch -> dom_parse ->
+ * css_extract_style_blocks -> (run inline <script>s, which may mutate
+ * the DOM before it's ever drawn) -> layout_run -> a flat list of
+ * positioned, styled render items in the tab's `layout`, which is what
+ * draw_browser() and the link/onclick click hit-tests actually walk.
+ * Unlike the old reader-mode renderer, the DOM tree and stylesheet are
+ * kept alive for as long as the page is loaded (not freed right after
+ * the first layout) so a JS onclick handler can mutate the tree and
+ * trigger a br_relayout() -- both are only torn down right before the
+ * tab's next page (or the tab itself, on close) replaces them.
+ *
+ * Known limitation, not fixed here: the JS engine (js/dom_binding.c's
+ * onclick_table, js/value.c's arena) is a single global instance, not
+ * per-tab -- switching to a tab you haven't just (re)fetched, after
+ * fetching a *different* tab in between, can dispatch onclick handlers
+ * against a stale/wrong table until that tab is reloaded. Pre-existing
+ * single-page assumption in the JS subsystem; making it per-tab is out
+ * of scope for tab/history/bookmark plumbing. */
+struct br_image_slot {
+    const struct dom_node *node;
+    struct bmp_image img;
+};
+
+typedef struct {
+    char url[BR_MAX_URL];
+    int url_len;
+    int scroll;
+    char status_msg[64];
+    struct layout_doc layout;
+    int layout_alloced;
+    struct dom_node *dom_root;
+    struct css_stylesheet stylesheet;
+    int stylesheet_valid;
+    struct br_image_slot images[BR_MAX_IMAGES];
+    int image_count;
+    /* Standard back/forward stack: history[0..history_count) is every
+     * URL ever navigated to (in order), history_pos is which one is
+     * currently displayed. Going back then navigating somewhere new
+     * truncates everything past history_pos before appending -- see
+     * br_history_push(). history_pos == -1 means nothing has loaded
+     * yet (brand-new tab). */
+    char history[BR_MAX_HISTORY][BR_MAX_URL];
+    int history_count;
+    int history_pos;
+} br_tab_t;
+
+static br_tab_t br_tabs[BR_MAX_TABS];
+static int br_tab_count = 0;
+static int br_active_tab = 0;
 static int br_editing_url = 0;
-static int br_scroll = 0;
-static char br_status_msg[64] = "Type a URL and press Enter";
-static struct layout_doc br_layout;
+static int br_bookmarks_open = 0;
 static int br_window_idx = -1;
-static struct dom_node *br_dom_root = NULL;
-static struct css_stylesheet br_stylesheet;
-static int br_stylesheet_valid = 0;
+
+static br_tab_t *br_active(void) { return &br_tabs[br_active_tab]; }
+
+/* Bookmarks -- one URL per line in a root-level FAT32 file, loaded once
+ * (lazily, the first time the star button or the list-toggle button is
+ * drawn or clicked) and rewritten in full on every change; there are at
+ * most BR_MAX_BOOKMARKS of them, so a full rewrite is cheap enough not
+ * to need anything smarter (same "just overwrite the whole file" model
+ * fm_save_current_file uses for NOTES.TXT). */
+#define BR_BOOKMARKS_FILE "BOOKMARKS.TXT"
+static char br_bookmarks[BR_MAX_BOOKMARKS][BR_MAX_URL];
+static int br_bookmark_count = 0;
+static int br_bookmarks_loaded = 0;
+
+static void br_tab_free_resources(br_tab_t *t) {
+    if (t->dom_root) { dom_free(t->dom_root); t->dom_root = NULL; }
+    if (t->stylesheet_valid) { css_stylesheet_free(&t->stylesheet); t->stylesheet_valid = 0; }
+    for (int i = 0; i < t->image_count; i++) bmp_free(&t->images[i].img);
+    t->image_count = 0;
+    if (t->layout_alloced) { layout_doc_free(&t->layout); t->layout_alloced = 0; }
+}
+
+/* (Re)initializes a tab slot to a fresh, blank state -- the same
+ * starting URL/status the single-tab browser used to boot with.
+ * Assumes any previous occupant's resources were already freed via
+ * br_tab_free_resources() (both callers below do that first; a
+ * never-used slot has nothing to free). */
+static void br_tab_reset(br_tab_t *t) {
+    strcpy(t->url, "example.com/");
+    t->url_len = (int)strlen(t->url);
+    t->scroll = 0;
+    strcpy(t->status_msg, "Type a URL and press Enter");
+    t->dom_root = NULL;
+    t->stylesheet_valid = 0;
+    t->image_count = 0;
+    t->history_count = 0;
+    t->history_pos = -1;
+    layout_doc_alloc(&t->layout);
+    t->layout_alloced = 1;
+}
+
+/* Opens a new tab and makes it active -- a no-op past BR_MAX_TABS (the
+ * tab strip has no room to show more anyway). Wired to both the "+"
+ * button and Ctrl+T (see br_handle_key). */
+static void br_tab_open(void) {
+    if (br_tab_count >= BR_MAX_TABS) return;
+    br_tab_reset(&br_tabs[br_tab_count]);
+    br_active_tab = br_tab_count;
+    br_tab_count++;
+}
+
+/* Closes tab `idx`, shifting every later tab left to keep the array
+ * contiguous (no holes -- same convention as fm/window arrays). Closing
+ * the last remaining tab just resets it in place instead, since a
+ * browser with zero tabs open has nowhere to draw a tab strip at all. */
+static void br_tab_close(int idx) {
+    if (idx < 0 || idx >= br_tab_count) return;
+    br_tab_free_resources(&br_tabs[idx]);
+    if (br_tab_count == 1) {
+        br_tab_reset(&br_tabs[0]);
+        br_active_tab = 0;
+        return;
+    }
+    for (int i = idx; i < br_tab_count - 1; i++) br_tabs[i] = br_tabs[i + 1];
+    br_tab_count--;
+
+    /* The slot that just fell off the end still holds copies of
+     * pointers now owned by whatever tab got shifted into its old
+     * neighbor's place -- clear them (without freeing, that would be a
+     * double free) so the next br_tab_open() to reuse this slot
+     * kmalloc's fresh ones instead of leaking over these. */
+    br_tab_t *vacated = &br_tabs[br_tab_count];
+    vacated->dom_root = NULL;
+    vacated->stylesheet_valid = 0;
+    vacated->image_count = 0;
+    vacated->layout_alloced = 0;
+
+    if (br_active_tab >= br_tab_count) br_active_tab = br_tab_count - 1;
+    else if (br_active_tab > idx) br_active_tab--;
+}
+
+static void br_tab_switch(int idx) {
+    if (idx < 0 || idx >= br_tab_count) return;
+    br_active_tab = idx;
+    br_editing_url = 0;
+    br_bookmarks_open = 0;
+}
+
+static int br_bookmark_find(const char *url) {
+    for (int i = 0; i < br_bookmark_count; i++) if (strcmp(br_bookmarks[i], url) == 0) return i;
+    return -1;
+}
+
+/* Reads BOOKMARKS.TXT (one URL per line) out of the FAT32 root -- the
+ * same find-by-name-via-fat32_list_dir pattern the File Manager and
+ * shell use for every other named file, since there's no
+ * fat32_open_by_name. A missing file or no disk at all both just leave
+ * the bookmark list empty rather than erroring. */
+static void br_bookmarks_load(void) {
+    br_bookmarks_loaded = 1;
+    br_bookmark_count = 0;
+    if (!fat32_is_mounted()) return;
+
+    struct fat_dirent_info entries[FM_MAX_ENTRIES];
+    int count = fat32_list_dir(fat32_root_cluster(), entries, FM_MAX_ENTRIES);
+    for (int i = 0; i < count; i++) {
+        if (entries[i].is_dir || strcmp(entries[i].name, BR_BOOKMARKS_FILE) != 0) continue;
+
+        static char buf[BR_MAX_BOOKMARKS * BR_MAX_URL + 1];
+        uint32_t cap = entries[i].size < sizeof(buf) - 1 ? entries[i].size : sizeof(buf) - 1;
+        uint32_t got = fat32_read_file(entries[i].cluster, entries[i].size, buf, cap);
+        buf[got] = 0;
+
+        char *p = buf;
+        while (*p && br_bookmark_count < BR_MAX_BOOKMARKS) {
+            int j = 0;
+            while (*p && *p != '\n' && *p != '\r' && j < BR_MAX_URL - 1) br_bookmarks[br_bookmark_count][j++] = *p++;
+            br_bookmarks[br_bookmark_count][j] = 0;
+            if (j > 0) br_bookmark_count++;
+            while (*p == '\n' || *p == '\r') p++;
+        }
+        break;
+    }
+}
+
+static void br_bookmarks_save(void) {
+    if (!fat32_is_mounted()) return;
+    static char buf[BR_MAX_BOOKMARKS * BR_MAX_URL + 1];
+    int len = 0;
+    for (int i = 0; i < br_bookmark_count; i++) {
+        int l = (int)strlen(br_bookmarks[i]);
+        if (len + l + 1 >= (int)sizeof(buf)) break;
+        memcpy(buf + len, br_bookmarks[i], (size_t)l);
+        len += l;
+        buf[len++] = '\n';
+    }
+    fat32_write_file(fat32_root_cluster(), BR_BOOKMARKS_FILE, buf, (uint32_t)len);
+}
+
+static int br_bookmark_is_set(const char *url) {
+    if (!br_bookmarks_loaded) br_bookmarks_load();
+    return br_bookmark_find(url) >= 0;
+}
+
+/* Toggles `url` in the bookmark list and persists the whole list right
+ * away -- there's no separate "save" step, same as fm_save_current_file
+ * being the only way NOTES.TXT edits reach disk. */
+static void br_bookmark_toggle(const char *url) {
+    if (!br_bookmarks_loaded) br_bookmarks_load();
+    int idx = br_bookmark_find(url);
+    if (idx >= 0) {
+        for (int i = idx; i < br_bookmark_count - 1; i++) strcpy(br_bookmarks[i], br_bookmarks[i + 1]);
+        br_bookmark_count--;
+    } else if (br_bookmark_count < BR_MAX_BOOKMARKS) {
+        strncpy(br_bookmarks[br_bookmark_count], url, BR_MAX_URL - 1);
+        br_bookmarks[br_bookmark_count][BR_MAX_URL - 1] = 0;
+        br_bookmark_count++;
+    }
+    br_bookmarks_save();
+}
 
 /* Terminal state -- a single instance, same convention as every other
  * window here. `term_scrollback` is a bounded FIFO of everything ever
@@ -312,6 +523,18 @@ static void bring_to_front(int order_pos) {
     window_order[window_count - 1] = wi;
 }
 
+/* The window drawn topmost among currently-open windows, if any (-1 if
+ * none are open) -- used to gate keyboard shortcuts that should only
+ * fire for whichever window currently "has focus" (Ctrl+T/Ctrl+W/
+ * Alt+Left/Alt+Right in the Browser -- see br_handle_key() and
+ * gui_run()), the same notion of focus draw_frame() already uses to
+ * pick which titlebar gets the brighter gradient. */
+static int gui_frontmost_window(void) {
+    int top = -1;
+    for (int i = 0; i < window_count; i++) if (windows[window_order[i]].open) top = window_order[i];
+    return top;
+}
+
 /* Opens (if closed) and raises the window at windows[wi] -- used by the
  * taskbar launcher, which addresses windows by their fixed slot index
  * rather than by their current stacking position. */
@@ -365,7 +588,7 @@ void gui_init(void) {
         int br = add_window(SX(600), SY(60), 500, 500, "Browser", "WWW", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
         br_window_idx = br;
-        layout_doc_alloc(&br_layout);
+        br_tab_open();
     }
 
     if (fat32_is_mounted()) {
@@ -926,12 +1149,21 @@ static void br_parse_url(const char *url, char *host_out, int host_cap, uint16_t
     }
 }
 
+/* Chrome layout, top to bottom: tab strip, then the URL row (back/
+ * forward/star/bookmarks-list buttons + the URL field), then the status
+ * line, then the page content. These two return the top of the tab
+ * strip and the URL row respectively; every other piece of browser
+ * chrome (drawing, click hit-testing, content area) is defined relative
+ * to them so they can never disagree with each other. */
+static int br_tabstrip_y(const gui_window_t *w) { return w->y + TITLEBAR_H + 6; }
+static int br_urlrow_y(const gui_window_t *w) { return br_tabstrip_y(w) + BR_TAB_H + 4; }
+
 /* Content-area geometry shared by drawing, scrolling, and link hit-
  * testing, so they can never disagree with each other. */
 static void br_content_area(int *x, int *y, int *w, int *h) {
     const gui_window_t *win = &windows[br_window_idx];
     *x = win->x + 10;
-    *y = win->y + TITLEBAR_H + 8 + 46;
+    *y = br_urlrow_y(win) + 46;
     *w = win->w - 20;
     *h = win->y + win->h - *y - 8;
     if (*h < 0) *h = 0;
@@ -999,10 +1231,10 @@ static void br_join_path(const char *base_path, const char *href, char *out, int
 /* Resolves a sub-resource reference (a <link href> or <img src>, as
  * opposed to an <a href> the user actually navigates to) against the
  * page that referenced it, without touching the browser's own
- * navigation state (br_url/br_status_msg) -- a missing image shouldn't
- * clobber the address bar or status line. Returns 0 for schemes this
- * browser can't fetch (https:, data:, empty) rather than 1 with a
- * nonsense host/path. */
+ * navigation state (the active tab's url/status_msg) -- a missing
+ * image shouldn't clobber the address bar or status line. Returns 0
+ * for schemes this browser can't fetch (https:, data:, empty) rather
+ * than 1 with a nonsense host/path. */
 static int br_resolve_subresource(const char *base_host, uint16_t base_port, const char *base_path,
                                    const char *url, char *host_out, int host_cap,
                                    uint16_t *port_out, char *path_out, int path_cap) {
@@ -1019,45 +1251,48 @@ static int br_resolve_subresource(const char *base_host, uint16_t base_port, con
     return 1;
 }
 
-/* Decoded <img> cache for the currently displayed page -- keyed by the
+/* Decoded <img> cache for the active tab's page (struct br_image_slot
+ * and the per-tab `images`/`image_count` fields are declared with the
+ * rest of br_tab_t, up near the other browser state) -- keyed by the
  * DOM node so layout_get_image() (called from net/layout.c while laying
  * out that exact <img> element) can look its pixels back up. Filled by
  * br_load_subresources() right after the DOM parses and before the
  * first layout, since layout needs each image's natural size to
- * reserve space for it. Freed and reset on every navigation. */
-struct br_image_slot {
-    const struct dom_node *node;
-    struct bmp_image img;
-};
-static struct br_image_slot br_images[BR_MAX_IMAGES];
-static int br_image_count = 0;
-
+ * reserve space for it. Freed and reset by br_tab_free_resources() on
+ * navigation/close.
+ *
+ * layout_run() (and therefore layout_get_image()) is only ever called
+ * synchronously while working on whichever tab br_active() names at
+ * that moment (br_fetch_page/br_relayout both operate on br_active()),
+ * so reading br_active()'s own cache here is always the right one --
+ * this never runs "for" a tab that isn't currently active. */
 int layout_get_image(const struct dom_node *node, int *out_w, int *out_h, const uint32_t **out_pixels) {
-    for (int i = 0; i < br_image_count; i++) {
-        if (br_images[i].node == node) {
-            *out_w = br_images[i].img.width;
-            *out_h = br_images[i].img.height;
-            *out_pixels = br_images[i].img.pixels;
+    br_tab_t *t = br_active();
+    for (int i = 0; i < t->image_count; i++) {
+        if (t->images[i].node == node) {
+            *out_w = t->images[i].img.width;
+            *out_h = t->images[i].img.height;
+            *out_pixels = t->images[i].img.pixels;
             return 1;
         }
     }
     return 0;
 }
 
-static void br_images_reset(void) {
-    for (int i = 0; i < br_image_count; i++) bmp_free(&br_images[i].img);
-    br_image_count = 0;
+static void br_images_reset(br_tab_t *t) {
+    for (int i = 0; i < t->image_count; i++) bmp_free(&t->images[i].img);
+    t->image_count = 0;
 }
 
 /* Walks the DOM fetching every <link rel="stylesheet"> and <img> it
  * finds, one HTTP request at a time (this browser only ever has one TCP
  * connection open at once) -- external CSS is parsed straight into the
- * page's stylesheet, images are decoded into br_images[] for
+ * page's stylesheet, images are decoded into the tab's images[] for
  * layout_get_image() to find. Best-effort: a failed/unsupported
  * sub-resource is silently skipped rather than aborting the page, same
  * as a real browser would just show a broken-image icon and move on. */
-static void br_load_subresources(struct dom_node *node, const char *base_host, uint16_t base_port,
-                                  const char *base_path) {
+static void br_load_subresources(br_tab_t *t, struct dom_node *node, const char *base_host,
+                                  uint16_t base_port, const char *base_path) {
     for (struct dom_node *child = node->children; child; child = child->next) {
         if (child->type != DOM_ELEMENT) continue;
 
@@ -1070,12 +1305,12 @@ static void br_load_subresources(struct dom_node *node, const char *base_host, u
                     int status; uint32_t blen;
                     if (http_get(host, port, path, &status, buf, BR_CSS_FETCH_CAP, &blen, NULL, 0) &&
                         status >= 200 && status < 300) {
-                        css_parse_into(&br_stylesheet, buf, blen);
+                        css_parse_into(&t->stylesheet, buf, blen);
                     }
                     kfree(buf);
                 }
             }
-        } else if (strcmp(child->tag, "img") == 0 && child->href[0] && br_image_count < BR_MAX_IMAGES) {
+        } else if (strcmp(child->tag, "img") == 0 && child->href[0] && t->image_count < BR_MAX_IMAGES) {
             char host[64], path[64]; uint16_t port;
             if (br_resolve_subresource(base_host, base_port, base_path, child->href,
                                         host, sizeof(host), &port, path, sizeof(path))) {
@@ -1086,9 +1321,9 @@ static void br_load_subresources(struct dom_node *node, const char *base_host, u
                         status >= 200 && status < 300) {
                         struct bmp_image img;
                         if (bmp_decode((const uint8_t *)buf, blen, &img)) {
-                            br_images[br_image_count].node = child;
-                            br_images[br_image_count].img = img;
-                            br_image_count++;
+                            t->images[t->image_count].node = child;
+                            t->images[t->image_count].img = img;
+                            t->image_count++;
                         }
                     }
                     kfree(buf);
@@ -1096,8 +1331,26 @@ static void br_load_subresources(struct dom_node *node, const char *base_host, u
             }
         }
 
-        br_load_subresources(child, base_host, base_port, base_path);
+        br_load_subresources(t, child, base_host, base_port, base_path);
     }
+}
+
+/* Standard back/forward-stack push: appends `url` right after the
+ * current position, discarding anything that was ahead of it (the redo
+ * branch a previous br_go_back() left behind) -- exactly what "go back,
+ * then navigate somewhere new" is supposed to do. Drops the oldest
+ * entry to make room past BR_MAX_HISTORY rather than growing, same
+ * fixed-capacity convention as everything else in this file. */
+static void br_history_push(br_tab_t *t, const char *url) {
+    int new_pos = t->history_pos + 1;
+    if (new_pos >= BR_MAX_HISTORY) {
+        for (int i = 1; i < BR_MAX_HISTORY; i++) strcpy(t->history[i - 1], t->history[i]);
+        new_pos = BR_MAX_HISTORY - 1;
+    }
+    strncpy(t->history[new_pos], url, BR_MAX_URL - 1);
+    t->history[new_pos][BR_MAX_URL - 1] = 0;
+    t->history_pos = new_pos;
+    t->history_count = new_pos + 1;
 }
 
 /* Runs synchronously on the GUI's own task -- the screen won't redraw
@@ -1112,15 +1365,23 @@ static void br_load_subresources(struct dom_node *node, const char *base_host, u
  * being rendered, so it shows up in the File Manager afterward. There
  * is no decoding of any kind: a saved .mkv or .mp3 is just bytes on
  * disk, not something this OS can play (WAV is the only playable audio
- * format, via the File Manager -- see fm_play_audio()). */
-static void br_fetch(void) {
+ * format, via the File Manager -- see fm_play_audio()).
+ *
+ * `record_history` is 0 for br_go_back()/br_go_forward() (they're
+ * replaying a URL already in the tab's history, not creating a new
+ * entry) and 1 for every other navigation path (typing a URL, clicking
+ * a link, an onclick-driven navigation). There's no page cache of any
+ * kind, so going back/forward re-fetches over the network exactly like
+ * a fresh navigation -- a deliberate simplification given this browser
+ * has nowhere to cache a rendered page anyway. */
+static void br_fetch_page(br_tab_t *t, int record_history) {
     char host[64], path[64];
     uint16_t port;
-    br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
+    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path));
 
     char *body = (char *)kmalloc(BR_FETCH_CAP + 1);
     if (!body) {
-        strcpy(br_status_msg, "Out of memory");
+        strcpy(t->status_msg, "Out of memory");
         return;
     }
 
@@ -1130,9 +1391,9 @@ static void br_fetch(void) {
 
     if (!http_get(host, port, path, &status, body, BR_FETCH_CAP, &body_len,
                    content_type, sizeof(content_type))) {
-        strcpy(br_status_msg, "Failed to load (DNS/TCP error)");
-        br_layout.item_count = 0;
-        br_layout.link_count = 0;
+        strcpy(t->status_msg, "Failed to load (DNS/TCP error)");
+        t->layout.item_count = 0;
+        t->layout.link_count = 0;
         kfree(body);
         return;
     }
@@ -1148,24 +1409,24 @@ static void br_fetch(void) {
         /* Tear down the previous page's DOM/stylesheet/JS state before
          * building the new one -- all three only need to live as long
          * as the page that owns them is displayed. */
-        if (br_dom_root) { dom_free(br_dom_root); br_dom_root = NULL; }
-        if (br_stylesheet_valid) { css_stylesheet_free(&br_stylesheet); br_stylesheet_valid = 0; }
-        br_images_reset();
+        if (t->dom_root) { dom_free(t->dom_root); t->dom_root = NULL; }
+        if (t->stylesheet_valid) { css_stylesheet_free(&t->stylesheet); t->stylesheet_valid = 0; }
+        br_images_reset(t);
         js_arena_reset();
         js_dom_reset();
 
         char title[DOM_MAX_TITLE];
-        br_dom_root = dom_parse(body, body_len, title, sizeof(title));
+        t->dom_root = dom_parse(body, body_len, title, sizeof(title));
 
-        css_stylesheet_init(&br_stylesheet);
-        css_extract_style_blocks(&br_stylesheet, body, body_len);
-        br_stylesheet_valid = 1;
+        css_stylesheet_init(&t->stylesheet);
+        css_extract_style_blocks(&t->stylesheet, body, body_len);
+        t->stylesheet_valid = 1;
 
         /* External <link rel=stylesheet> and <img> both need their own
          * HTTP fetch, done here (before layout, after DOM/inline-CSS)
          * so the external rules are in the cascade and every image's
          * natural size is known by the time layout_run() needs it. */
-        br_load_subresources(br_dom_root, host, port, path);
+        br_load_subresources(t, t->dom_root, host, port, path);
 
         /* Custom-property (var()) resolution needs the FINAL stylesheet
          * -- including whatever external sheets br_load_subresources()
@@ -1173,27 +1434,33 @@ static void br_fetch(void) {
          * live in one of those rather than an inline <style> block --
          * so this runs after subresources load and before anything
          * else reads a computed style. */
-        css_resolve_custom_properties(&br_stylesheet);
+        css_resolve_custom_properties(&t->stylesheet);
 
         /* Scripts run before the first layout so DOM mutations they
          * make (innerHTML, textContent, style) show up immediately
          * rather than requiring a second pass. */
-        struct js_env *global_env = js_make_global_env(br_dom_root);
+        struct js_env *global_env = js_make_global_env(t->dom_root);
         js_run_inline_scripts(body, body_len, global_env);
         js_dom_clear_relayout_flag();
 
         int content_x, content_y, content_w, content_h;
         br_content_area(&content_x, &content_y, &content_w, &content_h);
-        layout_run(br_dom_root, &br_stylesheet, content_w, &br_layout);
-        strncpy(br_layout.title, title, DOM_MAX_TITLE - 1);
+        layout_run(t->dom_root, &t->stylesheet, content_w, &t->layout);
+        strncpy(t->layout.title, title, DOM_MAX_TITLE - 1);
 
         kfree(body);
-        br_scroll = 0;
+        t->scroll = 0;
 
         char numbuf[12];
         utoa((unsigned int)status, numbuf);
-        strcpy(br_status_msg, status >= 200 && status < 300 ? "OK " : "HTTP ");
-        strcat(br_status_msg, numbuf);
+        strcpy(t->status_msg, status >= 200 && status < 300 ? "OK " : "HTTP ");
+        strcat(t->status_msg, numbuf);
+
+        /* A page that loaded at all (even a 404/500 error page the
+         * server rendered as HTML) is still something back/forward
+         * should be able to return to -- only the DNS/TCP failure path
+         * above (no response at all) skips history. */
+        if (record_history) br_history_push(t, t->url);
         return;
     }
 
@@ -1201,68 +1468,99 @@ static void br_fetch(void) {
     br_derive_filename(path, fname, sizeof(fname));
 
     if (!fat32_is_mounted()) {
-        strcpy(br_status_msg, "Fetched, but no disk to save it to");
+        strcpy(t->status_msg, "Fetched, but no disk to save it to");
     } else if (fat32_write_file(fat32_root_cluster(), fname, body, body_len)) {
         char numbuf[16];
         utoa(body_len, numbuf);
-        strcpy(br_status_msg, "Downloaded ");
-        strcat(br_status_msg, fname);
-        strcat(br_status_msg, " (");
-        strcat(br_status_msg, numbuf);
-        strcat(br_status_msg, "B)");
+        strcpy(t->status_msg, "Downloaded ");
+        strcat(t->status_msg, fname);
+        strcat(t->status_msg, " (");
+        strcat(t->status_msg, numbuf);
+        strcat(t->status_msg, "B)");
         fm_refresh();
     } else {
-        strcpy(br_status_msg, "Download failed (disk full?)");
+        strcpy(t->status_msg, "Download failed (disk full?)");
     }
     kfree(body);
 }
 
+static void br_fetch(void) {
+    br_fetch_page(br_active(), 1);
+}
+
+/* Back/forward just rewind/replay the active tab's history stack and
+ * re-fetch -- see br_fetch_page()'s comment on why re-fetching (rather
+ * than caching) is what "going back" means in this browser. No-ops at
+ * the bounds (nothing before the oldest entry, nothing after the
+ * newest), same "disabled at the edges" behavior as the on-screen
+ * back/forward buttons (see draw_browser). */
+static void br_go_back(void) {
+    br_tab_t *t = br_active();
+    if (t->history_pos <= 0) return;
+    t->history_pos--;
+    strncpy(t->url, t->history[t->history_pos], BR_MAX_URL - 1);
+    t->url[BR_MAX_URL - 1] = 0;
+    t->url_len = (int)strlen(t->url);
+    br_fetch_page(t, 0);
+}
+
+static void br_go_forward(void) {
+    br_tab_t *t = br_active();
+    if (t->history_pos < 0 || t->history_pos >= t->history_count - 1) return;
+    t->history_pos++;
+    strncpy(t->url, t->history[t->history_pos], BR_MAX_URL - 1);
+    t->url[BR_MAX_URL - 1] = 0;
+    t->url_len = (int)strlen(t->url);
+    br_fetch_page(t, 0);
+}
+
 /* Resolves `href` (as found on an <a> in the just-loaded page) against
- * the current br_url, writes the resolved absolute "host[:port]/path"
- * into br_url, and returns 1 -- or returns 0 (no navigation) for
+ * `t`'s current url, writes the resolved absolute "host[:port]/path"
+ * back into it, and returns 1 -- or returns 0 (no navigation) for
  * fragment-only/mailto:/javascript: links and for https: links, which
  * this browser can't fetch (no TLS client). */
-static int br_resolve_href(const char *href) {
+static int br_resolve_href(br_tab_t *t, const char *href) {
     if (href[0] == '#' || href[0] == 0) return 0;
     if (strncmp(href, "mailto:", 7) == 0 || strncmp(href, "javascript:", 11) == 0) return 0;
     if (strncmp(href, "https://", 8) == 0) {
-        strcpy(br_status_msg, "HTTPS not supported (no TLS client)");
+        strcpy(t->status_msg, "HTTPS not supported (no TLS client)");
         return 0;
     }
 
     if (strncmp(href, "http://", 7) == 0) {
-        strncpy(br_url, href, BR_MAX_URL - 1);
-        br_url[BR_MAX_URL - 1] = 0;
-        br_url_len = (int)strlen(br_url);
+        strncpy(t->url, href, BR_MAX_URL - 1);
+        t->url[BR_MAX_URL - 1] = 0;
+        t->url_len = (int)strlen(t->url);
         return 1;
     }
 
     char host[64], path[64];
     uint16_t port;
-    br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
+    br_parse_url(t->url, host, sizeof(host), &port, path, sizeof(path));
 
     char new_path[64];
     br_join_path(path, href, new_path, sizeof(new_path));
 
     int n = 0;
     n += (int)strlen(host);
-    strncpy(br_url, host, BR_MAX_URL - 1);
+    strncpy(t->url, host, BR_MAX_URL - 1);
     if (port != 80 && n < BR_MAX_URL - 8) {
         char portbuf[8];
         utoa(port, portbuf);
-        br_url[n++] = ':';
+        t->url[n++] = ':';
         int pl = (int)strlen(portbuf);
-        if (n + pl < BR_MAX_URL) { memcpy(br_url + n, portbuf, (size_t)pl); n += pl; }
+        if (n + pl < BR_MAX_URL) { memcpy(t->url + n, portbuf, (size_t)pl); n += pl; }
     }
     int pl = (int)strlen(new_path);
-    if (n + pl < BR_MAX_URL) { memcpy(br_url + n, new_path, (size_t)pl); n += pl; }
-    br_url[n] = 0;
-    br_url_len = n;
+    if (n + pl < BR_MAX_URL) { memcpy(t->url + n, new_path, (size_t)pl); n += pl; }
+    t->url[n] = 0;
+    t->url_len = n;
     return 1;
 }
 
 static void br_navigate(const char *href) {
-    if (br_resolve_href(href)) br_fetch();
+    br_tab_t *t = br_active();
+    if (br_resolve_href(t, href)) br_fetch();
 }
 
 /* Re-runs layout against the (possibly JS-mutated) live DOM tree and
@@ -1270,31 +1568,143 @@ static void br_navigate(const char *href) {
  * textContent, or style. Does not touch scroll position or the DOM
  * tree/stylesheet themselves. */
 static void br_relayout(void) {
-    if (!br_dom_root || !br_stylesheet_valid) return;
+    br_tab_t *t = br_active();
+    if (!t->dom_root || !t->stylesheet_valid) return;
     int content_x, content_y, content_w, content_h;
     br_content_area(&content_x, &content_y, &content_w, &content_h);
-    layout_run(br_dom_root, &br_stylesheet, content_w, &br_layout);
+    layout_run(t->dom_root, &t->stylesheet, content_w, &t->layout);
+}
+
+/* Tab strip geometry -- tab `i`'s rect, and the "+" (new tab) button
+ * that follows the last one. The rightmost BR_TAB_CLOSE_W of each tab
+ * is its close-box hit area (see br_handle_click); drawing mirrors this
+ * exactly (see draw_browser_tabstrip) so the "x" glyph always lands
+ * inside its own hit box. */
+static void br_tab_rect(const gui_window_t *w, int i, int *x, int *y, int *tw, int *th) {
+    *x = w->x + 10 + i * (BR_TAB_W + BR_TAB_GAP);
+    *y = br_tabstrip_y(w);
+    *tw = BR_TAB_W;
+    *th = BR_TAB_H;
+}
+
+static void br_tab_plus_rect(const gui_window_t *w, int *x, int *y, int *tw, int *th) {
+    *x = w->x + 10 + br_tab_count * (BR_TAB_W + BR_TAB_GAP);
+    *y = br_tabstrip_y(w);
+    *tw = 20;
+    *th = BR_TAB_H;
+}
+
+/* Back/forward/star(bookmark)/bookmarks-list buttons, packed left of
+ * the URL field in that order (index 0..3) -- index 4 isn't a real
+ * button, but reusing this formula for "one slot past the last button"
+ * is exactly where the URL field's left edge belongs (see
+ * br_urlfield_rect), so there's only one place that ever has to agree
+ * on button width/gap. */
+static void br_navbtn_rect(const gui_window_t *w, int index, int *x, int *y, int *bw, int *bh) {
+    *x = w->x + 10 + index * (BR_NAVBTN_W + BR_NAVBTN_GAP);
+    *y = br_urlrow_y(w);
+    *bw = BR_NAVBTN_W;
+    *bh = BR_URL_ROW_H;
+}
+
+static void br_urlfield_rect(const gui_window_t *w, int *x, int *y, int *fw, int *fh) {
+    int bx, by, bw, bh;
+    br_navbtn_rect(w, 4, &bx, &by, &bw, &bh);
+    *x = bx;
+    *y = by;
+    *fw = (w->x + w->w - 10) - bx;
+    *fh = BR_URL_ROW_H;
+}
+
+/* Bookmarks dropdown, anchored under the bookmarks-list button (index
+ * 3) and floating on top of the page content -- it doesn't need its
+ * own scroll, BR_MAX_BOOKMARKS is small enough that `rows` just clips
+ * to however many actually fit in the window. */
+static void br_bookmarks_panel_rect(const gui_window_t *w, int *x, int *y, int *pw, int *ph, int *rows) {
+    int bx, by, bw, bh;
+    br_navbtn_rect(w, 3, &bx, &by, &bw, &bh);
+    *x = bx;
+    *y = by + bh + 2;
+    *pw = 220;
+    if (*x + *pw > w->x + w->w - 6) *pw = (w->x + w->w - 6) - *x;
+
+    int max_rows = (w->y + w->h - *y - 6) / BR_BM_ROW_H;
+    *rows = br_bookmark_count < max_rows ? br_bookmark_count : max_rows;
+    if (*rows < 1) *rows = 1;
+    *ph = *rows * BR_BM_ROW_H + 6;
+}
+
+/* Returns the clicked bookmark's index, -1 if the click landed inside
+ * the panel but not on a valid row (an empty list, or padding), or -2
+ * if it missed the panel entirely -- callers use -2 to tell "dismiss,
+ * the user clicked away" apart from "dismiss, they clicked a blank
+ * row", though both currently just close the panel without navigating. */
+static int br_bookmarks_hit_test(const gui_window_t *w, int mx, int my) {
+    int px, py, pw, ph, rows;
+    br_bookmarks_panel_rect(w, &px, &py, &pw, &ph, &rows);
+    if (mx < px || mx >= px + pw || my < py || my >= py + ph) return -2;
+    if (br_bookmark_count == 0) return -1;
+    int row = (my - py - 3) / BR_BM_ROW_H;
+    if (row < 0 || row >= rows) return -1;
+    return row;
 }
 
 static void br_handle_click(const gui_window_t *w, int mx, int my) {
-    int rel_y = my - (w->y + TITLEBAR_H + 8);
-    br_editing_url = (rel_y >= 0 && rel_y < 20);
-    if (br_editing_url) return;
+    if (br_bookmarks_open) {
+        int hit = br_bookmarks_hit_test(w, mx, my);
+        br_bookmarks_open = 0;
+        if (hit >= 0) br_navigate(br_bookmarks[hit]);
+        return;
+    }
 
+    int ts_y = br_tabstrip_y(w);
+    if (my >= ts_y && my < ts_y + BR_TAB_H) {
+        for (int i = 0; i < br_tab_count; i++) {
+            int tx, ty, tw_, th_;
+            br_tab_rect(w, i, &tx, &ty, &tw_, &th_);
+            if (mx < tx || mx >= tx + tw_) continue;
+            if (mx >= tx + tw_ - BR_TAB_CLOSE_W) br_tab_close(i);
+            else br_tab_switch(i);
+            return;
+        }
+        int px, py, pw_, ph_;
+        br_tab_plus_rect(w, &px, &py, &pw_, &ph_);
+        if (mx >= px && mx < px + pw_) br_tab_open();
+        return;
+    }
+
+    int url_y = br_urlrow_y(w);
+    if (my >= url_y && my < url_y + BR_URL_ROW_H) {
+        br_tab_t *t = br_active();
+        int bx, by, bw, bh;
+        br_navbtn_rect(w, 0, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw) { br_editing_url = 0; br_go_back(); return; }
+        br_navbtn_rect(w, 1, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw) { br_editing_url = 0; br_go_forward(); return; }
+        br_navbtn_rect(w, 2, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw) { br_editing_url = 0; br_bookmark_toggle(t->url); return; }
+        br_navbtn_rect(w, 3, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw) { br_editing_url = 0; br_bookmarks_open = 1; return; }
+        br_editing_url = 1;
+        return;
+    }
+    br_editing_url = 0;
+
+    br_tab_t *t = br_active();
     int content_x, content_y, content_w, content_h;
     br_content_area(&content_x, &content_y, &content_w, &content_h);
     if (mx < content_x || my < content_y) return;
 
     int doc_x = mx - content_x;
-    int doc_y = (my - content_y) + br_scroll;
+    int doc_y = (my - content_y) + t->scroll;
 
-    for (int i = 0; i < br_layout.item_count; i++) {
-        const struct layout_item *it = &br_layout.items[i];
+    for (int i = 0; i < t->layout.item_count; i++) {
+        const struct layout_item *it = &t->layout.items[i];
         if (it->type != LAYOUT_ITEM_TEXT && it->type != LAYOUT_ITEM_IMAGE) continue;
         if (doc_x < it->x || doc_x >= it->x + it->w || doc_y < it->y || doc_y >= it->y + it->h) continue;
 
         if (it->link_id >= 0) {
-            br_navigate(br_layout.links[it->link_id].href);
+            br_navigate(t->layout.links[it->link_id].href);
             return;
         }
         if (it->owner && js_dom_dispatch_click((struct dom_node *)it->owner)) {
@@ -1307,31 +1717,133 @@ static void br_handle_click(const gui_window_t *w, int mx, int my) {
     }
 }
 
+/* Ctrl+T/Ctrl+W arrive here as ordinary characters -- 0x14/0x17, the
+ * same Ctrl+letter -> C0 control code mapping drivers/keyboard.c uses
+ * for the text editor's Ctrl+S -- so they're handled up front,
+ * independent of br_editing_url, and gated on the Browser actually
+ * being the frontmost window (so typing Ctrl+T while the Terminal has
+ * focus doesn't reach into the Browser). Alt+Left/Alt+Right (back/
+ * forward) have no ASCII form at all -- see gui_run()'s own raw-
+ * scancode handling for those, right next to the up/down-arrow scroll
+ * keys this same window already responds to. */
 static void br_handle_key(char c) {
+    if (br_window_idx < 0) return;
+    if (c == 0x14 || c == 0x17) {
+        if (gui_frontmost_window() == br_window_idx) {
+            if (c == 0x14) br_tab_open();
+            else br_tab_close(br_active_tab);
+        }
+        return;
+    }
+
     if (!br_editing_url) return;
+    br_tab_t *t = br_active();
     if (c == '\n' || c == '\r') {
         br_fetch();
     } else if (c == '\b') {
-        if (br_url_len > 0) br_url_len--;
-    } else if (c >= 32 && c < 127 && br_url_len < BR_MAX_URL - 1) {
-        br_url[br_url_len++] = c;
+        if (t->url_len > 0) t->url_len--;
+    } else if (c >= 32 && c < 127 && t->url_len < BR_MAX_URL - 1) {
+        t->url[t->url_len++] = c;
     }
-    br_url[br_url_len] = 0;
+    t->url[t->url_len] = 0;
+}
+
+/* Tab labels are the page title if one loaded, else the raw URL --
+ * truncated hard (no ellipsis) to whatever fits left of the close box,
+ * the same "just cut it off" simplification the rest of this file uses
+ * for fixed-width text (see e.g. fm_derive... any of the FM listing
+ * lines). */
+static void br_tab_label(const br_tab_t *t, char *out, int cap) {
+    const char *src = t->layout.title[0] ? t->layout.title : t->url;
+    int i = 0;
+    while (src[i] && i < cap - 1) { out[i] = src[i]; i++; }
+    out[i] = 0;
+}
+
+static void draw_browser_tabstrip(const gui_window_t *w) {
+    for (int i = 0; i < br_tab_count; i++) {
+        int tx, ty, tw_, th_;
+        br_tab_rect(w, i, &tx, &ty, &tw_, &th_);
+        int active = (i == br_active_tab);
+        fb_fill_rect(tx, ty, tw_, th_, active ? 0x2A3360 : 0x161B38);
+        fb_draw_rect(tx, ty, tw_, th_, active ? 0x62D8FF : 0x3A4270);
+
+        char label[8];
+        br_tab_label(&br_tabs[i], label, sizeof(label));
+        fb_draw_string(tx + 3, ty + 5, label, active ? COL_TEXT : COL_MUTED, 1);
+
+        int cx = tx + tw_ - BR_TAB_CLOSE_W;
+        fb_draw_string(cx + 3, ty + 5, "x", 0xE05252, 1);
+    }
+
+    if (br_tab_count < BR_MAX_TABS) {
+        int px, py, pw_, ph_;
+        br_tab_plus_rect(w, &px, &py, &pw_, &ph_);
+        fb_fill_rect(px, py, pw_, ph_, 0x161B38);
+        fb_draw_rect(px, py, pw_, ph_, 0x3A4270);
+        fb_draw_string(px + 6, py + 5, "+", 0x8FE3A8, 1);
+    }
+}
+
+static void draw_browser_bookmarks_panel(const gui_window_t *w) {
+    int px, py, pw_, ph_, rows;
+    br_bookmarks_panel_rect(w, &px, &py, &pw_, &ph_, &rows);
+    fb_fill_rect(px, py, pw_, ph_, 0x10142C);
+    fb_draw_rect(px, py, pw_, ph_, 0x62D8FF);
+
+    if (br_bookmark_count == 0) {
+        fb_draw_string(px + 4, py + 4, "No bookmarks yet", COL_MUTED, 1);
+        return;
+    }
+    for (int i = 0; i < rows; i++) {
+        fb_draw_string(px + 4, py + 3 + i * BR_BM_ROW_H, br_bookmarks[i], COL_TEXT, 1);
+    }
 }
 
 static void draw_browser(const gui_window_t *w) {
+    br_tab_t *t = br_active();
     int x = w->x + 10;
-    int y = w->y + TITLEBAR_H + 8;
-    int inner_w = w->w - 20;
 
-    fb_fill_rect(x, y, inner_w, 20, 0x0D131C);
-    fb_draw_rect(x, y, inner_w, 20, br_editing_url ? 0x62D8FF : 0x3A4270);
-    fb_draw_string(x + 4, y + 6, br_url, COL_TEXT, 1);
+    draw_browser_tabstrip(w);
 
-    fb_draw_string(x, y + 26, br_status_msg, COL_MUTED, 1);
+    int url_y = br_urlrow_y(w);
+    int bx, by, bw, bh;
+
+    br_navbtn_rect(w, 0, &bx, &by, &bw, &bh);
+    int can_back = t->history_pos > 0;
+    fb_fill_rect(bx, by, bw, bh, 0x0D131C);
+    fb_draw_rect(bx, by, bw, bh, can_back ? 0x3A4270 : 0x20264A);
+    fb_draw_string(bx + 5, by + 6, "<", can_back ? COL_TEXT : COL_MUTED, 1);
+
+    br_navbtn_rect(w, 1, &bx, &by, &bw, &bh);
+    int can_fwd = t->history_pos >= 0 && t->history_pos < t->history_count - 1;
+    fb_fill_rect(bx, by, bw, bh, 0x0D131C);
+    fb_draw_rect(bx, by, bw, bh, can_fwd ? 0x3A4270 : 0x20264A);
+    fb_draw_string(bx + 5, by + 6, ">", can_fwd ? COL_TEXT : COL_MUTED, 1);
+
+    int bookmarked = br_bookmark_is_set(t->url);
+    br_navbtn_rect(w, 2, &bx, &by, &bw, &bh);
+    fb_fill_rect(bx, by, bw, bh, 0x0D131C);
+    fb_draw_rect(bx, by, bw, bh, bookmarked ? 0xF2C14E : 0x3A4270);
+    fb_draw_string(bx + 5, by + 6, "*", bookmarked ? 0xF2C14E : COL_MUTED, 1);
+
+    br_navbtn_rect(w, 3, &bx, &by, &bw, &bh);
+    fb_fill_rect(bx, by, bw, bh, 0x0D131C);
+    fb_draw_rect(bx, by, bw, bh, br_bookmarks_open ? 0x62D8FF : 0x3A4270);
+    fb_draw_string(bx + 5, by + 6, "v", COL_TEXT, 1);
+
+    int fx, fy, fw_, fh_;
+    br_urlfield_rect(w, &fx, &fy, &fw_, &fh_);
+    fb_fill_rect(fx, fy, fw_, fh_, 0x0D131C);
+    fb_draw_rect(fx, fy, fw_, fh_, br_editing_url ? 0x62D8FF : 0x3A4270);
+    fb_draw_string(fx + 4, fy + 6, t->url, COL_TEXT, 1);
+
+    fb_draw_string(x, url_y + 26, t->status_msg, COL_MUTED, 1);
+
+    if (br_bookmarks_open) draw_browser_bookmarks_panel(w);
 
     if (!net_is_up()) {
-        fb_draw_string(x, y + 44, "no NIC detected", 0xE05252, 1);
+        fb_draw_string(x, url_y + 44, "no NIC detected", 0xE05252, 1);
         return;
     }
 
@@ -1345,10 +1857,10 @@ static void draw_browser(const gui_window_t *w) {
      * body/html {background-color: ...}) paints over it. */
     fb_fill_rect(content_x, content_y, content_w, content_h, 0xF4F4F6);
 
-    int max_scroll = br_layout.content_height - content_h;
+    int max_scroll = t->layout.content_height - content_h;
     if (max_scroll < 0) max_scroll = 0;
-    if (br_scroll > max_scroll) br_scroll = max_scroll;
-    if (br_scroll < 0) br_scroll = 0;
+    if (t->scroll > max_scroll) t->scroll = max_scroll;
+    if (t->scroll < 0) t->scroll = 0;
 
     /* Four passes so backgrounds always sit under images/rules/text,
      * regardless of the order layout emitted them in. */
@@ -1356,13 +1868,13 @@ static void draw_browser(const gui_window_t *w) {
         enum layout_item_type want = pass == 0 ? LAYOUT_ITEM_RECT :
                                       pass == 1 ? LAYOUT_ITEM_IMAGE :
                                       pass == 2 ? LAYOUT_ITEM_HR : LAYOUT_ITEM_TEXT;
-        for (int i = 0; i < br_layout.item_count; i++) {
-            const struct layout_item *it = &br_layout.items[i];
+        for (int i = 0; i < t->layout.item_count; i++) {
+            const struct layout_item *it = &t->layout.items[i];
             if (it->type != want) continue;
-            if (it->y + it->h < br_scroll || it->y > br_scroll + content_h) continue;
+            if (it->y + it->h < t->scroll || it->y > t->scroll + content_h) continue;
 
             int sx = content_x + it->x;
-            int sy = content_y + (it->y - br_scroll);
+            int sy = content_y + (it->y - t->scroll);
             if (it->type == LAYOUT_ITEM_RECT) fb_fill_rect(sx, sy, it->w, it->h, it->color);
             else if (it->type == LAYOUT_ITEM_HR) fb_draw_line(sx, sy, sx + it->w, sy, it->color);
             else if (it->type == LAYOUT_ITEM_IMAGE) {
@@ -1612,12 +2124,27 @@ void gui_run(void) {
         if (scroll_cooldown > 0) {
             scroll_cooldown--;
         } else if (keyboard_key_pressed(0x48)) { /* up arrow */
-            br_scroll -= LAYOUT_LINE_H;
-            if (br_scroll < 0) br_scroll = 0;
+            br_active()->scroll -= LAYOUT_LINE_H;
+            if (br_active()->scroll < 0) br_active()->scroll = 0;
             scroll_cooldown = 4;
         } else if (keyboard_key_pressed(0x50)) { /* down arrow */
-            br_scroll += LAYOUT_LINE_H;
+            br_active()->scroll += LAYOUT_LINE_H;
             scroll_cooldown = 4;
+        }
+
+        /* Alt+Left/Alt+Right for back/forward -- mouse-driven testing
+         * (small on-screen back/forward buttons, PS/2 delta jitter) is
+         * fiddly enough in this environment that history needs a
+         * keyboard path independent of them. Only fires while the
+         * Browser is the frontmost window, same gate br_handle_key()
+         * uses for Ctrl+T/Ctrl+W. keyboard_alt_held() mirrors
+         * ctrl_held/shift_held in drivers/keyboard.c. */
+        static int nav_key_cooldown = 0;
+        if (nav_key_cooldown > 0) {
+            nav_key_cooldown--;
+        } else if (br_window_idx >= 0 && keyboard_alt_held() && gui_frontmost_window() == br_window_idx) {
+            if (keyboard_key_pressed(0x4B)) { br_go_back(); nav_key_cooldown = 10; }
+            else if (keyboard_key_pressed(0x4D)) { br_go_forward(); nav_key_cooldown = 10; }
         }
 
         draw_frame(mx, my);
