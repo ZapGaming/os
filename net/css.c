@@ -286,6 +286,104 @@ static uint32_t parse_color(const char *value, int *has_color_out) {
     return 0;
 }
 
+/* Splits `s` on top-level commas only (depth tracked through nested
+ * parens, so a color stop like "rgb(0, 0, 0)" doesn't get sliced in
+ * the middle) into up to `max_tokens` trimmed tokens. Used to pull the
+ * optional direction and however many color stops out of a
+ * linear-gradient()'s argument list without a real CSS value tokenizer. */
+static int split_top_level(const char *s, char tokens[][40], int max_tokens) {
+    int count = 0;
+    int depth = 0;
+    int start = 0;
+    char buf[200];
+    strncpy(buf, s, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    int len = (int)strlen(buf);
+    for (int i = 0; i <= len && count < max_tokens; i++) {
+        char c = buf[i];
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        if ((c == ',' && depth == 0) || c == 0) {
+            int tl = i - start;
+            if (tl > 39) tl = 39;
+            if (tl < 0) tl = 0;
+            memcpy(tokens[count], buf + start, (size_t)tl);
+            tokens[count][tl] = 0;
+            trim(tokens[count]);
+            count++;
+            start = i + 1;
+        }
+    }
+    return count;
+}
+
+/* Cuts a trailing " <percentage-or-length>" position off a gradient
+ * color-stop token (e.g. "red 20%" -> "red", "#fff 0%" -> "#fff") --
+ * but not off an rgb()/rgba() stop, whose own internal spaces (after
+ * each comma) never start at index 0, so nothing there gets cut. */
+static void strip_trailing_position(char *s) {
+    if (strncmp(s, "rgb", 3) == 0) return;
+    char *sp = strchr(s, ' ');
+    if (sp) *sp = 0;
+}
+
+/* Parses a `linear-gradient(...)` function's argument list: an
+ * optional leading direction (`to <side>...` or `Ndeg`) followed by
+ * two or more comma-separated color stops. Only the first and last
+ * stop, and a horizontal-vs-vertical axis for the direction (any
+ * diagonal angle rounds to whichever it's closer to), survive -- see
+ * struct css_computed's comment for why. Returns 0 if `value` isn't a
+ * linear-gradient() at all, or neither color stop parses. */
+static int parse_linear_gradient(const char *value, uint32_t *c1, uint32_t *c2, int *horizontal) {
+    char *start = find_substr((char *)value, "linear-gradient(");
+    if (!start) return 0;
+    char *open = start + 16; /* "linear-gradient(" is 16 chars, already past the '(' */
+
+    char *close = open;
+    int depth = 1;
+    while (*close && depth > 0) {
+        if (*close == '(') depth++;
+        else if (*close == ')') { depth--; if (depth == 0) break; }
+        close++;
+    }
+
+    char inner[200];
+    int ilen = (int)(close - open);
+    if (ilen > (int)sizeof(inner) - 1) ilen = (int)sizeof(inner) - 1;
+    if (ilen < 0) ilen = 0;
+    memcpy(inner, open, (size_t)ilen);
+    inner[ilen] = 0;
+
+    char tokens[8][40];
+    int n = split_top_level(inner, tokens, 8);
+    if (n < 2) return 0;
+
+    int has_direction = (strncmp(tokens[0], "to ", 3) == 0) || find_substr(tokens[0], "deg") != NULL;
+    int color_start = has_direction ? 1 : 0;
+    *horizontal = 0;
+    if (has_direction) {
+        if (find_substr(tokens[0], "right") || find_substr(tokens[0], "left")) *horizontal = 1;
+        char *deg = find_substr(tokens[0], "deg");
+        if (deg) {
+            int neg = 0, val = 0;
+            char *q = tokens[0];
+            if (*q == '-') { neg = 1; q++; }
+            while (*q >= '0' && *q <= '9') { val = val * 10 + (*q - '0'); q++; }
+            if (neg) val = -val;
+            int mod = ((val % 360) + 360) % 360;
+            if ((mod > 45 && mod < 135) || (mod > 225 && mod < 315)) *horizontal = 1;
+        }
+    }
+    if (n - color_start < 1) return 0;
+
+    strip_trailing_position(tokens[color_start]);
+    strip_trailing_position(tokens[n - 1]);
+    int has1, has2;
+    *c1 = parse_color(tokens[color_start], &has1);
+    *c2 = parse_color(tokens[n - 1], &has2);
+    return has1 && has2;
+}
+
 static int parse_px(const char *value) {
     int neg = 0;
     const char *p = value;
@@ -430,9 +528,32 @@ static void apply_decl(struct css_computed *out, const char *prop, const char *r
         int has; uint32_t c = parse_color(value, &has);
         if (has) out->color = c;
     } else if (strcmp(prop, "background-color") == 0 || strcmp(prop, "background") == 0) {
-        int has; uint32_t c = parse_color(value, &has);
-        out->has_background = has;
-        if (has) out->background_color = c;
+        uint32_t g1, g2; int horiz;
+        if (find_substr(value, "linear-gradient(") && parse_linear_gradient(value, &g1, &g2, &horiz)) {
+            out->has_background = 1;
+            out->background_color = g1;
+            out->has_gradient = 1;
+            out->gradient_color2 = g2;
+            out->gradient_horizontal = horiz;
+        } else {
+            int has; uint32_t c = parse_color(value, &has);
+            out->has_background = has;
+            if (has) out->background_color = c;
+            out->has_gradient = 0;
+        }
+    } else if (strcmp(prop, "border-radius") == 0) {
+        /* Tailwind's "rounded-full" utility (real-world usage for a
+         * pill-shaped button/badge, exactly the common case this is
+         * worth handling) emits scientific notation --
+         * "border-radius:3.40282e38px", float's max value, to
+         * guarantee a full capsule regardless of element size --
+         * which parse_px() can't read (it stops at the first non-
+         * digit, so this would otherwise silently parse as just "3").
+         * fb_fill_rounded_rect() already clamps to min(w,h)/2, so any
+         * suitably large sentinel here produces the same true capsule
+         * shape a real browser would draw. */
+        if (strchr(value, 'e') || strchr(value, 'E')) out->border_radius = 999999;
+        else out->border_radius = parse_px(value);
     } else if (strcmp(prop, "font-weight") == 0) {
         out->bold = (strcmp(value, "bold") == 0 || strcmp(value, "bolder") == 0 || parse_px(value) >= 700);
     } else if (strcmp(prop, "display") == 0) {

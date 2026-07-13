@@ -32,6 +32,13 @@ struct layout_item {
     int link_id;                /* index into doc->links, -1 if none */
     const struct dom_node *owner; /* nearest enclosing element, for JS onclick dispatch; NULL if none */
     const uint32_t *pixels;     /* LAYOUT_ITEM_IMAGE only; w*h, top-to-bottom, 0xRRGGBB */
+    /* LAYOUT_ITEM_RECT only, from a linear-gradient()/border-radius
+     * background (see struct css_computed) -- color above is the
+     * gradient's first stop. */
+    int has_gradient;
+    uint32_t color2;
+    int gradient_horizontal;
+    int radius;
 };
 
 /* Implemented by the GUI/browser layer (gui/compositor.c), which is the

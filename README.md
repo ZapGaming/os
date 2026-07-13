@@ -276,14 +276,28 @@ you can keep building on.
   `display: flex` (row direction only gets its own layout -- see "How
   the browser works" for exactly how simplified each is: one active
   float per side, no side-by-side packing, no `clear`; no `flex-wrap`,
-  no real grow/shrink weighting, no `align-items`), and a single
+  no real grow/shrink weighting, no `align-items`), a single
   document-wide `var(--name)` table (populated from `*`/`:root`/`:host`/
   `html`/`body` rules, not real per-element cascading custom
-  properties) now exist, but there's still no `inline-block`, no CSS
-  `grid`, no centering or automatic horizontal margins, no tables, no
-  descendant/child selectors (only bare tag, `.class`, `#id`, and
-  `tag.class` -- which, incidentally, is a reasonable fit for
-  Tailwind-style atomic utility classes even without descendant
+  properties), a two-stop `linear-gradient()` background (direction
+  rounds to the nearer of horizontal/vertical; middle color stops are
+  ignored -- see "How the browser works"), and `border-radius`
+  (including Tailwind's `rounded-full`, whose scientific-notation
+  value `parse_px()` can't read on its own, special-cased to a large
+  sentinel that still clamps to a true capsule) now exist, but there's
+  still no `radial-gradient()` or multi-layer backgrounds (several
+  comma-separated `background-image` values painted on top of each
+  other -- real sites commonly stack 2-3), no *per-element* custom
+  properties (only the single global table above, so a gradient whose
+  colors come from a utility class's own `--tw-gradient-from`/`-to`
+  rather than a root-level variable resolves to nothing -- this is
+  exactly why a real Tailwind gradient hero section, as opposed to a
+  hand-written one, still won't show its background -- see "What
+  actually happens on a real modern page" below), no `inline-block`,
+  no CSS `grid`, no centering or automatic horizontal margins, no
+  tables, no descendant/child selectors (only bare tag, `.class`,
+  `#id`, and `tag.class` -- which, incidentally, is a reasonable fit
+  for Tailwind-style atomic utility classes even without descendant
   selectors), no percentage widths, no `<style>` media queries, and no
   `@font-face`/web fonts of any kind (every glyph is the one embedded
   8x8 bitmap font, regardless of what a page's CSS asks for). Images
@@ -998,6 +1012,28 @@ never been exercised by a transfer bigger than a small HTML page:
    Fixed defensively, the same way as the ATA bug: explicitly unmask
    every IRQ line the kernel actually drives right after initializing
    its driver, instead of trusting an inherited default.
+10. **`linear-gradient()` backgrounds silently never rendered at all,**
+    even on a hand-written test page with a plain, spec-simple gradient
+    value -- caught only because a host-side unit test of the same
+    parsing logic (see "How HTTPS/TLS works" above for why that's the
+    standing practice for any new parser in this codebase) passed
+    while the real in-kernel code didn't, on byte-identical input.
+    `parse_linear_gradient()`'s very first step, skipping past
+    `linear-gradient(`'s literal `(`, had an off-by-one: it advanced a
+    pointer 16 bytes (correctly landing just past the `(`, since
+    `"linear-gradient("` is 16 characters including it), then checked
+    `*open != '('` and advanced *again* -- a leftover from an earlier
+    draft that used a 15-byte skip-then-check-then-advance, never
+    updated when the offset changed to skip the whole literal in one
+    step. Every real gradient value hit that stray check against
+    whatever byte actually followed the `(` (never `(` itself) and
+    bailed out, so `has_background` never even got set -- a plain
+    `background: red` on the same element would have worked fine,
+    which is what made this easy to miss by inspection alone. Fixed by
+    removing the redundant check/advance; border-radius (which shares
+    no code with the gradient path) was unaffected throughout and
+    rendered correctly the whole time, including Tailwind's
+    scientific-notation `rounded-full`.
 
 **What actually happens on a real modern (React/Next.js) page.** Tested
 against `failure.fail`, a real Next.js/Tailwind site with client-side
@@ -1015,9 +1051,26 @@ bitmap font), and its canvas-drawn animated background and any content
 that only exists because client-side JS/React rendered it after the
 initial HTML never appears (this browser only runs a page's *inline*
 `<script>` tags -- see "How the JS engine works" below -- and has
-nothing resembling a React runtime). The honest summary: this is enough
-real CSS to make a modern site's actual *content* legible, not enough to
-make it look right.
+nothing resembling a React runtime). Its hero section's colored
+background specifically doesn't render either, even now that
+`linear-gradient()` and `border-radius` both genuinely work (verified
+against a hand-written test page -- see the bug list above): the
+`background` shorthand there is Tailwind's `linear-gradient(var(
+--tw-gradient-stops))`, where the actual colors come from *other*
+utility classes on the same element (`--tw-gradient-from`/`-to`, not a
+root-level variable), which this browser's single document-wide
+custom-property table was never built to resolve; separately, `<body>`
+itself uses `radial-gradient()` plus a repeating grid pattern plus an
+SVG noise texture, layered together via CSS's multi-background-image
+comma syntax -- three more things this engine doesn't parse at all.
+Each is individually a real, boundable feature (unlike custom fonts or
+a canvas/React runtime); together, matching one specific site's exact
+recipe for its hero background wasn't judged worth chasing further
+this pass. The honest summary: this is enough real CSS to make a
+modern site's actual *content* legible and to render a genuinely
+common case (a plain, literal-color gradient or rounded corner) --
+just not enough to reproduce everything one particular Tailwind-heavy
+design does with its background layers.
 
 ## How HTTPS/TLS works
 

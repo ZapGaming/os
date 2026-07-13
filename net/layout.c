@@ -55,6 +55,10 @@ static void add_item(struct layout_ctx *ctx, enum layout_item_type type, int x, 
     it->link_id = link_id;
     it->owner = owner;
     it->pixels = NULL;
+    it->has_gradient = 0;
+    it->color2 = 0;
+    it->gradient_horizontal = 0;
+    it->radius = 0;
     if (text) { strncpy(it->text, text, LAYOUT_TEXT_LEN - 1); it->text[LAYOUT_TEXT_LEN - 1] = 0; }
     else it->text[0] = 0;
 }
@@ -195,7 +199,14 @@ static int layout_flex_row(struct layout_ctx *ctx, const struct dom_node *parent
         if (cs.has_background) {
             int before = ctx->doc->item_count;
             add_item(ctx, LAYOUT_ITEM_RECT, cx, block_top, child_w, 0, cs.background_color, NULL, -1, c);
-            if (ctx->doc->item_count > before) rect_idx = before;
+            if (ctx->doc->item_count > before) {
+                rect_idx = before;
+                struct layout_item *bg = &ctx->doc->items[rect_idx];
+                bg->has_gradient = cs.has_gradient;
+                bg->color2 = cs.gradient_color2;
+                bg->gradient_horizontal = cs.gradient_horizontal;
+                bg->radius = cs.border_radius;
+            }
         }
 
         int inner_x = cx + cs.padding_left;
@@ -319,7 +330,14 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
             if (style.has_background) {
                 int before_count = ctx->doc->item_count;
                 add_item(ctx, LAYOUT_ITEM_RECT, fx, block_top, float_w, 0, style.background_color, NULL, -1, child);
-                if (ctx->doc->item_count > before_count) rect_idx = before_count;
+                if (ctx->doc->item_count > before_count) {
+                    rect_idx = before_count;
+                    struct layout_item *bg = &ctx->doc->items[rect_idx];
+                    bg->has_gradient = style.has_gradient;
+                    bg->color2 = style.gradient_color2;
+                    bg->gradient_horizontal = style.gradient_horizontal;
+                    bg->radius = style.border_radius;
+                }
             }
 
             int fchild_x = fx + style.padding_left;
@@ -365,7 +383,14 @@ static int layout_children(struct layout_ctx *ctx, const struct dom_node *parent
         if (style.has_background) {
             int before_count = ctx->doc->item_count;
             add_item(ctx, LAYOUT_ITEM_RECT, eff_x, block_top, box_width, 0, style.background_color, NULL, -1, child);
-            if (ctx->doc->item_count > before_count) rect_idx = before_count;
+            if (ctx->doc->item_count > before_count) {
+                rect_idx = before_count;
+                struct layout_item *bg = &ctx->doc->items[rect_idx];
+                bg->has_gradient = style.has_gradient;
+                bg->color2 = style.gradient_color2;
+                bg->gradient_horizontal = style.gradient_horizontal;
+                bg->radius = style.border_radius;
+            }
         }
 
         int child_x = eff_x + style.padding_left;

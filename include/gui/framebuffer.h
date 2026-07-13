@@ -27,8 +27,12 @@ void fb_draw_rect(int x, int y, int w, int h, uint32_t color);
 void fb_draw_line(int x0, int y0, int x1, int y1, uint32_t color);
 void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t color);
 
-/* Vertical linear gradient from `top` to `bottom` over the rect. */
+/* Vertical/horizontal linear gradient over the rect. */
 void fb_fill_gradient_v(int x, int y, int w, int h, uint32_t top, uint32_t bottom);
+void fb_fill_gradient_h(int x, int y, int w, int h, uint32_t left, uint32_t right);
+
+/* Filled rect with uniformly rounded corners (CSS border-radius). */
+void fb_fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color);
 
 void fb_draw_char(int x, int y, char c, uint32_t fg, int scale);
 void fb_draw_string(int x, int y, const char *s, uint32_t fg, int scale);

@@ -1978,7 +1978,21 @@ static void draw_browser(const gui_window_t *w) {
 
             int sx = content_x + it->x;
             int sy = content_y + (it->y - t->scroll);
-            if (it->type == LAYOUT_ITEM_RECT) fb_fill_rect(sx, sy, it->w, it->h, it->color);
+            if (it->type == LAYOUT_ITEM_RECT) {
+                if (it->has_gradient && it->radius <= 0) {
+                    if (it->gradient_horizontal) fb_fill_gradient_h(sx, sy, it->w, it->h, it->color, it->color2);
+                    else fb_fill_gradient_v(sx, sy, it->w, it->h, it->color, it->color2);
+                } else if (it->radius > 0) {
+                    /* A gradient AND rounded corners together would need
+                     * a rounded-rect gradient fill this codebase doesn't
+                     * have -- radius wins (matches this browser's
+                     * existing "approximate, don't crash" tolerance for
+                     * combinations it can't render exactly). */
+                    fb_fill_rounded_rect(sx, sy, it->w, it->h, it->radius, it->color);
+                } else {
+                    fb_fill_rect(sx, sy, it->w, it->h, it->color);
+                }
+            }
             else if (it->type == LAYOUT_ITEM_HR) fb_draw_line(sx, sy, sx + it->w, sy, it->color);
             else if (it->type == LAYOUT_ITEM_IMAGE) {
                 if (it->pixels) {

@@ -140,6 +140,50 @@ void fb_fill_gradient_v(int x, int y, int w, int h, uint32_t top, uint32_t botto
     }
 }
 
+void fb_fill_gradient_h(int x, int y, int w, int h, uint32_t left, uint32_t right) {
+    int lr = (left >> 16) & 0xFF, lg = (left >> 8) & 0xFF, lb = left & 0xFF;
+    int rr = (right >> 16) & 0xFF, rg = (right >> 8) & 0xFF, rb = right & 0xFF;
+
+    for (int i = 0; i < w; i++) {
+        int r = lr + (rr - lr) * i / (w > 1 ? w - 1 : 1);
+        int g = lg + (rg - lg) * i / (w > 1 ? w - 1 : 1);
+        int b = lb + (rb - lb) * i / (w > 1 ? w - 1 : 1);
+        uint32_t color = RGB(r, g, b);
+        for (int j = 0; j < h; j++) {
+            fb_put_pixel(x + i, y + j, color);
+        }
+    }
+}
+
+/* Filled rectangle with uniformly rounded corners -- row by row, inset
+ * from the left/right edges near the top and bottom rows by however
+ * far the circle of radius `radius` centered on that corner has
+ * curved in by that row (integer approximation of sqrt, no float math
+ * anywhere in this kernel). Clamps `radius` to at most half of
+ * whichever of w/h is smaller, same as real CSS border-radius. */
+void fb_fill_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color) {
+    if (radius <= 0 || w <= 0 || h <= 0) { fb_fill_rect(x, y, w, h, color); return; }
+    int max_r = (w < h ? w : h) / 2;
+    if (radius > max_r) radius = max_r;
+
+    for (int j = 0; j < h; j++) {
+        int inset = 0;
+        int dy = -1;
+        if (j < radius) dy = radius - 1 - j;
+        else if (j >= h - radius) dy = j - (h - radius);
+        if (dy >= 0) {
+            /* Largest dx with dx^2 + dy^2 <= radius^2 -- an integer
+             * sqrt via linear search down from the top, always at
+             * most `radius` iterations (a handful of pixels for
+             * anything this browser renders). */
+            int dx = radius;
+            while (dx > 0 && dx * dx + dy * dy > radius * radius) dx--;
+            inset = radius - dx;
+        }
+        fb_fill_rect(x + inset, y + j, w - 2 * inset, 1, color);
+    }
+}
+
 void fb_draw_char(int x, int y, char c, uint32_t fg, int scale) {
     if ((unsigned char)c >= 128) return;
     if (scale < 1) scale = 1;

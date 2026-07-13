@@ -64,6 +64,14 @@ struct css_computed {
     uint32_t color;
     uint32_t background_color;
     int has_background;
+    /* A linear-gradient() background -- only its first/last color stop
+     * and a horizontal-vs-vertical axis (any angle rounds to whichever
+     * of those two it's closer to) survive; middle stops and the exact
+     * angle don't. background_color above holds the first stop. */
+    int has_gradient;
+    uint32_t gradient_color2;
+    int gradient_horizontal;
+    int border_radius;   /* pixels; one uniform radius, not four corners */
     int bold;
     enum css_display display;
     enum css_float cssfloat;
