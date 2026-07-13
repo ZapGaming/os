@@ -47,15 +47,22 @@ you can keep building on.
   our IP, the resolved gateway, and live ping stats. Verified against a
   real packet capture (see "How networking works" below) — the gateway's
   replies genuinely round-trip.
-- **A real (if minimal) web browser**: an HTTP/1.1 client on top of TCP
-  (handles both `Content-Length` and chunked transfer-encoding), and a
-  "reader mode" HTML interpreter — no CSS, no layout boxes, but it walks
-  real tag soup and produces styled, wrapped text (headings, bold, links,
-  lists, entity decoding, `<script>`/`<style>` skipping). The GUI's
-  "Browser" window has a real address bar you type a URL into; press
-  Enter and it resolves DNS, opens a TCP connection, fetches the page,
-  and renders it. Verified end-to-end against a real, live website (see
-  "How the browser works" below).
+- **A real web browser with a CSS box-model layout engine**: an HTTP/1.1
+  client on top of TCP (handles both `Content-Length` and chunked
+  transfer-encoding), a real DOM tree parser (`net/dom.c`), a CSS parser
+  and cascade (`net/css.c`, a UA default stylesheet plus a page's own
+  `<style>` blocks and inline `style=""`, with real property
+  inheritance), and a layout engine (`net/layout.c`) that walks the DOM
+  with resolved styles into block/inline boxes — real vertical margins
+  and padding, block-level background colors, `<hr>` rules, list-item
+  bullets, and per-word wrapped, individually-colored text runs. Links
+  are genuinely clickable: clicking one resolves the href (relative,
+  absolute-path, or absolute-URL) against the current page and
+  navigates. The GUI's "Browser" window has a real address bar (with
+  optional `host:port`); press Enter and it resolves DNS, opens a TCP
+  connection, fetches the page, and lays it out. Verified end-to-end
+  against both a real, live website and a local multi-page CSS test
+  site (see "How the browser works" below).
 - **Filesystem**: an ATA PIO disk driver and a real FAT32 driver (BPB
   parsing, FAT-chain walking, directory listing, file read *and* write)
   on a separate 64MB disk image. The GUI's "File Manager" window browses
@@ -69,12 +76,15 @@ you can keep building on.
 ## What's stubbed / not yet built
 
 - **Audio**: no sound driver yet.
-- **The browser has no CSS layout**: it's reader-mode only — a flat,
-  top-to-bottom list of styled text lines, no boxes/floats/tables/images.
-  Links are drawn styled but aren't clickable (no navigation on click
-  yet), there's no HTTPS (plain HTTP only — no TLS), the fetch is
-  synchronous and blocks GUI redraws while it runs, and only one TCP
-  connection can be open at a time.
+- **The browser's CSS support is a pragmatic subset, not real CSS**: no
+  horizontal box model (no width/height/floats/inline-block, no
+  centering or horizontal margins — only vertical stacking with a fixed
+  left indent), no tables/images, no descendant/child selectors (only
+  bare tag, `.class`, `#id`, and `tag.class`), no `<style>` media
+  queries. There's no HTTPS (plain HTTP only — no TLS, so `https://`
+  links are refused rather than fetched), the fetch is synchronous and
+  blocks GUI redraws while it runs, and only one TCP connection can be
+  open at a time (no fetching a page and its images concurrently).
 - **Filesystem writes are constrained**: `fat32_write_file` can only
   overwrite a file that already exists in a directory (it doesn't create
   new directory entries or grow a directory) — the shipped disk image
@@ -178,17 +188,41 @@ machine (`SYN_SENT` → `ESTABLISHED` → `FIN_WAIT1/2` → `LAST_ACK`) with
 stop-and-wait retransmission — send a segment, wait for its ACK before
 sending the next one, no windowing or congestion control. `net/http.c`
 drives that to do an HTTP/1.1 GET, and understands both `Content-Length`
-and chunked transfer-encoding responses. `net/html.c` is a "reader mode"
-interpreter, not a layout engine: it walks the tag stream recognizing a
-pragmatic subset (headings, paragraphs, bold/strong, links, lists, line
-breaks), skips `<script>`/`<style>` bodies outright, decodes the common
-HTML entities, and emits a flat list of styled text lines. The GUI's
-Browser window (`gui/compositor.c`) just draws that list top to bottom,
-word-wrapping each line to the window's actual pixel width.
+and chunked transfer-encoding responses.
 
-Two real bugs surfaced while getting this to work end-to-end against a
-live site (`example.com`), both caught by actually fetching a real page
-rather than trusting a synthetic test:
+From there, three layers turn the raw HTML bytes into pixels:
+
+- **`net/dom.c`** parses the HTML into a real tree (kmalloc'd nodes with
+  a tag, `id`/`class`/`href`/inline-`style` attributes, and text-node
+  children) instead of a flat line list — a real (if minimal) DOM.
+- **`net/css.c`** parses a pragmatic CSS subset: a hardcoded UA default
+  stylesheet (block/inline defaults, heading/link/bold colors, list and
+  blockquote spacing) plus whatever the page's own `<style>` blocks and
+  inline `style=""` attributes add, resolved with real property
+  inheritance and a simple cascade (later rules win per-property; inline
+  style wins over everything).
+- **`net/layout.c`** walks the DOM with resolved styles into a flat list
+  of positioned render items in document-pixel space: block children
+  stack vertically with real margins/padding, inline content (text,
+  `<a>`/`<b>`/`<span>`) flows and word-wraps within the current block's
+  width, and each *word* becomes its own item with its own color and
+  link id — which is what makes individual links genuinely clickable
+  (hit-testing is just "does the click point fall inside this word's
+  box"), not merely styled.
+
+The GUI's Browser window (`gui/compositor.c`) draws that item list in
+three passes (backgrounds, then rules, then text, so a block's own
+background never paints over its text regardless of emission order),
+and clicking a link resolves its `href` against the current URL
+(handling `http://` absolute, `//host/path`, `/path` absolute-path, and
+plain relative hrefs, with `#fragment`/`mailto:`/`javascript:` treated as
+no-ops and `https://` refused outright — no TLS client exists) before
+re-fetching.
+
+Several real bugs surfaced while getting this to render correctly
+end-to-end — all caught by actually fetching real pages (both a live
+site and a small local multi-page CSS test site) rather than trusting
+code review:
 
 1. **DNS silently failed.** `ip_send()` originally only checked the ARP
    *cache* for the next hop and gave up if it missed — fine for the
@@ -196,27 +230,42 @@ rather than trusting a synthetic test:
    ARP'd the DNS server's IP, so every DNS query silently failed to even
    go out. Fixed with `ip_resolve_next_hop()`, which actively sends ARP
    *requests* and retries (5 attempts, 200ms apart) before giving up.
-   This also let `kernel/ping_task.c` drop its own now-redundant manual
-   ARP loop, since `ip_send()` handles it for every caller now. The same
-   fix made off-subnet routing work in general: `ip_send()` now routes
-   through the gateway for any destination outside our `/24`, which is
-   what let TCP reach a real internet host instead of only local IPs.
-2. **Styled text lost its style, and long lines got silently cut off.**
-   In `net/html.c`, closing a `<b>`/`<a>` tag reset the current style
-   *before* the text accumulated under the old style was flushed to a
-   line, so bold/link text rendered as plain. Fixed by flushing first,
-   then changing the depth counter. Separately, `append_char()` just
-   stopped writing past a fixed 100-character line buffer, silently
-   truncating any longer paragraph. Fixed by having it auto-flush and
-   continue on a fresh (same-styled) line instead of dropping data.
+   The same fix made off-subnet routing work in general: `ip_send()` now
+   routes through the gateway for any destination outside our `/24`.
+2. **A whole class of tags silently rendered as inline text.** The UA
+   default stylesheet's `display: block` rule lists ~25 tag names in one
+   comma-separated selector (`h1,h2,...,blockquote,...,form`), but
+   `css_parse_into` only kept the first 4 comma-separated selectors per
+   rule (`CSS_MAX_GROUPS` was 4). Every tag past the 4th silently never
+   matched that rule, so `h1`, `ul`, `li`, `hr`, `blockquote`, and more
+   all defaulted to `display: inline` — no margins, no backgrounds, no
+   line breaks between them, everything ran together as one paragraph.
+   Caught by literally walking the DOM tree with debug logging and
+   noticing those tags were visited but never reached the block-layout
+   code path. Fixed by raising `CSS_MAX_GROUPS` to 32.
+3. **The fix above appeared to do nothing at first** — because the
+   Makefile's `%.o: %.c` rule has no header dependency tracking, so
+   editing `css.h` didn't trigger a rebuild of anything that includes
+   it. `make` silently relinked the *old* object file. Fixed by adding
+   `-MMD -MP` to `CFLAGS` and `-include`ing the generated `.d` files, so
+   header edits now correctly invalidate their dependents. This wasn't
+   a browser bug, but it's the kind of thing that makes a real bug look
+   fixed when it isn't, so it's worth calling out.
+4. **Unstyled pages were invisible.** The UA default text color was a
+   light near-white (left over from when the reader-mode renderer only
+   ever painted on the OS's own dark window background). Once real CSS
+   backgrounds started rendering, a page with a light `background-color`
+   but no explicit `color` (e.g. `example.com`, which relies on the
+   browser default) produced near-white text on a near-white
+   background — unreadable. Real browsers default to *black* text on a
+   light canvas; fixed by changing the UA default to black and giving
+   the Browser window's own content area a light default fill (drawn
+   before any page-supplied background), matching that same convention.
 
-A third bug was purely in the GUI layer: `draw_browser` was drawing each
-HTML line directly, and the HTML parser's own 100-character wrap is
-wider than the Browser window's ~380px content area, so long lines
-overflowed past the window's right edge. Fixed by reusing the File
-Manager's `draw_wrapped_text` helper (changed to return the row count it
-drew) so the Browser can correctly advance past HTML lines that wrap
-into multiple on-screen rows.
+Two smaller bugs were fixed in the reader-mode-era code and are now
+moot since that renderer (`net/html.c`) was deleted and fully replaced
+by the DOM/CSS/layout pipeline above: a style-flush-ordering bug and a
+line-truncation bug in the old flat HTML parser.
 
 ## How the filesystem works
 
@@ -300,8 +349,9 @@ kernel/          GDT/IDT/ISR/IRQ, PIC, PIT, paging, physical memory
                  scheduler + context switch, TSS, ring-3 entry, syscalls
 drivers/         PS/2 controller, keyboard, mouse, PCI enumeration, RTL8139 NIC, ATA
 gui/             framebuffer primitives, bitmap font, window compositor
-net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP, HTML --
-                 a from-scratch TCP/IP stack plus a reader-mode web browser backend
+net/             Ethernet, ARP, IPv4, ICMP, UDP, DNS, TCP, HTTP -- a
+                 from-scratch TCP/IP stack -- plus DOM/CSS/layout, a
+                 real (if pragmatic) web browser backend
 fs/              FAT32 driver (BPB, FAT chains, directory listing, read/write)
 include/         public headers, mirroring kernel/, drivers/, gui/, net/, fs/
 linker.ld        places the kernel at 1 MiB physical/virtual (identity-mapped)
@@ -338,8 +388,9 @@ ISO, which the kernel never reads back from.
 
 Preemptive multitasking, ring-3 user mode, syscalls, a full
 Ethernet/ARP/IPv4/ICMP/UDP/DNS/TCP stack, a real read/write FAT32
-filesystem, and a working (if CSS-less) web browser are now done (see
-above). Rough order of what's next:
+filesystem, and a web browser with a real (if pragmatic) CSS box-model
+layout engine and clickable links are now done (see above). Rough order
+of what's next:
 
 1. **Per-process page directories** — give each task its own CR3 instead
    of sharing one identity-mapped 4 GiB space. This is what turns "ring-3
@@ -351,16 +402,15 @@ above). Rough order of what's next:
    directories both in place, the natural next step is a minimal ELF
    loader plus `fork`/`exec`-style syscalls, so user programs can be
    files on `zapos_disk.img` instead of demo functions in `kernel.c`.
-3. **A CSS box-model layout engine for the browser** — the current
-   browser is reader-mode only (styled text, no boxes); a real layout
-   tree (block/inline boxes, at least a handful of CSS properties) is
-   the natural next step now that fetch/parse/TCP/DNS are all working.
-   Clickable links (real navigation) and HTTPS (a TLS client — a
-   substantial project on its own) would go with it.
+3. **HTTPS** — a TLS client is a substantial project on its own
+   (certificate parsing/validation, at minimum a static-RSA or ECDHE
+   cipher suite), but it's the single biggest thing keeping the browser
+   from reaching most of the real web.
 4. **DHCP + concurrent connections** — replace the static IP config with
    a real DHCP handshake, and lift TCP's single-static-connection
    limitation so multiple sockets can be open at once (needed before the
-   browser can, e.g., fetch a page and its images concurrently).
+   browser can, e.g., fetch a page and its images concurrently, or fetch
+   asynchronously without blocking GUI redraws).
 5. **A real windowing API** — right now windows are hardcoded in
    `gui/compositor.c`; user-mode processes (the eventual browser
    included) need a message-passing syscall API to create/draw into

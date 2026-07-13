@@ -7,7 +7,7 @@ GCC_FREESTANDING_INC := $(shell gcc -m32 -print-file-name=include)
 CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector \
            -fno-builtin -nostdlib -nostdinc -Wall -Wextra -O2 \
            -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mgeneral-regs-only \
-           -Iinclude -isystem $(GCC_FREESTANDING_INC)
+           -Iinclude -isystem $(GCC_FREESTANDING_INC) -MMD -MP
 LDFLAGS := -m elf_i386 -T linker.ld -nostdlib
 ASFLAGS := -f elf32
 
@@ -44,6 +44,8 @@ $(BUILD)/%.o: %.asm
 
 $(KERNEL): $(OBJECTS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+
+-include $(C_OBJECTS:.o=.d)
 
 iso: $(KERNEL)
 	@mkdir -p $(ISODIR)/boot/grub

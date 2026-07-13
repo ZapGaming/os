@@ -11,7 +11,9 @@
 #include <net/icmp.h>
 #include <net/dns.h>
 #include <net/http.h>
-#include <net/html.h>
+#include <net/dom.h>
+#include <net/css.h>
+#include <net/layout.h>
 #include <fs/fat32.h>
 #include <string.h>
 
@@ -65,13 +67,18 @@ static uint32_t fm_status_until = 0;
 
 static void fm_refresh(void);
 
-/* Browser state -- a single instance, one page loaded at a time. */
+/* Browser state -- a single instance, one page loaded at a time. Pages
+ * are rendered with a real (if pragmatic) CSS box-model layout: fetch
+ * -> dom_parse -> css_extract_style_blocks -> layout_run -> a flat
+ * list of positioned, styled render items in br_layout, which is what
+ * draw_browser() and the link click hit-test actually walk. */
 static char br_url[BR_MAX_URL] = "example.com/";
 static int br_url_len = 12;
 static int br_editing_url = 0;
 static int br_scroll = 0;
 static char br_status_msg[64] = "Type a URL and press Enter";
-static struct html_doc br_doc;
+static struct layout_doc br_layout;
+static int br_window_idx = -1;
 
 static int add_window(int x, int y, int w, int h, const char *title,
                        const char *l1, const char *l2, uint32_t accent) {
@@ -126,6 +133,8 @@ void gui_init(void) {
     if (net_is_up()) {
         int br = add_window(600, 60, 400, 400, "Browser", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
+        br_window_idx = br;
+        layout_doc_alloc(&br_layout);
     }
 }
 
@@ -374,17 +383,27 @@ static void draw_file_manager(const gui_window_t *w) {
     }
 }
 
-/* Splits "example.com/path" (an optional "http://" prefix is skipped)
- * into a host and a path; defaults the path to "/". */
-static void br_parse_url(const char *url, char *host_out, int host_cap, char *path_out, int path_cap) {
+/* Splits "example.com:8000/path" (an optional "http://" prefix is
+ * skipped) into a host, a port (defaulting to 80), and a path
+ * (defaulting to "/"). */
+static void br_parse_url(const char *url, char *host_out, int host_cap, uint16_t *port_out,
+                          char *path_out, int path_cap) {
     const char *p = url;
     if (p[0] == 'h' && p[1] == 't' && p[2] == 't' && p[3] == 'p' &&
         p[4] == ':' && p[5] == '/' && p[6] == '/') {
         p += 7;
     }
     int i = 0;
-    while (*p && *p != '/' && i < host_cap - 1) host_out[i++] = *p++;
+    while (*p && *p != '/' && *p != ':' && i < host_cap - 1) host_out[i++] = *p++;
     host_out[i] = 0;
+
+    *port_out = 80;
+    if (*p == ':') {
+        p++;
+        int port = 0;
+        while (*p >= '0' && *p <= '9') { port = port * 10 + (*p - '0'); p++; }
+        if (port > 0 && port < 65536) *port_out = (uint16_t)port;
+    }
 
     if (*p == '/') {
         int j = 0;
@@ -395,26 +414,52 @@ static void br_parse_url(const char *url, char *host_out, int host_cap, char *pa
     }
 }
 
+/* Content-area geometry shared by drawing, scrolling, and link hit-
+ * testing, so they can never disagree with each other. */
+static void br_content_area(int *x, int *y, int *w, int *h) {
+    const gui_window_t *win = &windows[br_window_idx];
+    *x = win->x + 10;
+    *y = win->y + TITLEBAR_H + 8 + 46;
+    *w = win->w - 20;
+    *h = win->y + win->h - *y - 8;
+    if (*h < 0) *h = 0;
+}
+
 /* Runs synchronously on the GUI's own task -- the screen won't redraw
  * until this returns (a few seconds for a small page). A real async
  * fetch would need a dedicated task and a way to hand the result back;
  * out of scope for this pass. */
 static void br_fetch(void) {
     char host[64], path[64];
-    br_parse_url(br_url, host, sizeof(host), path, sizeof(path));
+    uint16_t port;
+    br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
 
     static char body[BR_BODY_MAX];
     int status;
     uint32_t body_len;
 
-    if (!http_get(host, 80, path, &status, body, sizeof(body) - 1, &body_len)) {
+    if (!http_get(host, port, path, &status, body, sizeof(body) - 1, &body_len)) {
         strcpy(br_status_msg, "Failed to load (DNS/TCP error)");
-        br_doc.line_count = 0;
-        br_doc.title[0] = 0;
+        br_layout.item_count = 0;
+        br_layout.link_count = 0;
         return;
     }
     body[body_len] = 0;
-    html_parse(body, body_len, &br_doc);
+
+    char title[DOM_MAX_TITLE];
+    struct dom_node *root = dom_parse(body, body_len, title, sizeof(title));
+
+    struct css_stylesheet sheet;
+    css_stylesheet_init(&sheet);
+    css_extract_style_blocks(&sheet, body, body_len);
+
+    int content_x, content_y, content_w, content_h;
+    br_content_area(&content_x, &content_y, &content_w, &content_h);
+    layout_run(root, &sheet, content_w, &br_layout);
+    strncpy(br_layout.title, title, DOM_MAX_TITLE - 1);
+
+    css_stylesheet_free(&sheet);
+    dom_free(root);
     br_scroll = 0;
 
     char numbuf[12];
@@ -423,9 +468,91 @@ static void br_fetch(void) {
     strcat(br_status_msg, numbuf);
 }
 
-static void br_handle_click(const gui_window_t *w, int my) {
+/* Resolves `href` (as found on an <a> in the just-loaded page) against
+ * the current br_url, writes the resolved absolute "host[:port]/path"
+ * into br_url, and returns 1 -- or returns 0 (no navigation) for
+ * fragment-only/mailto:/javascript: links and for https: links, which
+ * this browser can't fetch (no TLS client). */
+static int br_resolve_href(const char *href) {
+    if (href[0] == '#' || href[0] == 0) return 0;
+    if (strncmp(href, "mailto:", 7) == 0 || strncmp(href, "javascript:", 11) == 0) return 0;
+    if (strncmp(href, "https://", 8) == 0) {
+        strcpy(br_status_msg, "HTTPS not supported (no TLS client)");
+        return 0;
+    }
+
+    if (strncmp(href, "http://", 7) == 0) {
+        strncpy(br_url, href, BR_MAX_URL - 1);
+        br_url[BR_MAX_URL - 1] = 0;
+        br_url_len = (int)strlen(br_url);
+        return 1;
+    }
+
+    char host[64], path[64];
+    uint16_t port;
+    br_parse_url(br_url, host, sizeof(host), &port, path, sizeof(path));
+
+    char new_path[64];
+    if (href[0] == '/') {
+        strncpy(new_path, href, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = 0;
+    } else {
+        /* Relative to the current path's directory. */
+        char dir[64];
+        strncpy(dir, path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *found = NULL;
+        for (char *p = dir; *p; p++) if (*p == '/') found = p;
+        if (found) found[1] = 0;
+        else strcpy(dir, "/");
+
+        strcpy(new_path, dir);
+        int dl = (int)strlen(new_path);
+        int hl = (int)strlen(href);
+        if (dl + hl < (int)sizeof(new_path)) strcpy(new_path + dl, href);
+    }
+
+    int n = 0;
+    n += (int)strlen(host);
+    strncpy(br_url, host, BR_MAX_URL - 1);
+    if (port != 80 && n < BR_MAX_URL - 8) {
+        char portbuf[8];
+        utoa(port, portbuf);
+        br_url[n++] = ':';
+        int pl = (int)strlen(portbuf);
+        if (n + pl < BR_MAX_URL) { memcpy(br_url + n, portbuf, (size_t)pl); n += pl; }
+    }
+    int pl = (int)strlen(new_path);
+    if (n + pl < BR_MAX_URL) { memcpy(br_url + n, new_path, (size_t)pl); n += pl; }
+    br_url[n] = 0;
+    br_url_len = n;
+    return 1;
+}
+
+static void br_navigate(const char *href) {
+    if (br_resolve_href(href)) br_fetch();
+}
+
+static void br_handle_click(const gui_window_t *w, int mx, int my) {
     int rel_y = my - (w->y + TITLEBAR_H + 8);
     br_editing_url = (rel_y >= 0 && rel_y < 20);
+    if (br_editing_url) return;
+
+    int content_x, content_y, content_w, content_h;
+    br_content_area(&content_x, &content_y, &content_w, &content_h);
+    if (mx < content_x || my < content_y) return;
+
+    int doc_x = mx - content_x;
+    int doc_y = (my - content_y) + br_scroll;
+
+    for (int i = 0; i < br_layout.item_count; i++) {
+        const struct layout_item *it = &br_layout.items[i];
+        if (it->type != LAYOUT_ITEM_TEXT || it->link_id < 0) continue;
+        if (doc_x >= it->x && doc_x < it->x + it->w && doc_y >= it->y && doc_y < it->y + it->h) {
+            br_navigate(br_layout.links[it->link_id].href);
+            return;
+        }
+    }
 }
 
 static void br_handle_key(char c) {
@@ -456,28 +583,37 @@ static void draw_browser(const gui_window_t *w) {
         return;
     }
 
-    int content_y = y + 46;
-    int content_h = w->y + w->h - content_y - 8;
-    int max_rows = content_h / FM_ROW_H;
-    if (max_rows < 1) max_rows = 1;
+    int content_x, content_y, content_w, content_h;
+    br_content_area(&content_x, &content_y, &content_w, &content_h);
 
-    if (br_scroll > br_doc.line_count - 1) br_scroll = br_doc.line_count - 1;
+    /* A real browser's default page canvas is light with black text --
+     * pages that never set their own background (the common case) rely
+     * on that default for contrast against their (also-defaulted)
+     * black text. Filled first so any background a page DOES set (via
+     * body/html {background-color: ...}) paints over it. */
+    fb_fill_rect(content_x, content_y, content_w, content_h, 0xF4F4F6);
+
+    int max_scroll = br_layout.content_height - content_h;
+    if (max_scroll < 0) max_scroll = 0;
+    if (br_scroll > max_scroll) br_scroll = max_scroll;
     if (br_scroll < 0) br_scroll = 0;
 
-    int display_row = 0;
-    for (int li = br_scroll; li < br_doc.line_count && display_row < max_rows; li++) {
-        const struct html_line *line = &br_doc.lines[li];
-        if (line->text[0] == 0) { display_row++; continue; } /* blank spacer line */
+    /* Three passes so backgrounds always sit under rules and text,
+     * regardless of the order layout emitted them in. */
+    for (int pass = 0; pass < 3; pass++) {
+        enum layout_item_type want = pass == 0 ? LAYOUT_ITEM_RECT :
+                                      pass == 1 ? LAYOUT_ITEM_HR : LAYOUT_ITEM_TEXT;
+        for (int i = 0; i < br_layout.item_count; i++) {
+            const struct layout_item *it = &br_layout.items[i];
+            if (it->type != want) continue;
+            if (it->y + it->h < br_scroll || it->y > br_scroll + content_h) continue;
 
-        uint32_t color;
-        switch (line->style) {
-            case HTML_STYLE_HEADING: color = 0xF2C14E; break;
-            case HTML_STYLE_LINK:    color = 0x62D8FF; break;
-            case HTML_STYLE_BOLD:    color = 0xFFFFFF; break;
-            default:                 color = COL_TEXT; break;
+            int sx = content_x + it->x;
+            int sy = content_y + (it->y - br_scroll);
+            if (it->type == LAYOUT_ITEM_RECT) fb_fill_rect(sx, sy, it->w, it->h, it->color);
+            else if (it->type == LAYOUT_ITEM_HR) fb_draw_line(sx, sy, sx + it->w, sy, it->color);
+            else fb_draw_string(sx, sy, it->text, it->color, 1);
         }
-        display_row += draw_wrapped_text(x, content_y + display_row * FM_ROW_H, inner_w,
-                                          max_rows - display_row, line->text, color);
     }
 }
 
@@ -588,7 +724,7 @@ void gui_run(void) {
                     if (mx >= w->x && mx < w->x + w->w && my >= w->y + TITLEBAR_H && my < w->y + w->h) {
                         bring_to_front(oi);
                         if (w->is_file_manager) fm_handle_click(w, my);
-                        else if (w->is_browser) br_handle_click(w, my);
+                        else if (w->is_browser) br_handle_click(w, mx, my);
                         break;
                     }
                 }
@@ -617,11 +753,11 @@ void gui_run(void) {
         if (scroll_cooldown > 0) {
             scroll_cooldown--;
         } else if (keyboard_key_pressed(0x48)) { /* up arrow */
-            br_scroll--;
+            br_scroll -= LAYOUT_LINE_H;
             if (br_scroll < 0) br_scroll = 0;
             scroll_cooldown = 4;
         } else if (keyboard_key_pressed(0x50)) { /* down arrow */
-            br_scroll++;
+            br_scroll += LAYOUT_LINE_H;
             scroll_cooldown = 4;
         }
 
