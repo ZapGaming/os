@@ -30,12 +30,13 @@ you can keep building on.
   kernel uses as-is — every part of the GUI reads the real width/height
   at runtime instead of assuming a fixed size).
 - **GUI**: a compositor with a themed desktop background, draggable
-  windows with title bars/close buttons (a real X, not just a colored
-  square)/drop shadows, a taskbar with a live clock and a dock of
-  per-app icons (color-coded, dims when closed, click to reopen/focus —
-  closing a window only hides it, so the dock is also the only way to
-  bring one back), and a custom-drawn cursor. Double-buffered to avoid
-  tearing.
+  windows with rounded-corner chrome, title bars/close buttons (a real
+  X, not just a colored square)/drop shadows, a taskbar with a live
+  clock and a dock of per-app icons (real vector pictograms rendered by
+  a from-scratch SVG-subset renderer — see "How app icons work" below —
+  color-coded badges, dims when closed, click to reopen/focus — closing
+  a window only hides it, so the dock is also the only way to bring one
+  back), and a custom-drawn cursor. Double-buffered to avoid tearing.
 - **Preemptive multitasking**: a real scheduler with independent kernel
   stacks per task, driven off the PIT timer interrupt — tasks are switched
   transparently, not cooperatively. See "How the scheduler works" below.
@@ -407,6 +408,41 @@ you can keep building on.
   a closing quote, e.g.) can miscolor a string's boundary.
 
 See "Roadmap" below for how each of these would actually get built.
+
+## How app icons work
+
+`gui/svgicon.c` is a from-scratch, minimal SVG-subset parser and
+rasterizer — no libc, no floating point (this file compiles under the
+same `-mgeneral-regs-only`/`-mno-sse`/`-mno-80387` flags as the rest of
+`gui/`, so every coordinate is fixed-point). It understands just enough
+of SVG to author real vector icons: `<rect>` (with optional rounded
+corners), `<circle>`, `<polygon>`, and `<path>` with `M/L/H/V/C/Z`
+commands (including multiple subpaths per path). Every icon is authored
+on a fixed 24x24 design grid and is a single-color silhouette — curves
+get flattened into line segments (a hardcoded quarter-circle table for
+circles/rounded corners, De Casteljau subdivision for cubic beziers),
+then every shape in the icon is combined into one scanline fill pass
+using the even-odd rule, which is what lets two overlapping shapes punch
+a hole in each other (see the globe icon: the meridian/equator "lines"
+are actually thin lens-shaped cutouts even-odd'd out of the solid disc,
+since a single alpha-mask silhouette has no second color available to
+draw contrasting lines with).
+
+Each icon is rasterized once, at startup, at 4x its final resolution
+into a 0/255 coverage buffer, then box-downsampled 4x4→1 for cheap
+anti-aliasing, and cached as an 8-bit alpha mask. `svgicon_draw()`
+composites a cached mask onto the framebuffer at any requested
+size/tint/opacity via `fb_blend_pixel()` — the same mask backs both the
+dock icons and the small icon in every window's title bar. There are 8
+built-in icons, one per app: an info glyph, a CPU chip, a flag, a bar
+chart, signal bars, a folder, a globe, and a terminal chevron.
+
+There's no rounded-corner *stroke* primitive in `gui/framebuffer.c`
+(only a filled rounded rect), so window chrome and dock badges fake a
+rounded border by drawing two nested filled rounded rects — a
+full-sized one in the border/accent color, then a smaller inset one in
+the body color on top — leaving only the outer rect's corner arcs
+visible as a frame.
 
 ## How the scheduler works
 
