@@ -20,16 +20,29 @@ jobs:
       - name: Install build and capture tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             gcc-multilib nasm grub-pc-bin grub-common xorriso mtools dosfstools \
             qemu-system-x86 imagemagick socat
 
       - name: Build bootable ISO
-        run: make clean && make iso
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          make clean 2>&1 | tee /tmp/zapos-build.log
+          make iso 2>&1 | tee -a /tmp/zapos-build.log
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zapos-build-log
+          path: /tmp/zapos-build.log
+          if-no-files-found: warn
 
       - name: Boot ZapOS in QEMU
         run: |
-          rm -f /tmp/qemu-monitor.sock /tmp/zapos.ppm
+          rm -f /tmp/qemu-monitor.sock /tmp/zapos.ppm /tmp/zapos-serial.log
           qemu-system-i386 \
             -boot order=d \
             -cdrom zapos.iso \
@@ -50,6 +63,7 @@ jobs:
             sleep 1
           done
 
+          test -S /tmp/qemu-monitor.sock
           sleep 18
           printf 'screendump /tmp/zapos.ppm\nquit\n' | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock
           test -s /tmp/zapos.ppm
@@ -60,10 +74,11 @@ jobs:
           identify /tmp/zapos-qemu.png
 
       - name: Upload real QEMU screenshot
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zapos-qemu-screenshot
           path: |
             /tmp/zapos-qemu.png
             /tmp/zapos-serial.log
-          if-no-files-found: error
+          if-no-files-found: warn
