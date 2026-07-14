@@ -3,16 +3,18 @@
 
 #include <stdint.h>
 
-#define NOVA_APP_COUNT 7
+#define NOVA_APP_COUNT 9
 
 enum nova_app_id {
     NOVA_APP_HOME = 0,
     NOVA_APP_TERMINAL = 1,
     NOVA_APP_FILES = 2,
     NOVA_APP_TASKS = 3,
-    NOVA_APP_ACTIVITY = 4,
-    NOVA_APP_SETTINGS = 5,
-    NOVA_APP_ABOUT = 6
+    NOVA_APP_BROWSER = 4,
+    NOVA_APP_EDITOR = 5,
+    NOVA_APP_ACTIVITY = 6,
+    NOVA_APP_SETTINGS = 7,
+    NOVA_APP_ABOUT = 8
 };
 
 struct nova_app_descriptor {
