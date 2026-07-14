@@ -128,13 +128,18 @@ void js_lexer_next(struct js_lexer *lx) {
         char quote = c;
         lx->pos++;
         int i = 0;
-        while (lx->pos < lx->len && lx->src[lx->pos] != quote && i < JS_TOKEN_MAX_LEN - 1) {
+        while (lx->pos < lx->len && lx->src[lx->pos] != quote) {
             char ch = lx->src[lx->pos];
             if (ch == '\\' && lx->pos + 1 < lx->len) {
                 lx->pos++;
                 ch = js_lexer_decode_escape(lx->src[lx->pos]);
             }
-            lx->cur.text[i++] = ch;
+            /* A string longer than the token buffer still gets scanned
+             * all the way to its real closing quote (just silently
+             * truncated in `text`) -- otherwise lx->pos is left
+             * mid-string, and the lexer resumes tokenizing the string's
+             * own tail as if it were code. */
+            if (i < JS_TOKEN_MAX_LEN - 1) lx->cur.text[i++] = ch;
             lx->pos++;
         }
         lx->cur.text[i] = 0;
