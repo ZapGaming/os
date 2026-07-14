@@ -56,6 +56,11 @@ you can keep building on.
   kernel. The GUI's "Process Monitor" window shows this live: task count,
   a live-incrementing counter from a background kernel task, and the
   actual string the ring-3 task sent via syscall.
+- **Inter-process communication**: named, kernel-managed message
+  channels — any two tasks can rendezvous on a shared name and exchange
+  data, including two fully isolated ELF user processes (separate page
+  directories) that otherwise share nothing at all. See "How IPC works"
+  below.
 - **Networking**: PCI enumeration, two NIC drivers — an RTL8139 driver
   (IRQ-driven RX ring + TX descriptors, I/O-space registers) and an
   Intel 8254x ("e1000") driver (MMIO registers, descriptor rings the
@@ -821,6 +826,44 @@ was the deliberate call. There's also still no isolation *between*
 two kernel-mode tasks (the background counter, the ping task, the
 GUI) — none of them run untrusted code, so that gap doesn't matter the
 way it would for ELF-loaded ones.
+
+## How IPC works
+
+`kernel/ipc.c` is a small named-channel registry — the one primitive
+that lets any two tasks exchange data, including two fully isolated
+ELF-loaded processes (see above) whose separate page directories mean
+they share literally nothing else: no common parent, no inherited
+handle, no way to see each other's pointers. A channel is identified by
+a short string name rather than a pid or handle either side has to
+already know about the other to obtain — `ipc_open("chat")` on both
+sides is exactly how two unrelated processes rendezvous, the same way
+two Unix processes meet on a named FIFO path rather than a fd inherited
+from a common ancestor. Opening an already-open name bumps a refcount
+and returns the same channel id; the slot is only actually freed (and
+any still-queued messages dropped) once every opener has called
+`ipc_close()`.
+
+Every channel is a small fixed-size ring buffer (8 channels × 8 queued
+messages × 256 bytes each, all static storage, no `kmalloc`) — deliberately
+just a data structure, with **no call to `schedule()` anywhere in
+`kernel/ipc.c`**. `ipc_try_send()`/`ipc_try_recv()` are non-blocking:
+they return immediately with "queued"/"received", "try again" (queue
+full or empty), or "invalid id". That split is what makes `ipc.c` fully
+host-testable in isolation (no scheduler, no serial port, no kmalloc to
+fake) — the actual *blocking* behavior a syscall needs ("keep trying
+until there's room, or a message shows up") lives one layer up, in
+`kernel/syscall.c`'s `SYS_IPC_SEND`/`SYS_IPC_RECV` handlers, as a
+`while (try_it() == 0) schedule();` loop around the non-blocking call —
+exactly the same shape `SYS_SLEEP` already used for "keep yielding until
+enough PIT ticks have passed."
+
+The 4 syscalls (`SYS_IPC_OPEN/SEND/RECV/CLOSE`, numbers 7-10) are the
+first to need more than one argument: `ecx`/`edx` (previously-unused
+slots in `struct registers`) carry a buffer pointer and a length/capacity
+alongside `ebx`'s channel id, the same way `ebx` alone already carried
+every earlier syscall's single argument. The self-hosted C compiler
+(`cc/`) gained matching builtins (`ipc_open`/`ipc_send`/`ipc_recv`/`ipc_close`)
+so a compiled program can use this directly — see `cc/builtins.c`.
 
 ## How the DOOM port works
 
