@@ -4,12 +4,15 @@
 #include <kernel/scheduler.h>
 #include <kernel/serial.h>
 #include <kernel/pit.h>
+#include <kernel/ipc.h>
+#include <kernel/capability.h>
+#include <kernel/sysfs.h>
 #include <drivers/keyboard.h>
 #include <gui/compositor.h>
 #include <string.h>
 
 extern void isr128(void);
-extern void task_exited(void); /* marks current task terminated, never returns */
+extern void task_exited(void);
 
 #define MSG_BUF_SIZE 128
 static char last_message[MSG_BUF_SIZE];
@@ -17,21 +20,26 @@ static int message_count = 0;
 
 static void copy_bounded(char *dst, const char *src, size_t max) {
     size_t i = 0;
+    if (!src || max == 0) return;
     for (; i < max - 1 && src[i]; i++) dst[i] = src[i];
     while (i > 0 && (dst[i - 1] == '\n' || dst[i - 1] == '\r')) i--;
     dst[i] = 0;
 }
 
-/* NOTE: `ebx` here is a raw pointer straight from ring-3. Because every
- * task currently shares one identity-mapped address space, dereferencing
- * it is safe for this demo -- a real OS would validate it lives in that
- * process's own mapped memory before touching it. */
+static int current_pid(void) {
+    struct task *t = scheduler_current();
+    return t ? t->pid : 0;
+}
+
 static void syscall_handler(struct registers *regs) {
+    int pid = current_pid();
+
     switch (regs->eax) {
         case SYS_WRITE: {
             const char *str = (const char *)regs->ebx;
-            serial_printf("[pid %d syscall] %s", scheduler_current()->pid, str);
-            terminal_route_output(scheduler_current()->pid, str);
+            if (!str) { regs->eax = (uint32_t)-1; break; }
+            serial_printf("[pid %d syscall] %s", pid, str);
+            terminal_route_output(pid, str);
             copy_bounded(last_message, str, MSG_BUF_SIZE);
             message_count++;
             regs->eax = strlen(str);
@@ -54,35 +62,55 @@ static void syscall_handler(struct registers *regs) {
         }
         case SYS_POLL_KEY: {
             uint8_t scancode, pressed;
-            if (keyboard_poll_event(&scancode, &pressed)) {
-                regs->eax = ((uint32_t)pressed << 8) | scancode;
-            } else {
-                regs->eax = (uint32_t)-1;
-            }
+            if (keyboard_poll_event(&scancode, &pressed)) regs->eax = ((uint32_t)pressed << 8) | scancode;
+            else regs->eax = (uint32_t)-1;
             break;
         }
         case SYS_BLIT:
-            /* `ebx` is a pointer into the CALLING task's own address
-             * space -- safe to dereference here specifically because a
-             * syscall trap doesn't change CR3, so the isolated task's
-             * own directory (with its own private mapping for this
-             * buffer) is still what's loaded for the duration of this
-             * handler. gui_blit_fullscreen() copies it into a kernel-
-             * owned staging buffer immediately, since the GUI's own
-             * redraw pass runs later, as a different task, under a
-             * different (or the same shared) directory where this
-             * pointer wouldn't mean the same thing -- or anything at
-             * all. Like SYS_WRITE's string pointer, there's no
-             * validation that the whole DOOM_BLIT_W*H range is
-             * actually mapped in the caller's own directory before
-             * reading it; a program passing a bad pointer here can
-             * still fault (safely contained -- see kernel/exceptions.c
-             * -- just this task, not the kernel). */
-            gui_blit_fullscreen((const uint32_t *)regs->ebx, scheduler_current()->pid);
+            gui_blit_fullscreen((const uint32_t *)regs->ebx, pid);
             regs->eax = 0;
             break;
+        case SYS_GETPID:
+            regs->eax = (uint32_t)pid;
+            break;
+        case SYS_CAP_GET:
+            regs->eax = capability_get(pid);
+            break;
+        case SYS_IPC_REGISTER: {
+            const char *service = (const char *)regs->ebx;
+            regs->eax = ipc_register(pid, service) ? 0u : (uint32_t)-1;
+            break;
+        }
+        case SYS_IPC_SEND: {
+            int receiver = (int)regs->ebx;
+            uint32_t type = regs->ecx;
+            const void *payload = (const void *)regs->edx;
+            uint32_t length = regs->esi;
+            regs->eax = ipc_send(pid, receiver, type, payload, length) ? 0u : (uint32_t)-1;
+            break;
+        }
+        case SYS_IPC_RECEIVE: {
+            struct ipc_message *out = (struct ipc_message *)regs->ebx;
+            regs->eax = ipc_receive(pid, out) ? 0u : (uint32_t)-1;
+            break;
+        }
+        case SYS_IPC_PENDING:
+            regs->eax = (uint32_t)ipc_pending(pid);
+            break;
+        case SYS_SYSFS_READ: {
+            const char *path = (const char *)regs->ebx;
+            char *out = (char *)regs->ecx;
+            uint32_t cap = regs->edx;
+            if (!capability_has(pid, CAP_PROCESS_QUERY)) {
+                regs->eax = (uint32_t)-1;
+                break;
+            }
+            regs->eax = (uint32_t)sysfs_read(path, out, cap);
+            break;
+        }
         case SYS_EXIT:
-            task_exited(); /* never returns */
+            ipc_unregister(pid);
+            task_exited();
             break;
         default:
             regs->eax = (uint32_t)-1;
@@ -91,9 +119,9 @@ static void syscall_handler(struct registers *regs) {
 }
 
 void syscall_init(void) {
-    idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE); /* DPL=3 interrupt gate */
+    idt_set_gate(0x80, (uint32_t)isr128, 0x08, 0xEE);
     register_interrupt_handler(0x80, syscall_handler);
-    serial_printf("syscall: int 0x80 gate installed\n");
+    serial_printf("syscall: int 0x80 gate installed with Nova IPC/sysfs ABI\n");
 }
 
 const char *syscall_last_message(void) {
