@@ -1,0 +1,69 @@
+name: QEMU Screenshot
+
+on:
+  push:
+    branches:
+      - chatgpt/zapos
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Install build and capture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-multilib nasm grub-pc-bin grub-common xorriso mtools dosfstools \
+            qemu-system-x86 imagemagick socat
+
+      - name: Build bootable ISO
+        run: make clean && make iso
+
+      - name: Boot ZapOS in QEMU
+        run: |
+          rm -f /tmp/qemu-monitor.sock /tmp/zapos.ppm
+          qemu-system-i386 \
+            -boot order=d \
+            -cdrom zapos.iso \
+            -m 512M \
+            -smp 2 \
+            -netdev user,id=net0 \
+            -device rtl8139,netdev=net0 \
+            -device AC97 \
+            -display none \
+            -serial file:/tmp/zapos-serial.log \
+            -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+            -daemonize
+
+          for i in $(seq 1 45); do
+            if [ -S /tmp/qemu-monitor.sock ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          sleep 18
+          printf 'screendump /tmp/zapos.ppm\nquit\n' | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock
+          test -s /tmp/zapos.ppm
+
+      - name: Convert framebuffer capture
+        run: |
+          convert /tmp/zapos.ppm -strip /tmp/zapos-qemu.png
+          identify /tmp/zapos-qemu.png
+
+      - name: Upload real QEMU screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: zapos-qemu-screenshot
+          path: |
+            /tmp/zapos-qemu.png
+            /tmp/zapos-serial.log
+          if-no-files-found: error
