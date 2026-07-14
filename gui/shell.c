@@ -7,6 +7,7 @@
 #include <js/lexer.h>
 #include <js/dom_binding.h>
 #include <py/py.h>
+#include <cc/compile.h>
 #include <string.h>
 
 #define SHELL_MAX_ENTRIES 32
@@ -82,6 +83,7 @@ static void cmd_help(void (*out)(const char *)) {
     out("  run <name.ELF>     launch a program (or just type its name)\n");
     out("  js <name.js>       run a script with the JS engine\n");
     out("  python <name.py>   run a script with the Python interpreter\n");
+    out("  cc <in.c> <out.ELF> compile a C source file to a native ELF32 program\n");
     out("  ps                 list tasks\n");
     out("  clear              clear the screen\n");
     out("  help               this text\n");
@@ -255,6 +257,55 @@ static void cmd_python(uint32_t cwd, const char *arg, void (*out)(const char *))
     kfree(source);
 }
 
+/* `cc <in.c> <out.ELF>` -- compiles a C source file (see cc/compile.c
+ * for exactly what's supported) straight to a native ELF32 executable
+ * and writes it to disk via fat32_write_file(), the same file-creation
+ * primitive `mkdir`'s sibling commands above already use. This is the
+ * one command in this file that WRITES a brand new file rather than
+ * only ever reading/listing/deleting existing ones -- the output name
+ * is upper-cased first, matching cmd_mkdir/cmd_mv's convention for
+ * every other on-disk name this shell ever creates or renames, since
+ * fat32.c's directory entries are compared byte-for-byte. The result
+ * is immediately runnable via the existing `run`/bare-name-with-.ELF
+ * commands -- no separate assemble/link step, no trip off of ZapOS. */
+static void cmd_cc(uint32_t cwd, const char *src_name, const char *out_name, void (*out)(const char *)) {
+    uint32_t len;
+    char *source = read_whole_file(cwd, src_name, &len);
+    if (!source) { out("cc: no such file: "); out(src_name); out("\n"); return; }
+
+    uint8_t *elf_buf = NULL;
+    uint32_t elf_len = 0;
+    char errbuf[200];
+    int ok = cc_compile(source, len, &elf_buf, &elf_len, errbuf, sizeof(errbuf));
+    kfree(source);
+    if (!ok) {
+        out("cc: ");
+        out(errbuf);
+        out("\n");
+        return;
+    }
+
+    char upper_name[FAT32_MAX_NAME];
+    strncpy(upper_name, out_name, FAT32_MAX_NAME - 1);
+    upper_name[FAT32_MAX_NAME - 1] = 0;
+    for (char *p = upper_name; *p; p++) *p = to_upper_ch(*p);
+
+    if (!fat32_write_file(cwd, upper_name, elf_buf, elf_len)) {
+        out("cc: failed to write ");
+        out(upper_name);
+        out(" (disk full?)\n");
+    } else {
+        out("cc: compiled ");
+        out(src_name);
+        out(" -> ");
+        out(upper_name);
+        out(" (");
+        print_uint(out, elf_len);
+        out(" bytes)\n");
+    }
+    kfree(elf_buf);
+}
+
 int shell_execute(const char *cmdline, uint32_t *cwd, void (*out)(const char *)) {
     int launched_pid = -1;
 
@@ -287,6 +338,7 @@ int shell_execute(const char *cmdline, uint32_t *cwd, void (*out)(const char *))
     else if (strcmp(cmd, "run") == 0 && argc > 1) cmd_run(*cwd, argv[1], out, &launched_pid);
     else if (strcmp(cmd, "js") == 0 && argc > 1) cmd_js(*cwd, argv[1], out);
     else if (strcmp(cmd, "python") == 0 && argc > 1) cmd_python(*cwd, argv[1], out);
+    else if (strcmp(cmd, "cc") == 0 && argc > 2) cmd_cc(*cwd, argv[1], argv[2], out);
     else if (has_ext_ieq(cmd, "ELF") && argc == 1) cmd_run(*cwd, cmd, out, &launched_pid);
     else {
         out(cmd);

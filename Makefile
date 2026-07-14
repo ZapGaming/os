@@ -30,7 +30,7 @@ ASFLAGS := -f elf32
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui net fs js py -name '*.c')
+C_SOURCES   := $(shell find boot kernel drivers gui net fs js py cc -name '*.c')
 
 # boot/ap_trampoline.asm is excluded here -- it's raw 16-bit real-mode
 # code that must run at a fixed low physical address (see that file's
