@@ -30,7 +30,12 @@ ASFLAGS := -f elf32
 BUILD   := build
 ISODIR  := isodir
 
-C_SOURCES   := $(shell find boot kernel drivers gui net fs js py cc -name '*.c')
+# chatgpt/zapos ships the Nova compositor as the desktop shell. The legacy
+# compositor remains in-tree as a reference implementation and as a source
+# of the browser/file-manager work, but is deliberately excluded from this
+# branch's kernel to avoid duplicate gui_init/gui_run symbols.
+ALL_C_SOURCES := $(shell find boot kernel drivers gui net fs js py cc -name '*.c')
+C_SOURCES     := $(filter-out gui/compositor.c,$(ALL_C_SOURCES))
 
 # boot/ap_trampoline.asm is excluded here -- it's raw 16-bit real-mode
 # code that must run at a fixed low physical address (see that file's
