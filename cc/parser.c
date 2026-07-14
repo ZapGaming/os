@@ -194,80 +194,61 @@ static struct cc_node *parse_unary(struct cc_lexer *lx, struct cc_module *m) {
     return parse_postfix(lx, m);
 }
 
-#define BINOP_LEVEL(fname, next, nodetype, unionfield) \
-static struct cc_node *fname(struct cc_lexer *lx, struct cc_module *m, const char **ops) { \
-    struct cc_node *left = next(lx, m); \
-    for (;;) { \
-        if (failed(m, lx)) return left; \
-        const char *matched = NULL; \
-        for (int i = 0; ops[i]; i++) if (is_punct(lx, ops[i])) { matched = ops[i]; break; } \
-        if (!matched) break; \
-        int line = lx->cur.line; \
-        cc_lexer_next(lx); \
-        struct cc_node *right = next(lx, m); \
-        struct cc_node *n = node_new(m, nodetype, line); \
-        strcpy(n->u.unionfield.op, matched); \
-        n->u.unionfield.left = left; \
-        n->u.unionfield.right = right; \
-        left = n; \
-    } \
-    return left; \
+/* One binary-operator precedence level: parses `next` (the tighter-
+ * binding level below it), then repeatedly consumes any operator in
+ * `ops` (NULL-terminated) at this level, left-associatively. Every
+ * level in the standard C precedence chain below is just this loop
+ * wired to the level beneath it with its own operator set -- shared
+ * as a single helper rather than repeating the loop by hand at every
+ * level. */
+typedef struct cc_node *(*cc_parse_fn)(struct cc_lexer *, struct cc_module *);
+
+static struct cc_node *parse_binop_level(struct cc_lexer *lx, struct cc_module *m,
+                                          cc_parse_fn next, const char **ops,
+                                          enum cc_node_type nodetype) {
+    struct cc_node *left = next(lx, m);
+    for (;;) {
+        if (failed(m, lx)) return left;
+        const char *matched = NULL;
+        for (int i = 0; ops[i]; i++) if (is_punct(lx, ops[i])) { matched = ops[i]; break; }
+        if (!matched) break;
+        int line = lx->cur.line;
+        cc_lexer_next(lx);
+        struct cc_node *right = next(lx, m);
+        struct cc_node *n = node_new(m, nodetype, line);
+        /* binary and logical nodes share the same {op,left,right} shape */
+        strcpy(n->u.binary.op, matched);
+        n->u.binary.left = left;
+        n->u.binary.right = right;
+        left = n;
+    }
+    return left;
 }
 
-BINOP_LEVEL(parse_mul, parse_unary, CC_BINARY, binary)
 static const char *ops_mul[] = { "*", "/", "%", NULL };
-BINOP_LEVEL(parse_add, parse_mul_wrap, CC_BINARY, binary)
-/* (forward-declared helpers below tie each level to the one below it
- * with its fixed operator set, since the macro above takes the
- * operator list as a runtime argument, not the callee) */
-
-static struct cc_node *parse_mul_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_mul(lx, m, ops_mul); }
-
 static const char *ops_add[] = { "+", "-", NULL };
-static struct cc_node *parse_add_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_add(lx, m, ops_add); }
-
-BINOP_LEVEL(parse_shift, parse_add_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_add_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_add_wrap(lx, m); }
 static const char *ops_shift[] = { "<<", ">>", NULL };
-static struct cc_node *parse_shift_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_shift(lx, m, ops_shift); }
-
-BINOP_LEVEL(parse_rel, parse_shift_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_shift_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_shift_wrap(lx, m); }
 static const char *ops_rel[] = { "<", ">", "<=", ">=", NULL };
-static struct cc_node *parse_rel_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_rel(lx, m, ops_rel); }
-
-BINOP_LEVEL(parse_eq, parse_rel_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_rel_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_rel_wrap(lx, m); }
 static const char *ops_eq[] = { "==", "!=", NULL };
-static struct cc_node *parse_eq_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_eq(lx, m, ops_eq); }
-
-BINOP_LEVEL(parse_band, parse_eq_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_eq_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_eq_wrap(lx, m); }
 static const char *ops_band[] = { "&", NULL };
-static struct cc_node *parse_band_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_band(lx, m, ops_band); }
-
-BINOP_LEVEL(parse_bxor, parse_band_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_band_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_band_wrap(lx, m); }
 static const char *ops_bxor[] = { "^", NULL };
-static struct cc_node *parse_bxor_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_bxor(lx, m, ops_bxor); }
-
-BINOP_LEVEL(parse_bor, parse_bxor_wrap2, CC_BINARY, binary)
-static struct cc_node *parse_bxor_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_bxor_wrap(lx, m); }
 static const char *ops_bor[] = { "|", NULL };
-static struct cc_node *parse_bor_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_bor(lx, m, ops_bor); }
-
-BINOP_LEVEL(parse_land, parse_bor_wrap2, CC_LOGICAL, logical)
-static struct cc_node *parse_bor_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_bor_wrap(lx, m); }
 static const char *ops_land[] = { "&&", NULL };
-static struct cc_node *parse_land_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_land(lx, m, ops_land); }
-
-BINOP_LEVEL(parse_lor, parse_land_wrap2, CC_LOGICAL, logical)
-static struct cc_node *parse_land_wrap2(struct cc_lexer *lx, struct cc_module *m) { return parse_land_wrap(lx, m); }
 static const char *ops_lor[] = { "||", NULL };
-static struct cc_node *parse_lor_wrap(struct cc_lexer *lx, struct cc_module *m) { return parse_lor(lx, m, ops_lor); }
+
+static struct cc_node *parse_mul(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_unary, ops_mul, CC_BINARY); }
+static struct cc_node *parse_add(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_mul, ops_add, CC_BINARY); }
+static struct cc_node *parse_shift(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_add, ops_shift, CC_BINARY); }
+static struct cc_node *parse_rel(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_shift, ops_rel, CC_BINARY); }
+static struct cc_node *parse_eq(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_rel, ops_eq, CC_BINARY); }
+static struct cc_node *parse_band(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_eq, ops_band, CC_BINARY); }
+static struct cc_node *parse_bxor(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_band, ops_bxor, CC_BINARY); }
+static struct cc_node *parse_bor(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_bxor, ops_bor, CC_BINARY); }
+static struct cc_node *parse_land(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_bor, ops_land, CC_LOGICAL); }
+static struct cc_node *parse_lor(struct cc_lexer *lx, struct cc_module *m) { return parse_binop_level(lx, m, parse_land, ops_lor, CC_LOGICAL); }
 
 static struct cc_node *parse_assignment(struct cc_lexer *lx, struct cc_module *m) {
-    struct cc_node *left = parse_lor_wrap(lx, m);
+    struct cc_node *left = parse_lor(lx, m);
     if (failed(m, lx)) return left;
     if (is_punct(lx, "=")) {
         int line = lx->cur.line;

@@ -46,7 +46,13 @@ enum cc_cond { CC_EQ, CC_NE, CC_LT, CC_GE, CC_LE, CC_GT };
 void emit_push_reg(struct cc_buf *b, enum cc_reg reg);
 void emit_pop_reg(struct cc_buf *b, enum cc_reg reg);
 void emit_push_imm32(struct cc_buf *b, uint32_t imm);
-void emit_mov_reg_imm32(struct cc_buf *b, enum cc_reg reg, uint32_t imm); /* returns via patch offset below when a reloc is needed */
+/* Returns the buffer offset of the imm32 field, so a caller that needs
+ * this to resolve to a section-relative address later (a global
+ * variable, a string literal, a function's entry point -- anything
+ * whose final absolute address isn't known until link time, see
+ * cc_add_reloc()) can register that offset for patching. Callers that
+ * just want a plain constant loaded (CC_NUM_LIT) simply ignore it. */
+uint32_t emit_mov_reg_imm32(struct cc_buf *b, enum cc_reg reg, uint32_t imm);
 void emit_mov_reg_reg(struct cc_buf *b, enum cc_reg dst, enum cc_reg src);
 /* mov reg, [base+disp] / mov [base+disp], reg -- base must not be ESP. */
 void emit_mov_reg_mem(struct cc_buf *b, enum cc_reg reg, enum cc_reg base, int32_t disp);
@@ -58,6 +64,13 @@ void emit_mov_mem_reg(struct cc_buf *b, enum cc_reg base, int32_t disp, enum cc_
 uint32_t emit_mov_reg_absmem(struct cc_buf *b, enum cc_reg reg, uint32_t placeholder);
 uint32_t emit_mov_absmem_reg(struct cc_buf *b, uint32_t placeholder, enum cc_reg reg);
 void emit_lea_mem(struct cc_buf *b, enum cc_reg reg, enum cc_reg base, int32_t disp);
+/* Single-byte memory forms -- only used by cc/builtins.c's hand-written
+ * print_int() itoa loop (writing individual ASCII digit/sign/NUL
+ * bytes). `reg` must be EAX/ECX/EDX/EBX (the only four with an 8-bit
+ * sub-register reachable without a REX prefix, which 32-bit mode has
+ * no such thing as anyway). */
+void emit_mov_mem8_reg8(struct cc_buf *b, enum cc_reg base, int32_t disp, enum cc_reg reg);
+void emit_mov_mem8_imm8(struct cc_buf *b, enum cc_reg base, int32_t disp, uint8_t imm);
 
 void emit_add_reg_reg(struct cc_buf *b, enum cc_reg dst, enum cc_reg src);
 void emit_sub_reg_reg(struct cc_buf *b, enum cc_reg dst, enum cc_reg src);

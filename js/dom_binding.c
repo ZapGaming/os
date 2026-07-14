@@ -3,10 +3,17 @@
 #include <kernel/kheap.h>
 #include <kernel/serial.h>
 #include <net/wasm.h>
+#include <net/websocket.h>
 #include <string.h>
 
 #define ONCLICK_MAX 32
 #define TEXT_CONTENT_MAX 512
+/* Message payloads are already capped at WS_MAX_MESSAGE bytes coming
+ * out of net/websocket.c's ws_poll() -- this is just the JS-visible
+ * event object's own copy of that same bound, plus one byte for the
+ * NUL terminator a JS string needs that the raw ws_poll() buffer
+ * doesn't (see the ws.h scope note re: binary frames/embedded NULs). */
+#define WS_JS_MSG_MAX WS_MAX_MESSAGE
 
 /* WebAssembly.instantiate(url) needs raw bytes from somewhere, but this
  * engine has no fetch()/ArrayBuffer to carry them in JS -- so instead
@@ -32,6 +39,28 @@ struct js_wasm_export_binding {
     char name[WASM_MAX_NAME_LEN];
     int has_result;
 };
+
+/* new WebSocket(url) (see native_websocket_construct below) hands back
+ * a plain JS_OBJ_PLAIN object -- .send/.close are just native-function
+ * properties on it, and .onopen/.onmessage/.onclose are just ordinary
+ * data properties (js_get_prop/js_set_prop already handles those with
+ * no DOM-style special-casing needed, since this isn't a
+ * JS_OBJ_DOM_ELEMENT). What DOES need a side reference, the same reason
+ * onclick_table exists below: net/websocket.c's underlying connection
+ * is a singleton with no JS-visible identity of its own, so something
+ * has to remember *which* JS object's handlers to call when a frame
+ * arrives -- there's only ever one live connection (see
+ * include/net/websocket.h), so a single pointer suffices where onclick
+ * needed a whole table keyed by DOM node.
+ *
+ * g_ws_registered is distinct from ws_is_open(): it also covers the
+ * one-poll window where onopen still needs firing (see
+ * js_dom_ws_poll()) even though the connection is already open, and it
+ * drops back to 0 the moment nothing more should ever be dispatched to
+ * g_ws_object again (close seen, or the page navigated away). */
+static struct js_object *g_ws_object = NULL;
+static int g_ws_registered = 0;
+static int g_ws_open_pending = 0;
 
 static struct dom_node *g_document_root = NULL;
 static int g_needs_relayout = 0;
@@ -67,6 +96,18 @@ void js_dom_reset(void) {
             wasm_slot_used[i] = 0;
         }
     }
+    /* A live WebSocket connection belongs to the page that opened it --
+     * same lifecycle rule as onclick_table/WASM instances above, just
+     * for a resource net/websocket.c owns instead of the JS arena.
+     * Closing it here (rather than leaving it for the next
+     * js_dom_ws_poll() to notice) matters because g_ws_object is about
+     * to become a dangling pointer into an arena that js_arena_reset()
+     * (called by the same navigation right alongside this) is about to
+     * throw away wholesale. */
+    if (ws_is_open()) ws_close();
+    g_ws_object = NULL;
+    g_ws_registered = 0;
+    g_ws_open_pending = 0;
 }
 
 int js_dom_needs_relayout(void) { return g_needs_relayout; }
@@ -399,6 +440,135 @@ static js_value native_wasm_instantiate(js_value this_val, js_value *args, int a
     return js_make_object(result);
 }
 
+/* WebSocket.readyState numeric values -- same 4 values/meanings as the
+ * real API, even though this engine has no async connect (see below)
+ * to ever actually observe CONNECTING from JS. */
+enum { WS_STATE_CONNECTING = 0, WS_STATE_OPEN = 1, WS_STATE_CLOSING = 2, WS_STATE_CLOSED = 3 };
+
+/* ws.send(str) -- ignores `this_val` and just operates on
+ * net/websocket.c's one global connection, consistent with that file's
+ * own "one connection at a time" scope; there is at most one
+ * JS-visible WebSocket object alive anyway (see g_ws_object above). */
+static js_value native_ws_send(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
+    if (argc < 1) return js_undefined();
+    if (!ws_is_open()) {
+        serial_printf("js: WebSocket.send() called while not open -- dropped\n");
+        return js_undefined();
+    }
+    if (!ws_send_text(js_to_string(args[0]))) {
+        serial_printf("js: WebSocket.send() failed (TCP send error)\n");
+    }
+    return js_undefined();
+}
+
+/* ws.close() -- fires onclose synchronously, right here, rather than
+ * waiting for the next js_dom_ws_poll(): a locally-initiated close
+ * happens inline during JS execution (same as an onclick handler
+ * running inline), it isn't something that arrived asynchronously off
+ * the network for the per-frame poll to notice. Real WebSocket fires
+ * onclose asynchronously even for a local close; this engine has no
+ * event loop to defer it into, so "synchronously, right where the
+ * script called close()" is the honest equivalent. */
+static js_value native_ws_close(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)args; (void)argc; (void)fn_obj;
+    if (ws_is_open()) {
+        ws_close();
+        if (g_ws_object) {
+            js_set_prop(g_ws_object, "readyState", js_make_num(WS_STATE_CLOSED));
+            js_value handler = js_get_prop(g_ws_object, "onclose");
+            if (handler.type == JS_OBJ) js_call(handler, js_make_object(g_ws_object), NULL, 0);
+        }
+    }
+    g_ws_registered = 0;
+    return js_undefined();
+}
+
+/* Non-standard shape, forced by what this engine actually has -- same
+ * spirit as native_wasm_instantiate() above. Real WebSocket connects
+ * asynchronously (the constructor returns immediately, before any
+ * network I/O has happened, and onopen fires later); this engine has
+ * no event loop to run that connection attempt on in the background,
+ * so ws_connect() below runs it synchronously and to completion before
+ * `new WebSocket(url)` ever returns to the calling script -- by which
+ * point the handshake has already succeeded or failed. onopen still
+ * fires on the *next* js_dom_ws_poll() rather than from inside here,
+ * though, because the script's very next line (`ws.onopen = ...`)
+ * hasn't run yet at this point -- see g_ws_open_pending. */
+static js_value native_websocket_construct(js_value this_val, js_value *args, int argc, struct js_object *fn_obj) {
+    (void)this_val; (void)fn_obj;
+    if (argc < 1 || args[0].type != JS_STR) {
+        serial_printf("js: WebSocket requires a URL string argument\n");
+        return js_undefined();
+    }
+    const char *url = js_to_string(args[0]);
+
+    struct js_object *obj = js_new_object(JS_OBJ_PLAIN);
+    js_value obj_val = js_make_object(obj);
+    js_set_prop(obj, "url", js_make_str(js_strdup(url)));
+    js_set_prop(obj, "onopen", js_undefined());
+    js_set_prop(obj, "onmessage", js_undefined());
+    js_set_prop(obj, "onclose", js_undefined());
+    js_set_prop(obj, "send", js_make_object(make_native(native_ws_send)));
+    js_set_prop(obj, "close", js_make_object(make_native(native_ws_close)));
+
+    g_ws_object = obj;
+    g_ws_registered = 0;
+    g_ws_open_pending = 0;
+
+    if (ws_connect(url)) {
+        js_set_prop(obj, "readyState", js_make_num(WS_STATE_OPEN));
+        g_ws_registered = 1;
+        g_ws_open_pending = 1; /* fire onopen on the first js_dom_ws_poll() after this */
+    } else {
+        js_set_prop(obj, "readyState", js_make_num(WS_STATE_CLOSED));
+        serial_printf("js: new WebSocket(%s) failed to connect\n", url);
+    }
+    return obj_val;
+}
+
+/* Called once per gui_run() frame (see gui/compositor.c) -- the exact
+ * same timing model js_dom_dispatch_click() already uses for onclick,
+ * just triggered by "did a WebSocket frame arrive" instead of "did a
+ * mouse click happen." A no-op whenever there's no registered
+ * connection, so the caller doesn't need to gate the call itself. */
+void js_dom_ws_poll(void) {
+    if (!g_ws_registered || !g_ws_object) return;
+
+    if (g_ws_open_pending) {
+        g_ws_open_pending = 0;
+        js_value handler = js_get_prop(g_ws_object, "onopen");
+        if (handler.type == JS_OBJ) js_call(handler, js_make_object(g_ws_object), NULL, 0);
+    }
+
+    if (!ws_is_open()) { g_ws_registered = 0; return; }
+
+    static char msg_buf[WS_JS_MSG_MAX + 1];
+    uint32_t msg_len = 0;
+    enum ws_event ev = ws_poll(msg_buf, WS_JS_MSG_MAX, &msg_len);
+
+    if (ev == WS_EVENT_MESSAGE) {
+        /* NUL-terminated so it can become a JS string -- see
+         * include/net/websocket.h's binary-frame note re: this being
+         * lossy if the payload itself contains a NUL byte. There's no
+         * primitive in this engine that could carry an exact byte count
+         * alongside the bytes instead. */
+        msg_buf[msg_len] = 0;
+        struct js_object *event = js_new_object(JS_OBJ_PLAIN);
+        js_set_prop(event, "data", js_make_str(js_strdup(msg_buf)));
+        js_value handler = js_get_prop(g_ws_object, "onmessage");
+        if (handler.type == JS_OBJ) {
+            js_value event_arg = js_make_object(event);
+            js_call(handler, js_make_object(g_ws_object), &event_arg, 1);
+        }
+    } else if (ev == WS_EVENT_CLOSE) {
+        js_set_prop(g_ws_object, "readyState", js_make_num(WS_STATE_CLOSED));
+        js_value handler = js_get_prop(g_ws_object, "onclose");
+        if (handler.type == JS_OBJ) js_call(handler, js_make_object(g_ws_object), NULL, 0);
+        g_ws_registered = 0;
+    }
+}
+
 struct js_env *js_make_global_env(struct dom_node *document_root) {
     g_document_root = document_root;
     struct js_env *env = js_env_new(NULL);
@@ -421,6 +591,13 @@ struct js_env *js_make_global_env(struct dom_node *document_root) {
     struct js_object *wasm_ns = js_new_object(JS_OBJ_PLAIN);
     js_set_prop(wasm_ns, "instantiate", js_make_object(make_native(native_wasm_instantiate)));
     js_env_declare(env, "WebAssembly", js_make_object(wasm_ns), 0);
+
+    /* A plain JS_OBJ_NATIVE global, not a JS_OBJ_FUNCTION -- js/interp.c's
+     * JS_NEW case has a dedicated branch letting `new WebSocket(url)`
+     * call this directly (see the comment there); calling it as a plain
+     * WebSocket(url), with no `new` at all, works too, since js_call()
+     * dispatches JS_OBJ_NATIVE the same way either path ends up. */
+    js_env_declare(env, "WebSocket", js_make_object(make_native(native_websocket_construct)), 0);
 
     return env;
 }

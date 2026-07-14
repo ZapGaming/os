@@ -299,7 +299,22 @@ static js_value eval_expr(struct js_node *node, struct js_env *env) {
             js_value ctor = eval_expr(node->u.call.callee, env);
             js_value args[8];
             int argc = eval_args(node->u.call.args, env, args, 8);
-            if (ctor.type != JS_OBJ || (ctor.as.object->kind != JS_OBJ_FUNCTION && ctor.as.object->kind != JS_OBJ_ARROW)) {
+            if (ctor.type != JS_OBJ) {
+                serial_printf("js: 'new' target is not a constructor\n");
+                return js_undefined();
+            }
+            if (ctor.as.object->kind == JS_OBJ_NATIVE) {
+                /* A native "constructor" (e.g. `new WebSocket(url)` --
+                 * see js/dom_binding.c) has no func_node/class methods
+                 * for the JS_CLASS_DECL/JS_CLASS_EXPR path below to run
+                 * -- it just builds and returns its own object directly,
+                 * exactly like calling it without `new` would. `this` is
+                 * undefined rather than a pre-built instance, since
+                 * there's no instance for it to populate ahead of the
+                 * call the way the JS-defined-class path does. */
+                return ctor.as.object->native_fn(js_undefined(), args, argc, ctor.as.object);
+            }
+            if (ctor.as.object->kind != JS_OBJ_FUNCTION && ctor.as.object->kind != JS_OBJ_ARROW) {
                 serial_printf("js: 'new' target is not a constructor\n");
                 return js_undefined();
             }

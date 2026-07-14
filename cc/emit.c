@@ -85,9 +85,11 @@ void emit_push_imm32(struct cc_buf *b, uint32_t imm) {
     cc_buf_push_u32(b, imm);
 }
 
-void emit_mov_reg_imm32(struct cc_buf *b, enum cc_reg reg, uint32_t imm) {
+uint32_t emit_mov_reg_imm32(struct cc_buf *b, enum cc_reg reg, uint32_t imm) {
     cc_buf_push_byte(b, (uint8_t)(0xB8 + reg));
+    uint32_t at = b->len;
     cc_buf_push_u32(b, imm);
+    return at;
 }
 
 void emit_mov_reg_reg(struct cc_buf *b, enum cc_reg dst, enum cc_reg src) {
@@ -124,6 +126,17 @@ uint32_t emit_mov_absmem_reg(struct cc_buf *b, uint32_t placeholder, enum cc_reg
 void emit_lea_mem(struct cc_buf *b, enum cc_reg reg, enum cc_reg base, int32_t disp) {
     cc_buf_push_byte(b, 0x8D);
     emit_modrm_mem(b, reg, base, disp);
+}
+
+void emit_mov_mem8_reg8(struct cc_buf *b, enum cc_reg base, int32_t disp, enum cc_reg reg) {
+    cc_buf_push_byte(b, 0x88);
+    emit_modrm_mem(b, reg, base, disp);
+}
+
+void emit_mov_mem8_imm8(struct cc_buf *b, enum cc_reg base, int32_t disp, uint8_t imm) {
+    cc_buf_push_byte(b, 0xC6);
+    emit_modrm_mem(b, (enum cc_reg)0, base, disp); /* reg field = 0 (opcode extension /0) */
+    cc_buf_push_byte(b, imm);
 }
 
 static void emit_rr(struct cc_buf *b, uint8_t opcode, enum cc_reg dst, enum cc_reg src) {

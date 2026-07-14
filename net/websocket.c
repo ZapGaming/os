@@ -460,9 +460,16 @@ enum ws_event ws_poll(char *out, uint32_t cap, uint32_t *out_len) {
             return WS_EVENT_CLOSE;
         }
 
-        memmove(ws.raw_buf, ws.raw_buf + frame.frame_len, ws.raw_len - frame.frame_len);
-        ws.raw_len -= frame.frame_len;
-
+        /* Read everything this frame's opcode needs out of
+         * frame.payload BEFORE consuming the frame from raw_buf below --
+         * frame.payload aliases directly into raw_buf (see
+         * ws_parse_frame()), so shifting the buffer first would corrupt
+         * it out from under any case that still needs to read it
+         * (continuation/text/binary/ping all do; only close/pong/unknown
+         * don't). This is deliberately a two-step "read, then consume"
+         * rather than "consume, then switch," which briefly had exactly
+         * that bug during development. */
+        int deliver = 0;
         switch (frame.opcode) {
             case 0x8: /* close */
                 ws_close();
@@ -470,42 +477,50 @@ enum ws_event ws_poll(char *out, uint32_t cap, uint32_t *out_len) {
 
             case 0x9: /* ping -- reply with pong echoing the same payload */
                 ws_send_frame(0xA, frame.payload, frame.payload_len);
-                continue;
+                break;
 
             case 0xA: /* pong */
-                continue;
+                break;
 
             case 0x0: /* continuation of a fragmented message */
-                if (!ws.reassembling) continue; /* stray continuation frame -- ignore */
+                if (!ws.reassembling) break; /* stray continuation frame -- ignore */
                 if (ws.msg_len + frame.payload_len <= WS_MAX_MESSAGE) {
                     memcpy(ws.msg_buf + ws.msg_len, frame.payload, frame.payload_len);
                     ws.msg_len += frame.payload_len;
                 }
                 if (frame.fin) {
                     ws.reassembling = 0;
-                    uint32_t n = ws.msg_len < cap ? ws.msg_len : cap;
-                    memcpy(out, ws.msg_buf, n);
-                    *out_len = n;
-                    return WS_EVENT_MESSAGE;
+                    deliver = 1;
                 }
-                continue;
+                break;
 
             case 0x1: /* text */
             case 0x2: /* binary -- delivered identically, see the file-level scope note */
                 if (frame.fin) {
-                    uint32_t n = frame.payload_len < cap ? frame.payload_len : cap;
-                    memcpy(out, frame.payload, n);
-                    *out_len = n;
-                    return WS_EVENT_MESSAGE;
+                    ws.msg_len = frame.payload_len <= WS_MAX_MESSAGE ? frame.payload_len : WS_MAX_MESSAGE;
+                    memcpy(ws.msg_buf, frame.payload, ws.msg_len);
+                    deliver = 1;
+                } else {
+                    ws.reassembling = 1;
+                    ws.msg_opcode = frame.opcode;
+                    ws.msg_len = frame.payload_len <= WS_MAX_MESSAGE ? frame.payload_len : WS_MAX_MESSAGE;
+                    memcpy(ws.msg_buf, frame.payload, ws.msg_len);
                 }
-                ws.reassembling = 1;
-                ws.msg_opcode = frame.opcode;
-                ws.msg_len = frame.payload_len <= WS_MAX_MESSAGE ? frame.payload_len : WS_MAX_MESSAGE;
-                memcpy(ws.msg_buf, frame.payload, ws.msg_len);
-                continue;
+                break;
 
             default:
-                continue; /* unknown/reserved opcode -- ignore rather than fail the whole connection */
+                break; /* unknown/reserved opcode -- ignore rather than fail the whole connection */
+        }
+
+        /* Now safe to consume: nothing above still needs frame.payload. */
+        memmove(ws.raw_buf, ws.raw_buf + frame.frame_len, ws.raw_len - frame.frame_len);
+        ws.raw_len -= frame.frame_len;
+
+        if (deliver) {
+            uint32_t n = ws.msg_len < cap ? ws.msg_len : cap;
+            memcpy(out, ws.msg_buf, n);
+            *out_len = n;
+            return WS_EVENT_MESSAGE;
         }
     }
 }

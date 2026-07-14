@@ -1,0 +1,174 @@
+/* Runtime support for compiled programs -- see the syscall ABI doc
+ * comment on include/kernel/syscall.h. A compiled program has no libc
+ * to link against (int 0x80 with 7 syscalls is *everything* it can
+ * touch -- see the task brief), so these are hand-assembled function
+ * bodies (using the same emit_* encoder cc/codegen.c's own codegen
+ * uses) spliced into m->text before any user code, then registered
+ * into m->funcs exactly like an ordinary user-defined function. That
+ * means a user's `print("hi")` or `print_int(x)` call compiles through
+ * the *exact same* call-site codegen as calling any function they
+ * wrote themselves (see gen_call() in cc/codegen.c) -- nothing about
+ * calling a builtin is special-cased at the call site.
+ *
+ * Provided: print(s), print_int(n), yield(), sleep(ms), get_ticks(),
+ * poll_key(), exit(code) -- one thin wrapper per syscall in
+ * include/kernel/syscall.h, plus the two print variants since there's
+ * no other way for a compiled program to produce output at all (no
+ * libc means no sprintf/itoa either). SYS_BLIT is deliberately not
+ * wrapped -- it wants a raw pointer to a large fixed-size pixel
+ * buffer, which is far more useful to a program that already has
+ * `int screen[76800];`-style global arrays than a canned builtin. */
+#include <cc/codegen.h>
+#include <cc/emit.h>
+#include <kernel/syscall.h>
+#include <string.h>
+
+static void emit_prologue(struct cc_buf *b, int frame_size) {
+    emit_push_reg(b, EBP);
+    emit_mov_reg_reg(b, EBP, ESP);
+    if (frame_size > 0) emit_sub_reg_imm32(b, ESP, (uint32_t)frame_size);
+}
+
+static void emit_epilogue(struct cc_buf *b) {
+    emit_mov_reg_reg(b, ESP, EBP);
+    emit_pop_reg(b, EBP);
+    emit_ret(b);
+}
+
+/* void print(int *s) -- SYS_WRITE(s). */
+static void emit_print(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_imm32(b, EAX, SYS_WRITE);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* void print_int(int n) -- hand-written signed itoa + SYS_WRITE. Digits
+ * are produced least-significant-first into a 16-byte stack buffer,
+ * written back-to-front (EBX walks backward from the buffer's last
+ * byte), which avoids needing a separate reverse pass. ESI (otherwise
+ * unused here) holds the sign flag across the division loop since
+ * EAX/ECX/EDX/EBX are all busy with the division and write cursor. */
+static void emit_print_int(struct cc_buf *b) {
+    emit_prologue(b, 16); /* buffer at [ebp-16 .. ebp-1] */
+    emit_lea_mem(b, EBX, EBP, -1);
+    emit_mov_mem8_imm8(b, EBX, 0, 0); /* NUL terminator */
+    emit_mov_reg_mem(b, EAX, EBP, 8); /* eax = n */
+    emit_mov_reg_imm32(b, ESI, 0);    /* esi = is_negative */
+
+    emit_test_reg_reg(b, EAX, EAX);
+    uint32_t j_neg = emit_jcc(b, CC_LT); /* SF after TEST with OF cleared == genuine "negative" test */
+    uint32_t j_absdone = emit_jmp(b);
+    uint32_t neg_pos = b->len;
+    emit_neg_reg(b, EAX);
+    emit_mov_reg_imm32(b, ESI, 1);
+    uint32_t absdone_pos = b->len;
+    cc_patch_rel32(b, j_neg, neg_pos);
+    cc_patch_rel32(b, j_absdone, absdone_pos);
+
+    emit_mov_reg_imm32(b, ECX, 10);
+    uint32_t loop_pos = b->len;
+    emit_mov_reg_imm32(b, EDX, 0); /* clear high dividend half -- eax is nonnegative here */
+    emit_idiv_reg(b, ECX);
+    emit_add_reg_imm32(b, EDX, '0');
+    emit_sub_reg_imm32(b, EBX, 1);
+    emit_mov_mem8_reg8(b, EBX, 0, EDX);
+    emit_test_reg_reg(b, EAX, EAX);
+    uint32_t j_loop = emit_jcc(b, CC_NE);
+    cc_patch_rel32(b, j_loop, loop_pos);
+
+    emit_test_reg_reg(b, ESI, ESI);
+    uint32_t j_nosign = emit_jcc(b, CC_EQ);
+    emit_sub_reg_imm32(b, EBX, 1);
+    emit_mov_mem8_imm8(b, EBX, 0, '-');
+    uint32_t nosign_pos = b->len;
+    cc_patch_rel32(b, j_nosign, nosign_pos);
+
+    emit_mov_reg_imm32(b, EAX, SYS_WRITE);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int yield(void) -- SYS_YIELD. */
+static void emit_yield(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_imm32(b, EAX, SYS_YIELD);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int sleep(int ms) -- SYS_SLEEP(ms). */
+static void emit_sleep(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_imm32(b, EAX, SYS_SLEEP);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int get_ticks(void) -- SYS_GET_TICKS. */
+static void emit_get_ticks(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_imm32(b, EAX, SYS_GET_TICKS);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int poll_key(void) -- SYS_POLL_KEY. */
+static void emit_poll_key(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_imm32(b, EAX, SYS_POLL_KEY);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* void exit(int code) -- SYS_EXIT. `code` is accepted for C-familiarity
+ * but ignored: task_exited() (see kernel/syscall.c) takes no exit-code
+ * argument at all. Never returns; the epilogue after it is unreachable
+ * but kept for structural symmetry with every other builtin here. */
+static void emit_exit(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_imm32(b, EAX, SYS_EXIT);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+static struct cc_func *cc_register_builtin(struct cc_module *m, const char *name, int param_count,
+                                            int param_ptr_depth, int is_void, int ret_ptr_depth) {
+    struct cc_func *f = cc_add_func(m, name);
+    if (!f) return NULL;
+    f->is_builtin = 1;
+    f->has_body = 1;
+    f->is_void = is_void;
+    f->ret_type.ptr_depth = ret_ptr_depth;
+    f->ret_type.is_array = 0;
+    f->param_count = param_count;
+    if (param_count > 0) f->param_types[0].ptr_depth = param_ptr_depth;
+    return f;
+}
+
+void cc_register_builtins(struct cc_module *m) {
+    struct cc_func *f;
+
+    f = cc_register_builtin(m, "print", 1, 1, 1, 0);
+    if (f) { f->text_offset = m->text.len; emit_print(&m->text); }
+
+    f = cc_register_builtin(m, "print_int", 1, 0, 1, 0);
+    if (f) { f->text_offset = m->text.len; emit_print_int(&m->text); }
+
+    f = cc_register_builtin(m, "yield", 0, 0, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_yield(&m->text); }
+
+    f = cc_register_builtin(m, "sleep", 1, 0, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_sleep(&m->text); }
+
+    f = cc_register_builtin(m, "get_ticks", 0, 0, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_get_ticks(&m->text); }
+
+    f = cc_register_builtin(m, "poll_key", 0, 0, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_poll_key(&m->text); }
+
+    f = cc_register_builtin(m, "exit", 1, 0, 1, 0);
+    if (f) { f->text_offset = m->text.len; emit_exit(&m->text); }
+}

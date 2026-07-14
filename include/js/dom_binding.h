@@ -63,4 +63,16 @@ void js_set_console_sink(void (*sink)(const char *));
 typedef int (*js_binary_fetch_fn)(const char *url, uint8_t **out_data, uint32_t *out_len);
 void js_set_binary_fetcher(js_binary_fetch_fn fn);
 
+/* Polls net/websocket.c's one connection (if `new WebSocket(url)` --
+ * see js/dom_binding.c -- has ever registered one for the current
+ * page) for a newly-arrived message or close, and dispatches
+ * .onmessage/.onclose synchronously, in-frame -- same timing model as
+ * js_dom_dispatch_click() above, just fired by gui/compositor.c's
+ * gui_run() once per frame instead of by a mouse click. Also fires
+ * .onopen, exactly once, on the first call after a successful
+ * ws_connect() (see js/dom_binding.c for why that can't happen any
+ * earlier). A no-op when there's no WebSocket for the current page, so
+ * the caller doesn't need to gate the call itself. */
+void js_dom_ws_poll(void);
+
 #endif

@@ -11,7 +11,17 @@
 #define CC_MAX_RELOCS 4096
 #define CC_ERR_LEN 160
 
-enum cc_section { CC_SEC_TEXT, CC_SEC_RODATA, CC_SEC_DATA, CC_SEC_BSS };
+enum cc_section {
+    CC_SEC_TEXT, CC_SEC_RODATA, CC_SEC_DATA, CC_SEC_BSS,
+    /* Not a byte-addressed section -- `offset_in_section` for this kind
+     * holds a FUNCTION INDEX (into m->funcs) instead of a byte offset,
+     * resolved via that function's own text_offset in the final link
+     * pass. Needed because a call site may be emitted before the
+     * callee's body has been (forward reference / mutual recursion),
+     * so the callee's text_offset isn't known yet at the point the
+     * call is emitted -- only once every function has been emitted. */
+    CC_SEC_FUNC,
+};
 
 /* A reference, recorded while emitting `text`, to an absolute address
  * that isn't known until every function/global has been laid out (see

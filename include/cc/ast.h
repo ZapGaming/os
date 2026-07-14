@@ -55,7 +55,7 @@ struct cc_node {
         struct { char *name; struct cc_type ret_type; int is_void; struct cc_node *params; struct cc_node *body; } func_decl;
         struct { char *name; struct cc_type type; int has_init; int32_t init_value; } global_var;
         struct { char *name; struct cc_type type; } param;
-        struct { char *name; struct cc_type type; struct cc_node *init; } var_decl;
+        struct { char *name; struct cc_type type; struct cc_node *init; int local_index; } var_decl;
         struct { struct cc_node *stmts; } block;
         struct { struct cc_node *cond, *then_branch, *else_branch; } if_stmt;
         struct { struct cc_node *cond, *body; } while_stmt;
@@ -66,8 +66,11 @@ struct cc_node {
         struct { uint32_t rodata_offset; uint32_t len; } str_lit;
         struct { char *name; } ident;
         struct { struct cc_node *target, *value; } assign;
+        /* Shared by CC_BINARY (arithmetic/bitwise/comparison, all
+         * strict) and CC_LOGICAL (&&/||, short-circuiting) -- codegen
+         * always accesses this through the `binary` name regardless of
+         * which of the two node types it is. */
         struct { char op[3]; struct cc_node *left, *right; } binary;
-        struct { char op[3]; struct cc_node *left, *right; } logical;
         struct { char op[2]; struct cc_node *operand; } unary;
         struct { struct cc_node *operand; } addr_deref;
         struct { struct cc_node *operand; } incdec;
