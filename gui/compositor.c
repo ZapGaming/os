@@ -23,6 +23,7 @@
 #include <js/dom_binding.h>
 #include <kernel/kheap.h>
 #include <kernel/elf.h>
+#include <kernel/apic.h>
 #include <gui/shell.h>
 #include <string.h>
 
@@ -78,6 +79,7 @@ typedef struct {
     int is_file_manager;
     int is_browser;
     int is_terminal;
+    int is_smp_monitor;
     int open;
 } gui_window_t;
 
@@ -515,6 +517,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->is_file_manager = 0;
     win->is_browser = 0;
     win->is_terminal = 0;
+    win->is_smp_monitor = 0;
     win->open = 1;
     window_order[window_count] = idx;
     window_count++;
@@ -570,9 +573,10 @@ void gui_init(void) {
     add_window(SX(120), SY(90), 340, 190, "About ZapOS", "ABT",
                "A fully custom 32-bit OS kernel",
                "GUI + drivers written from scratch", 0x3E6FF0);
-    add_window(SX(560), SY(160), 300, 170, "System Monitor", "SYS",
+    int sys = add_window(SX(560), SY(160), 300, 170, "System Monitor", "SYS",
                "Kernel heap + paging: online",
                "PS/2 keyboard + mouse: online", 0x2FBF71);
+    windows[sys].is_smp_monitor = 1;
     add_window(SX(260), SY(340), 320, 150, "Roadmap", "MAP",
                "Next up: process isolation + a filesystem",
                "See README.md for the plan", 0xE0954C);
@@ -642,6 +646,20 @@ static void draw_labeled_uint(int x, int y, const char *label, unsigned int val,
     utoa(val, buf);
     fb_draw_string(x, y, label, COL_MUTED, 1);
     fb_draw_string(x + fb_text_width(label, 1), y, buf, color, 1);
+}
+
+/* Deliberately temporary/easy-to-remove proof-of-life display for the
+ * SMP bring-up MVP (see kernel/smp.c, kernel/apic.c): just reads the
+ * two counters the AP itself increments and shows them changing over
+ * time. If no AP was ever woken (single-CPU boot, or bring-up failed),
+ * both values just stay at 0 forever -- a correct, harmless steady
+ * state, not an error. */
+static void draw_smp_monitor(const gui_window_t *w) {
+    int x = w->x + 14;
+    int y = w->y + TITLEBAR_H + 58;
+
+    draw_labeled_uint(x, y, "AP cores started: ", apic_ap_started_count(), 0x8FE3A8);
+    draw_labeled_uint(x, y + 20, "AP heartbeat: ", apic_ap_heartbeat(), 0xE0954C);
 }
 
 static void draw_process_monitor(const gui_window_t *w) {
@@ -2101,6 +2119,7 @@ static void draw_window(const gui_window_t *w, int focused) {
 
     if (w->body_line1) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 16, w->body_line1, COL_TEXT, 1);
     if (w->body_line2) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 34, w->body_line2, COL_MUTED, 1);
+    if (w->is_smp_monitor) draw_smp_monitor(w);
     if (w->is_process_monitor) draw_process_monitor(w);
     if (w->is_network) draw_network(w);
     if (w->is_file_manager) draw_file_manager(w);
@@ -2314,6 +2333,20 @@ void gui_run(void) {
             if (keyboard_key_pressed(0x4B)) { br_go_back(); nav_key_cooldown = 10; }
             else if (keyboard_key_pressed(0x4D)) { br_go_forward(); nav_key_cooldown = 10; }
         }
+
+        /* WebSocket messages/close, checked once per frame -- the same
+         * "polled from gui_run() itself" pattern fs_owner_pid/
+         * term_owner_pid above already use for noticing state that
+         * changed off in some other subsystem between frames, just for
+         * incoming network frames instead of task exits. There's no
+         * event loop anywhere in this engine (see js/dom_binding.c's
+         * onclick dispatch for the only other precedent: a native call
+         * invoking a JS handler inline, synchronously, rather than
+         * queuing it) -- this is that same model, just triggered by "did
+         * a WebSocket frame arrive" instead of "did a click happen."
+         * js_dom_ws_poll() is a no-op whenever the current page never
+         * opened a WebSocket, so this doesn't need its own gate. */
+        js_dom_ws_poll();
 
         draw_frame(mx, my);
         fb_swap_buffers();

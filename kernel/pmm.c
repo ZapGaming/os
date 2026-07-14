@@ -93,3 +93,22 @@ void pmm_free_frame(uint32_t frame_addr) {
 uint32_t pmm_free_frame_count(void) {
     return free_frames;
 }
+
+/* See the doc comment in pmm.h -- deliberately a single-use flag, not a
+ * general sub-1MB allocator. If a second caller ever needs a low frame,
+ * that's the signal to design a real one, not to loosen this. */
+static int low_frame_claimed = 0;
+
+uint32_t pmm_alloc_low_frame(uint32_t phys_addr) {
+    if (phys_addr >= 0x100000 || (phys_addr & (PMM_FRAME_SIZE - 1)) != 0) {
+        serial_printf("pmm: pmm_alloc_low_frame(%x) rejected -- not a page-aligned sub-1MB address\n", phys_addr);
+        return 0;
+    }
+    if (low_frame_claimed) {
+        serial_printf("pmm: pmm_alloc_low_frame(%x) rejected -- a low frame was already claimed\n", phys_addr);
+        return 0;
+    }
+    low_frame_claimed = 1;
+    serial_printf("pmm: carved out low frame %x from the sub-1MB reservation\n", phys_addr);
+    return phys_addr;
+}

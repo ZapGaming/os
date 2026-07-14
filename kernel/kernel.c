@@ -20,6 +20,7 @@
 #include <kernel/syscall.h>
 #include <kernel/demo_user_task.h>
 #include <kernel/ping_task.h>
+#include <kernel/smp.h>
 #include <net/net.h>
 #include <net/dhcp.h>
 #include <drivers/ata.h>
@@ -130,6 +131,18 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     __asm__ volatile ("sti");
     serial_printf("Interrupts enabled\n");
+
+    /* SMP bring-up MVP: detects every CPU via ACPI/MADT and, only if
+     * more than one is reported, wakes exactly one AP and proves it's
+     * genuinely running -- a clean no-op on a single-CPU boot (the
+     * default for this kernel/QEMU invocation). Needs interrupts on
+     * (pit_sleep(), used both inside apic_send_init_sipi()'s timing and
+     * smp_init()'s own proof-of-life wait, needs the timer IRQ actually
+     * firing to make progress), so it can't run any earlier than this.
+     * See include/kernel/smp.h for the full scope-cut list -- in
+     * particular, this never touches kernel/scheduler.c's
+     * schedule()/tasks[]/current_task. */
+    smp_init();
 
     /* Needs interrupts on (it blocks waiting for replies, same as
      * dns_resolve()) so it can't run any earlier than this -- net_init()

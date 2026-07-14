@@ -31,7 +31,15 @@ BUILD   := build
 ISODIR  := isodir
 
 C_SOURCES   := $(shell find boot kernel drivers gui net fs js py -name '*.c')
-ASM_SOURCES := $(shell find boot kernel drivers gui net fs js -name '*.asm')
+
+# boot/ap_trampoline.asm is excluded here -- it's raw 16-bit real-mode
+# code that must run at a fixed low physical address (see that file's
+# header comment), assembled with its own `nasm -f bin` rule below
+# instead of the generic `-f elf32` pattern rule every other .asm file
+# uses. boot/ap_trampoline_blob.asm (which embeds the resulting flat
+# binary into the normal kernel image) stays in this glob like any
+# other .asm file.
+ASM_SOURCES := $(filter-out boot/ap_trampoline.asm, $(shell find boot kernel drivers gui net fs js -name '*.asm'))
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES))
 ASM_OBJECTS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SOURCES))
@@ -62,6 +70,25 @@ $(BUILD)/py/%.o: py/%.c
 	$(CC) $(PY_CFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: %.asm
+	@mkdir -p $(dir $@)
+	$(ASM) $(ASFLAGS) $< -o $@
+
+# Flat real-mode AP trampoline (see boot/ap_trampoline.asm's header
+# comment) -- assembled as a raw binary, NOT a normal elf32 object,
+# since it must run at a fixed low physical address rather than
+# wherever the linker would place a regular .o. boot/ap_trampoline_blob.asm
+# incbin's this .bin to pull the bytes into the normal kernel image; its
+# object file explicitly depends on this one so it's always rebuilt
+# first. This overrides the generic `%.o: %.asm` pattern rule above for
+# this one target (an explicit rule with an extra prerequisite beats a
+# pattern rule), which is why boot/ap_trampoline.asm itself is filtered
+# out of ASM_SOURCES above -- otherwise Make would also try to build it
+# as a plain elf32 object, which fails (ORG is invalid in that format).
+$(BUILD)/boot/ap_trampoline.bin: boot/ap_trampoline.asm
+	@mkdir -p $(dir $@)
+	$(ASM) -f bin $< -o $@
+
+$(BUILD)/boot/ap_trampoline_blob.o: boot/ap_trampoline_blob.asm $(BUILD)/boot/ap_trampoline.bin
 	@mkdir -p $(dir $@)
 	$(ASM) $(ASFLAGS) $< -o $@
 
