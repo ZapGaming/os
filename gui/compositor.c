@@ -1,5 +1,6 @@
 #include <gui/compositor.h>
 #include <gui/framebuffer.h>
+#include <gui/svgicon.h>
 #include <drivers/mouse.h>
 #include <drivers/keyboard.h>
 #include <kernel/pit.h>
@@ -81,6 +82,7 @@ typedef struct {
     int is_terminal;
     int is_smp_monitor;
     int open;
+    int icon_id; /* enum svg_icon_id -- which dock/titlebar vector icon */
 } gui_window_t;
 
 static gui_window_t windows[MAX_WINDOWS];
@@ -519,6 +521,7 @@ static int add_window(int x, int y, int w, int h, const char *title,
     win->is_terminal = 0;
     win->is_smp_monitor = 0;
     win->open = 1;
+    win->icon_id = ICON_ABOUT; /* placeholder; gui_init() sets the real one */
     window_order[window_count] = idx;
     window_count++;
     return idx;
@@ -570,26 +573,36 @@ static int SY(int v) {
 }
 
 void gui_init(void) {
-    add_window(SX(120), SY(90), 340, 190, "About ZapOS", "ABT",
+    svgicon_init();
+
+    int about = add_window(SX(120), SY(90), 340, 190, "About ZapOS", "ABT",
                "A fully custom 32-bit OS kernel",
                "GUI + drivers written from scratch", 0x3E6FF0);
+    windows[about].icon_id = ICON_ABOUT;
+
     int sys = add_window(SX(560), SY(160), 300, 170, "System Monitor", "SYS",
                "Kernel heap + paging: online",
                "PS/2 keyboard + mouse: online", 0x2FBF71);
     windows[sys].is_smp_monitor = 1;
-    add_window(SX(260), SY(340), 320, 150, "Roadmap", "MAP",
+    windows[sys].icon_id = ICON_SYSTEM;
+
+    int roadmap = add_window(SX(260), SY(340), 320, 150, "Roadmap", "MAP",
                "Next up: process isolation + a filesystem",
                "See README.md for the plan", 0xE0954C);
+    windows[roadmap].icon_id = ICON_ROADMAP;
 
     int pm = add_window(SX(640), SY(420), 320, 190, "Process Monitor", "PROC", NULL, NULL, 0xB05CE0);
     windows[pm].is_process_monitor = 1;
+    windows[pm].icon_id = ICON_PROCESS;
 
     int net = add_window(SX(120), SY(460), 340, 190, "Network", "NET", NULL, NULL, 0x3ED0D8);
     windows[net].is_network = 1;
+    windows[net].icon_id = ICON_NETWORK;
 
     if (fat32_is_mounted()) {
         int fm = add_window(SX(480), SY(560), 380, 220, "File Manager", "FILE", NULL, NULL, 0xF2C14E);
         windows[fm].is_file_manager = 1;
+        windows[fm].icon_id = ICON_FILES;
         fm_current_dir = fat32_root_cluster();
         fm_refresh();
     }
@@ -598,6 +611,7 @@ void gui_init(void) {
         js_set_binary_fetcher(br_wasm_fetch);
         int br = add_window(SX(600), SY(60), 500, 500, "Browser", "WWW", NULL, NULL, 0x62D8FF);
         windows[br].is_browser = 1;
+        windows[br].icon_id = ICON_BROWSER;
         br_window_idx = br;
         br_tab_open();
     }
@@ -605,6 +619,7 @@ void gui_init(void) {
     if (fat32_is_mounted()) {
         int term = add_window(SX(680), SY(540), 460, 210, "Terminal", "TERM", NULL, NULL, 0x4CD980);
         windows[term].is_terminal = 1;
+        windows[term].icon_id = ICON_TERMINAL;
         term_cwd = fat32_root_cluster();
         term_print("ZapOS terminal -- type 'help' for commands\n");
     }
@@ -2096,26 +2111,47 @@ static void draw_shadow(int x, int y, int w, int h) {
     }
 }
 
+/* Window/badge corner radius, shared by draw_window()'s nested-rounded-
+ * rect trick and draw_taskbar_icon()'s badge fill, so the chrome reads
+ * as one consistent rounding across dock + titlebars. */
+#define CHROME_RADIUS 7
+
 static void draw_window(const gui_window_t *w, int focused) {
     draw_shadow(w->x, w->y, w->w, w->h);
 
-    /* title bar */
     uint32_t accent_dark = ((w->accent >> 1) & 0x7F7F7F);
-    fb_fill_gradient_v(w->x, w->y, w->w, TITLEBAR_H,
+    uint32_t border_color = focused ? w->accent : accent_dark;
+
+    /* Rounded corners: there's no rounded-stroke or rounded-gradient
+     * primitive, only fb_fill_rounded_rect (solid fill). Fake the look
+     * with two nested filled rounded rects -- a full-window-sized one in
+     * the border/accent color, then a smaller inset one (in the body
+     * color) on top -- so only the outer rect's corner arcs remain
+     * visible as a rounded frame. The gradient title bar and body content
+     * below are then drawn as ordinary rects, inset just enough that
+     * their own square corners fall inside the already-rounded frame
+     * rather than redrawing square corners over it. */
+    fb_fill_rounded_rect(w->x, w->y, w->w, w->h, CHROME_RADIUS, border_color);
+    fb_fill_rounded_rect(w->x + 2, w->y + 2, w->w - 4, w->h - 4,
+                          CHROME_RADIUS > 2 ? CHROME_RADIUS - 2 : 0, 0x1B2040);
+
+    /* title bar */
+    fb_fill_gradient_v(w->x + CHROME_RADIUS, w->y + 2, w->w - 2 * CHROME_RADIUS, TITLEBAR_H - 2,
                         focused ? w->accent : accent_dark,
                         focused ? accent_dark : (accent_dark >> 1) & 0x7F7F7F);
 
-    fb_draw_string(w->x + 10, w->y + 10, w->title, 0xFFFFFF, 1);
+    /* titlebar icon + title text, icon tinted white same as focused/open
+     * dock icons -- text shifted right to make room. */
+    int ticon_size = 16;
+    int ticon_x = w->x + 8, ticon_y = w->y + (TITLEBAR_H - ticon_size) / 2;
+    svgicon_draw((enum svg_icon_id)w->icon_id, ticon_x, ticon_y, ticon_size, 0xFFFFFF, 255);
+    fb_draw_string(ticon_x + ticon_size + 6, w->y + 10, w->title, 0xFFFFFF, 1);
 
     /* close button */
     int cbx = w->x + w->w - 20, cby = w->y + 8;
     fb_fill_rect(cbx, cby, 12, 12, 0xE05252);
     fb_draw_line(cbx + 2, cby + 2, cbx + 9, cby + 9, 0xFFFFFF);
     fb_draw_line(cbx + 9, cby + 2, cbx + 2, cby + 9, 0xFFFFFF);
-
-    /* body */
-    fb_fill_rect(w->x, w->y + TITLEBAR_H, w->w, w->h - TITLEBAR_H, 0x1B2040);
-    fb_draw_rect(w->x, w->y, w->w, w->h, focused ? w->accent : accent_dark);
 
     if (w->body_line1) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 16, w->body_line1, COL_TEXT, 1);
     if (w->body_line2) fb_draw_string(w->x + 14, w->y + TITLEBAR_H + 34, w->body_line2, COL_MUTED, 1);
@@ -2149,12 +2185,18 @@ static void draw_taskbar_icon(int slot, int focused_wi) {
 
     uint32_t bg = 0x171E38;
     if (w->open) bg = (slot == focused_wi) ? w->accent : ((w->accent >> 1) & 0x7F7F7F);
-    fb_fill_rect(ix, iy, iw, ih, bg);
-    fb_draw_rect(ix, iy, iw, ih, w->open ? w->accent : 0x2A3350);
+    fb_fill_rounded_rect(ix, iy, iw, ih, CHROME_RADIUS, bg);
 
-    int tw = fb_text_width(w->icon_label, 1);
-    fb_draw_string(ix + (iw - tw) / 2, iy + 6, w->icon_label,
-                    w->open ? 0xFFFFFF : 0x7A83A8, 1);
+    /* vector icon centered in the slot, leaving margin inside
+     * TASKBAR_ICON_W x TASKBAR_ICON_H and room below for the focus
+     * underline -- tinted white + full alpha when open/focused, muted +
+     * dimmed when closed (via alpha_scale, no second cached variant). */
+    int icon_size = 20;
+    int icx = ix + (iw - icon_size) / 2;
+    int icy = iy + (ih - icon_size) / 2 - 1;
+    uint32_t tint = w->open ? 0xFFFFFF : 0x7A83A8;
+    uint8_t alpha_scale = w->open ? 255 : 140;
+    svgicon_draw((enum svg_icon_id)w->icon_id, icx, icy, icon_size, tint, alpha_scale);
 
     if (w->open) fb_fill_rect(ix + 4, iy + ih - 4, iw - 8, 2, 0xFFFFFF);
 }

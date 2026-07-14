@@ -76,7 +76,15 @@ static void begin_subpath(void) {
 }
 
 static void add_point(int32_t x, int32_t y) {
-    if (g_npts > 0 && g_npts < MAX_POINTS) {
+    /* Dedupe only within the CURRENT subpath -- g_npts is a global point
+     * counter shared across every subpath in the icon, so comparing
+     * against g_pts[g_npts-1] unconditionally would also fire when a new
+     * subpath's first point happens to coincide with the previous
+     * subpath's last point (e.g. two touching/adjacent shapes sharing a
+     * vertex), silently dropping that subpath's first vertex and
+     * corrupting its shape. Guard by checking the current subpath
+     * already has at least one point of its own. */
+    if (g_nsub > 0 && g_npts > g_sub_start[g_nsub - 1] && g_npts < MAX_POINTS) {
         ptq8_t *last = &g_pts[g_npts - 1];
         if (last->x == x && last->y == y) return; /* dedupe consecutive dup */
     }
@@ -507,12 +515,22 @@ static const char SVG_FILES[] =
  * a vertical "meridian" lens, each built from two cubic beziers and
  * touching the circle exactly at its poles, so even-odd punches them out
  * as thin cutout lines across the solid disc (the only way to render
- * contrasting "lines" with a single alpha-mask silhouette). */
+ * contrasting "lines" with a single alpha-mask silhouette).
+ *
+ * The two lenses necessarily cross at the very center (both pass through
+ * (12,12)), and since this rasterizer only does even-odd FILL (no
+ * stroke), that crossing double-covers a small region there, which
+ * even-odd counts back "in" -- an unavoidable side effect of this
+ * fill-only cutout trick, not a bug. Kept deliberately thin (control
+ * points only 1.8 units off the pole-to-pole line, vs. an earlier, much
+ * thicker draft that made the crossing read as a solid pinwheel instead
+ * of two crossing lines) so that leftover center patch stays a small,
+ * subtle dot rather than a dominant shape. */
 static const char SVG_BROWSER[] =
     "<svg>"
     "<circle cx=\"12\" cy=\"12\" r=\"9\"/>"
-    "<path d=\"M3,12 C7,9.3 17,9.3 21,12 C17,14.7 7,14.7 3,12 Z\"/>"
-    "<path d=\"M12,3 C9.3,7 9.3,17 12,21 C14.7,17 14.7,7 12,3 Z\"/>"
+    "<path d=\"M3,12 C7,10.2 17,10.2 21,12 C17,13.8 7,13.8 3,12 Z\"/>"
+    "<path d=\"M12,3 C10.2,7 10.2,17 12,21 C13.8,17 13.8,7 12,3 Z\"/>"
     "</svg>";
 
 /* ICON_TERMINAL: the classic prompt glyph -- a thick ">" chevron plus a
