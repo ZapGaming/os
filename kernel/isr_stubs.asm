@@ -104,4 +104,14 @@ IRQ 15, 47
 ; is given DPL=3 so it's actually callable from CPL 3 (see syscall.c).
 ISR_NOERR 128
 
+; AP-local-timer gate (vector 80/0x50): fires only on whichever core has
+; actually configured+unmasked its own Local APIC LVT Timer to use this
+; vector (kernel/apic.c's apic_start_periodic_timer() -- only ever the
+; AP in this pass, never the BSP, which stays on the legacy PIT/IRQ0).
+; Same reusable ISR_NOERR stub as everything else here; the gate itself
+; is installed by kernel/apic.c directly (idt_set_gate + a dedicated
+; register_interrupt_handler call), not by kernel/idt.c's idt_init() --
+; same pattern syscall.c already uses for vector 0x80 above.
+ISR_NOERR 80
+
 section .note.GNU-stack noalloc noexec nowrite progbits

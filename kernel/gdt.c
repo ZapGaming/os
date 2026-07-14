@@ -15,7 +15,11 @@ struct gdt_ptr {
     uint32_t base;
 } __attribute__((packed));
 
-#define GDT_ENTRIES 6
+/* 7 entries: null, kernel code/data, user code/data, and now TWO TSS
+ * descriptors (index 5 = BSP's, index 6 = the AP's -- see kernel/tss.c)
+ * instead of the prior pass's one. Capped at exactly 2 TSSes/CPUs for
+ * this pass, matching kernel/smp.c only ever waking one AP. */
+#define GDT_ENTRIES 7
 
 static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr   gdtp;
@@ -41,5 +45,9 @@ void gdt_init(void) {
     gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);  // user code, ring 3
     gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);  // user data, ring 3
 
+    gdt_flush((uint32_t)&gdtp);
+}
+
+void gdt_load_this_cpu(void) {
     gdt_flush((uint32_t)&gdtp);
 }

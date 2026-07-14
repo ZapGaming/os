@@ -40,12 +40,13 @@ ap_trampoline_start:
 
     ; Load OUR OWN tiny, self-contained flat GDT (defined below) --
     ; deliberately separate from the kernel's real GDT (kernel/gdt.c).
-    ; The AP only needs this to flip into 32-bit protected mode; the C
-    ; entry point below (ap_main, via kernel/apic.c) keeps running under
-    ; this same temporary GDT forever, since a parked AP that never
-    ; enters ring 3 and never takes an interrupt needs nothing the
-    ; kernel's own GDT/TSS would add (see include/kernel/smp.h's scope
-    ; note on per-CPU GDT/TSS).
+    ; The AP only needs this to flip into 32-bit protected mode: the C
+    ; entry point below (ap_main, in kernel/apic.c) immediately loads
+    ; the kernel's REAL GDT/IDT/TSS for itself (gdt_load_this_cpu() /
+    ; idt_load_this_cpu() / tss_load_ap()) as the very first thing it
+    ; does, once it's actually running -- this tiny temporary GDT's only
+    ; job is getting from 16-bit real mode to 32-bit protected mode far
+    ; enough to make that call at all.
     lgdt [gdt_ptr]
 
     mov eax, cr0

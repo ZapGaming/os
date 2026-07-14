@@ -111,9 +111,15 @@ iso: $(KERNEL) $(DISK)
 # Real ATA hardware disk still takes priority over the embedded module
 # (see kernel.c), so attaching zapos_disk.img as a second drive here
 # keeps behaving exactly as before -- persisting writes across reboots.
+#
+# -smp 2 gives kernel/smp.c a second CPU to actually wake -- on any
+# QEMU/hardware that only ever reports one, ACPI/MADT bring-up is
+# already a documented, tested no-op (see include/kernel/smp.h), so
+# this is safe to leave on unconditionally rather than gating it behind
+# a separate target.
 run: iso disk
 	qemu-system-i386 -boot order=d -cdrom $(ISO) -drive file=$(DISK),format=raw,if=ide,index=0 \
-		-serial stdio -m 512M -netdev user,id=net0 -device rtl8139,netdev=net0 -device AC97
+		-serial stdio -m 512M -smp 2 -netdev user,id=net0 -device rtl8139,netdev=net0 -device AC97
 
 # Boots zapos.iso with NO second drive at all -- proves the ISO is
 # self-contained (embedded disk image module + RAM-disk fallback).

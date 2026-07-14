@@ -35,7 +35,8 @@ void smp_init(void) {
     }
 
     serial_printf("smp: waking one AP (apic id=%u; BSP is id=%u; %u CPU(s) total reported) -- "
-                  "waking more than one AP, and real multi-core task scheduling, are explicit "
+                  "it will bring itself up as a real second scheduler participant "
+                  "(kernel/apic.c's ap_main()); waking more than one AP is still explicit "
                   "follow-on work, not attempted by this pass\n",
                   ap_id, bsp_id, cpus.cpu_count);
 

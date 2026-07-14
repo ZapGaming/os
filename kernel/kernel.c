@@ -21,6 +21,7 @@
 #include <kernel/demo_user_task.h>
 #include <kernel/ping_task.h>
 #include <kernel/smp.h>
+#include <kernel/apic.h>
 #include <net/net.h>
 #include <net/dhcp.h>
 #include <drivers/ata.h>
@@ -29,6 +30,14 @@
 #include <stdint.h>
 #include <string.h>
 
+/* May run on the BSP (single-CPU boot, or if AP bring-up failed) or on
+ * the AP (see kernel_main()'s re-pin right after smp_init()) -- either
+ * way, only ONE core is ever the one incrementing it at a time
+ * (kernel/scheduler.c's cpu_affinity partitioning guarantees a given
+ * task never runs on two cores simultaneously), so this stays a safe
+ * single-writer volatile counter exactly like it always was; reading it
+ * from get_bg_counter() (the GUI, on the BSP) needs no lock for the same
+ * reason apic_ap_heartbeat() doesn't. */
 static volatile uint32_t bg_counter = 0;
 
 uint32_t get_bg_counter(void) {
@@ -122,7 +131,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     serial_printf(audio_up ? "Audio: AC97 ready\n" : "Audio: no codec found\n");
 
     scheduler_init();
-    task_create(bg_task_entry);
+    /* Kept exactly where it always was, pinned to its default
+     * (SCHED_CPU_BSP) affinity for now -- see the re-pin right after
+     * smp_init(), below, for why and when this moves to the AP. */
+    struct task *bg_task = task_create(bg_task_entry);
     task_create_user(demo_user_task_entry);
     if (net_up) task_create(ping_task_entry);
     pit_set_tick_callback(schedule);
@@ -132,17 +144,42 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
     __asm__ volatile ("sti");
     serial_printf("Interrupts enabled\n");
 
-    /* SMP bring-up MVP: detects every CPU via ACPI/MADT and, only if
-     * more than one is reported, wakes exactly one AP and proves it's
-     * genuinely running -- a clean no-op on a single-CPU boot (the
-     * default for this kernel/QEMU invocation). Needs interrupts on
-     * (pit_sleep(), used both inside apic_send_init_sipi()'s timing and
-     * smp_init()'s own proof-of-life wait, needs the timer IRQ actually
-     * firing to make progress), so it can't run any earlier than this.
-     * See include/kernel/smp.h for the full scope-cut list -- in
-     * particular, this never touches kernel/scheduler.c's
-     * schedule()/tasks[]/current_task. */
+    /* SMP bring-up: detects every CPU via ACPI/MADT and, only if more
+     * than one is reported, wakes exactly one AP -- which now (see
+     * kernel/apic.c's ap_main()) brings itself all the way up into a
+     * real, lock-protected second scheduler participant, not just a
+     * parked heartbeat loop. Still a clean no-op on a single-CPU boot
+     * (the default for this kernel/QEMU invocation unless run with
+     * `-smp 2`). Needs interrupts on (pit_sleep(), used both inside
+     * apic_send_init_sipi()'s timing and smp_init()'s own proof-of-life
+     * wait, and now also apic_start_periodic_timer()'s calibration --
+     * needs the timer IRQ actually firing to make progress), so it
+     * can't run any earlier than this. See include/kernel/smp.h for the
+     * current full scope-cut list. */
     smp_init();
+
+    /* Real cross-core scheduling proof-of-life for this pass: if (and
+     * only if) an AP actually came up -- smp_init() above already
+     * blocked long enough to prove that with a heartbeat-counter check
+     * of its own -- re-pin the pre-existing bg_task to it, so it's the
+     * BSP and the AP genuinely round-robin-scheduling two independent
+     * things at once (bg_task on the AP; everything else -- GUI,
+     * ping_task, demo_user_task -- still exclusively on the BSP).
+     * bg_task_entry only ever touches its own `bg_counter` (a single
+     * volatile uint32_t, kernel/kernel.c) -- no kmalloc/kfree, no GUI,
+     * no network, no filesystem -- which is exactly the "deliberately
+     * shared-state-free beyond the scheduler's own lock" property this
+     * pass requires of anything it schedules onto the AP. If no AP came
+     * up (single-CPU boot, or bring-up failed), bg_task simply stays on
+     * SCHED_CPU_BSP -- its default -- which is byte-for-byte this
+     * kernel's behavior before this pass. task_set_cpu_affinity() takes
+     * kernel/scheduler.c's own lock, so this is safe to call here even
+     * though interrupts are already enabled and the BSP's scheduler is
+     * already preempting concurrently. */
+    if (bg_task && apic_ap_started_count() > 0) {
+        task_set_cpu_affinity(bg_task, SCHED_CPU_AP);
+        serial_printf("kernel: bg counter task re-pinned to the AP now that it's up\n");
+    }
 
     /* Needs interrupts on (it blocks waiting for replies, same as
      * dns_resolve()) so it can't run any earlier than this -- net_init()

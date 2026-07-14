@@ -39,6 +39,13 @@ you can keep building on.
 - **Preemptive multitasking**: a real scheduler with independent kernel
   stacks per task, driven off the PIT timer interrupt — tasks are switched
   transparently, not cooperatively. See "How the scheduler works" below.
+- **Multi-core (SMP) scheduling**: on a multi-CPU host, wakes a second
+  core (an "AP") via ACPI/MADT + the Local APIC's INIT-SIPI-SIPI sequence,
+  and brings it all the way up into a real, lock-protected second
+  scheduler participant — its own GDT/TSS/IDT loads, its own calibrated
+  Local APIC timer interrupt, and its own schedulable task, genuinely
+  running in parallel with the BSP. Clean no-op on a single-CPU host. See
+  "How multi-core (SMP) scheduling works" below.
 - **Ring-3 user mode**: a TSS and an `iret`-based ring0→ring3 transition.
   A demo task genuinely executes at CPL 3 (privileged instructions like
   `in`/`out` would fault there) and runs alongside the GUI and the kernel
@@ -432,6 +439,64 @@ that calls `enter_usermode.asm` to `iret` into CPL 3 with a separate user
 stack; the kernel stack is kept around too, since the CPU needs it (via
 the TSS's `esp0`) the moment that task takes an interrupt or syscall back
 into ring 0.
+
+## How multi-core (SMP) scheduling works
+
+On boot, `kernel/smp.c` reads the ACPI MADT (`kernel/acpi.c` finds the
+RSDP → RSDT → MADT and enumerates each CPU entry's Local APIC ID). If
+only one CPU is reported — the common case for a default QEMU
+invocation, or any single-core host — this is a clean no-op: nothing
+below it ever runs, and the kernel behaves exactly as it did before SMP
+existed.
+
+If a second CPU is reported, `kernel/apic.c` wakes it with the classic
+INIT-SIPI-SIPI sequence: assert INIT, wait, deassert, then two Startup
+IPIs pointing at a real-mode trampoline (`boot/ap_trampoline.asm`)
+copied to a fixed low physical address (`0x8000`, carved out of the
+existing sub-1MB PMM reservation). That trampoline's only job is
+flipping into 32-bit protected mode under its own tiny temporary GDT
+and calling into `ap_main()` — the AP's actual C entry point, and the
+only kernel code that ever runs on that second core.
+
+`ap_main()` immediately abandons the trampoline's temporary GDT for the
+kernel's real one (`gdt_load_this_cpu()`), loads its own TSS
+(`tss_load_ap()` — each core now has its own TSS, since `esp0` is
+genuinely per-core state once both cores can take ring-0 transitions),
+loads the shared IDT for itself (`idt_load_this_cpu()`), software-enables
+its own Local APIC, registers its own currently-running call stack as a
+real `struct task` pinned to a new `SCHED_CPU_AP` affinity
+(`scheduler_init_ap()`), and finally calibrates and starts its own Local
+APIC timer as a periodic interrupt source before enabling interrupts.
+From that point on, the AP is a second, independent participant in
+`kernel/scheduler.c`'s round-robin scheduler — driven by its own Local
+APIC timer, never the legacy PIT the BSP still uses for IRQ0.
+
+Once `kernel/kernel.c` confirms the AP actually came up (a heartbeat
+counter observed moving across a ~2s window), it re-pins one
+pre-existing, deliberately shared-state-free background counter task to
+`SCHED_CPU_AP` — so the two cores are genuinely running independent
+tasks at once, not just idling. Everything else (GUI, networking,
+filesystem, ELF-loaded user code) stays BSP-only; this pass doesn't
+attempt to make the kernel heap, the serial UART, or any subsystem
+beyond the scheduler's own run queue safe for concurrent access from two
+cores.
+
+That run queue is the one piece of genuinely shared, concurrently-mutated
+state this pass adds a lock for (`include/kernel/spinlock.h`) — a plain
+test-and-set busy-wait spinlock, `lock_acquire_irqsave`/
+`lock_release_irqrestore`, that also disables interrupts on the
+acquiring core for the duration of the critical section. That detail
+matters: some call sites into the scheduler (task creation, re-pinning
+`bg_task` to the AP) run from ordinary kernel flow with interrupts
+already enabled, not from inside an interrupt gate — without disabling
+interrupts across the lock, a timer interrupt landing on the same core
+mid-critical-section would call `schedule()`, which would try to
+re-acquire the same lock that core already holds, and spin forever.
+
+Scope cuts, deliberately: only ever one AP is woken (not "every CPU
+reported"); no IOAPIC/inter-core IPI routing beyond the one-time wake;
+no SMP-safety work on any subsystem besides the scheduler's run queue.
+All explicit follow-on work, not attempted here.
 
 ## How FPU support works
 

@@ -110,6 +110,10 @@ void idt_init(void) {
     idt_flush((uint32_t)&idtp);
 }
 
+void idt_load_this_cpu(void) {
+    idt_flush((uint32_t)&idtp);
+}
+
 /* Called from the asm stubs' common handler */
 void isr_dispatch(struct registers *regs) {
     /* EOI must be sent before the handler runs, not after: a handler is
