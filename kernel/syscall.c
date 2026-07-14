@@ -4,6 +4,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/serial.h>
 #include <kernel/pit.h>
+#include <kernel/ipc.h>
 #include <drivers/keyboard.h>
 #include <gui/compositor.h>
 #include <string.h>
@@ -79,6 +80,51 @@ static void syscall_handler(struct registers *regs) {
              * still fault (safely contained -- see kernel/exceptions.c
              * -- just this task, not the kernel). */
             gui_blit_fullscreen((const uint32_t *)regs->ebx, scheduler_current()->pid);
+            regs->eax = 0;
+            break;
+        case SYS_IPC_OPEN:
+            /* `ebx` is a pointer into the CALLING task's own address
+             * space -- same "syscall trap doesn't touch CR3" reasoning
+             * as SYS_WRITE/SYS_BLIT above, so it means exactly what the
+             * caller thinks it means even for an isolated ELF task with
+             * its own private directory. ipc_open() only ever reads it
+             * (strlen/strcmp against the channel table), never keeps
+             * the pointer itself past this call, so there's nothing
+             * further to guard here. */
+            regs->eax = (uint32_t)ipc_open((const char *)regs->ebx);
+            break;
+        case SYS_IPC_SEND: {
+            /* Blocking send: retries the non-blocking ipc_try_send()
+             * (kernel/ipc.c) via schedule() until the channel's queue
+             * has room -- the exact same "loop schedule() from inside
+             * the interrupt-gate handler" idiom SYS_SLEEP uses above,
+             * just polling a queue slot instead of pit_ticks(). `ecx`
+             * is, again, a pointer in the CALLER's own address space;
+             * ipc_try_send() copies the bytes out of it into the
+             * channel's queue immediately, so nothing here needs to
+             * (or safely could) outlive this one handler invocation. */
+            int r;
+            while ((r = ipc_try_send((int)regs->ebx, (const void *)regs->ecx, regs->edx)) == 0) schedule();
+            regs->eax = (r < 0) ? (uint32_t)-1 : 0;
+            break;
+        }
+        case SYS_IPC_RECV: {
+            /* Blocking receive: mirrors SYS_IPC_SEND, retrying
+             * ipc_try_recv() until a message is queued. `ecx` is once
+             * more the calling task's own pointer -- ipc_try_recv()
+             * writes straight into it, so the bytes land in whichever
+             * address space (kernel or a specific isolated user task's
+             * own directory) is actually loaded right now, which is
+             * always the caller's, for the same CR3-doesn't-change
+             * reason as every other syscall here. */
+            uint32_t out_len = 0;
+            int r;
+            while ((r = ipc_try_recv((int)regs->ebx, (void *)regs->ecx, regs->edx, &out_len)) == 0) schedule();
+            regs->eax = (r < 0) ? (uint32_t)-1 : out_len;
+            break;
+        }
+        case SYS_IPC_CLOSE:
+            ipc_close((int)regs->ebx);
             regs->eax = 0;
             break;
         case SYS_EXIT:

@@ -18,6 +18,7 @@
 #include <kernel/exceptions.h>
 #include <kernel/tss.h>
 #include <kernel/syscall.h>
+#include <kernel/ipc.h>
 #include <kernel/demo_user_task.h>
 #include <kernel/ping_task.h>
 #include <kernel/smp.h>
@@ -129,6 +130,8 @@ void kernel_main(uint32_t magic, uint32_t mb_info_addr) {
 
     int audio_up = ac97_init();
     serial_printf(audio_up ? "Audio: AC97 ready\n" : "Audio: no codec found\n");
+
+    ipc_init(); /* named IPC channel table -- see kernel/ipc.c; no ordering dependency, just needs to run once before any task could plausibly call ipc_open() */
 
     scheduler_init();
     /* Kept exactly where it always was, pinned to its default

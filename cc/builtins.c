@@ -1,17 +1,18 @@
 /* Runtime support for compiled programs -- see the syscall ABI doc
  * comment on include/kernel/syscall.h. A compiled program has no libc
- * to link against (int 0x80 with 7 syscalls is *everything* it can
- * touch -- see the task brief), so these are hand-assembled function
- * bodies (using the same emit_* encoder cc/codegen.c's own codegen
- * uses) spliced into m->text before any user code, then registered
- * into m->funcs exactly like an ordinary user-defined function. That
- * means a user's `print("hi")` or `print_int(x)` call compiles through
- * the *exact same* call-site codegen as calling any function they
- * wrote themselves (see gen_call() in cc/codegen.c) -- nothing about
- * calling a builtin is special-cased at the call site.
+ * to link against (int 0x80 is *everything* it can touch -- see the
+ * task brief), so these are hand-assembled function bodies (using the
+ * same emit_* encoder cc/codegen.c's own codegen uses) spliced into
+ * m->text before any user code, then registered into m->funcs exactly
+ * like an ordinary user-defined function. That means a user's
+ * `print("hi")` or `ipc_send(ch, buf, 10)` call compiles through the
+ * *exact same* call-site codegen as calling any function they wrote
+ * themselves (see gen_call() in cc/codegen.c) -- nothing about calling
+ * a builtin is special-cased at the call site.
  *
  * Provided: print(s), print_int(n), yield(), sleep(ms), get_ticks(),
- * poll_key(), exit(code) -- one thin wrapper per syscall in
+ * poll_key(), exit(code), ipc_open(name), ipc_send(id,buf,len),
+ * ipc_recv(id,buf,cap), ipc_close(id) -- one thin wrapper per syscall in
  * include/kernel/syscall.h, plus the two print variants since there's
  * no other way for a compiled program to produce output at all (no
  * libc means no sprintf/itoa either). SYS_BLIT is deliberately not
@@ -134,8 +135,77 @@ static void emit_exit(struct cc_buf *b) {
     emit_epilogue(b);
 }
 
+/* int ipc_open(char *name) -- SYS_IPC_OPEN(name). */
+static void emit_ipc_open(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_imm32(b, EAX, SYS_IPC_OPEN);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int ipc_send(int id, char *buf, int len) -- SYS_IPC_SEND(id, buf, len).
+ * Three cdecl stack args, read the same way sleep()'s single `[ebp+8]`
+ * already does, just one slot further along for each: `id` at
+ * [ebp+8], `buf` at [ebp+12], `len` at [ebp+16] -- the call site
+ * (cc/codegen.c's gen_call_args_reverse()) pushes them right-to-left,
+ * so they land at ascending offsets above the saved EBP/return address
+ * in declaration order, same as for any ordinary (non-builtin) 3-param
+ * function this compiler emits. */
+static void emit_ipc_send(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_mem(b, ECX, EBP, 12);
+    emit_mov_reg_mem(b, EDX, EBP, 16);
+    emit_mov_reg_imm32(b, EAX, SYS_IPC_SEND);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int ipc_recv(int id, char *buf, int cap) -- SYS_IPC_RECV(id, buf, cap).
+ * Same 3-param stack shape as ipc_send() above. */
+static void emit_ipc_recv(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_mem(b, ECX, EBP, 12);
+    emit_mov_reg_mem(b, EDX, EBP, 16);
+    emit_mov_reg_imm32(b, EAX, SYS_IPC_RECV);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int ipc_close(int id) -- SYS_IPC_CLOSE(id). */
+static void emit_ipc_close(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_imm32(b, EAX, SYS_IPC_CLOSE);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* `param_ptr_depths` is a `param_count`-length array (NULL when
+ * param_count == 0), one ptr_depth slot per parameter in declaration
+ * order -- e.g. ipc_send(int id, char *buf, int len) passes {0, 1, 0}.
+ *
+ * This used to be a single `int param_ptr_depth` that only ever set
+ * f->param_types[0], silently leaving every later parameter's
+ * ptr_depth at its zero-initialized default (i.e. "int") regardless of
+ * its real type -- harmless *only* by accident, and only so long as
+ * every builtin had at most one parameter. Confirmed by reading both
+ * consumers of struct cc_func.param_types before relying on that: the
+ * call-site type checker (gen_call() in cc/codegen.c) only ever compares
+ * argument COUNT against f->param_count, never any argument's type
+ * against f->param_types[i] -- so a wrong-or-missing ptr_depth there
+ * can't cause a real ipc_send(ch, buf, 10) call to mis-typecheck or
+ * mis-codegen today (confirmed by actually compiling one -- see the
+ * host-side test harness). ipc_send/ipc_recv need a SECOND parameter to
+ * be a pointer (`buf`, index 1) though, which the old single-index
+ * version could never express at all, so it's fixed here to take one
+ * ptr_depth per parameter -- correct, not just "happens not to break"
+ * -- in case anything (future type-checking, tooling, error messages)
+ * ever starts reading param_types[i] for i > 0. */
 static struct cc_func *cc_register_builtin(struct cc_module *m, const char *name, int param_count,
-                                            int param_ptr_depth, int is_void, int ret_ptr_depth) {
+                                            const int *param_ptr_depths, int is_void, int ret_ptr_depth) {
     struct cc_func *f = cc_add_func(m, name);
     if (!f) return NULL;
     f->is_builtin = 1;
@@ -144,31 +214,49 @@ static struct cc_func *cc_register_builtin(struct cc_module *m, const char *name
     f->ret_type.ptr_depth = ret_ptr_depth;
     f->ret_type.is_array = 0;
     f->param_count = param_count;
-    if (param_count > 0) f->param_types[0].ptr_depth = param_ptr_depth;
+    for (int i = 0; i < param_count; i++) {
+        f->param_types[i].ptr_depth = param_ptr_depths ? param_ptr_depths[i] : 0;
+        f->param_types[i].is_array = 0;
+    }
     return f;
 }
 
 void cc_register_builtins(struct cc_module *m) {
     struct cc_func *f;
+    static const int ptrs_1_ptr[]      = { 1 };    /* (T*) */
+    static const int ptrs_1_int[]      = { 0 };    /* (int) */
+    static const int ptrs_int_ptr_int[] = { 0, 1, 0 }; /* (int, T*, int) */
 
-    f = cc_register_builtin(m, "print", 1, 1, 1, 0);
+    f = cc_register_builtin(m, "print", 1, ptrs_1_ptr, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_print(&m->text); }
 
-    f = cc_register_builtin(m, "print_int", 1, 0, 1, 0);
+    f = cc_register_builtin(m, "print_int", 1, ptrs_1_int, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_print_int(&m->text); }
 
-    f = cc_register_builtin(m, "yield", 0, 0, 0, 0);
+    f = cc_register_builtin(m, "yield", 0, NULL, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_yield(&m->text); }
 
-    f = cc_register_builtin(m, "sleep", 1, 0, 0, 0);
+    f = cc_register_builtin(m, "sleep", 1, ptrs_1_int, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_sleep(&m->text); }
 
-    f = cc_register_builtin(m, "get_ticks", 0, 0, 0, 0);
+    f = cc_register_builtin(m, "get_ticks", 0, NULL, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_get_ticks(&m->text); }
 
-    f = cc_register_builtin(m, "poll_key", 0, 0, 0, 0);
+    f = cc_register_builtin(m, "poll_key", 0, NULL, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_poll_key(&m->text); }
 
-    f = cc_register_builtin(m, "exit", 1, 0, 1, 0);
+    f = cc_register_builtin(m, "exit", 1, ptrs_1_int, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_exit(&m->text); }
+
+    f = cc_register_builtin(m, "ipc_open", 1, ptrs_1_ptr, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_ipc_open(&m->text); }
+
+    f = cc_register_builtin(m, "ipc_send", 3, ptrs_int_ptr_int, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_ipc_send(&m->text); }
+
+    f = cc_register_builtin(m, "ipc_recv", 3, ptrs_int_ptr_int, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_ipc_recv(&m->text); }
+
+    f = cc_register_builtin(m, "ipc_close", 1, ptrs_1_int, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_ipc_close(&m->text); }
 }
