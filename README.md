@@ -64,7 +64,10 @@ you can keep building on.
 - **Windowed app graphics + a developer SDK**: any user program can open
   its own real desktop window and draw into it (`SYS_WIN_OPEN`/
   `SYS_WIN_BLIT`) — closing the old gap between plain text output and
-  hijacking the entire screen (what DOOM does). `sdk/` packages the
+  hijacking the entire screen (what DOOM does). Windows support real
+  per-pixel alpha transparency and an optional borderless style (no
+  frame, no title bar) for apps that want to float directly on the
+  desktop instead of sitting in a titled box. `sdk/` packages the
   whole syscall surface into a documented SDK — a consolidated header,
   a developer guide covering both the zero-setup in-kernel `cc`
   compiler and the full host-gcc build path, and a worked example app
@@ -904,8 +907,26 @@ desktop itself share the one global `SYS_POLL_KEY` event queue.
 `cc/builtins.c` gained matching `win_open`/`win_blit` builtins, so even
 a program built with the in-kernel `cc` compiler (no host toolchain at
 all) can open a window and draw into it — an `int buf[w*h];` array *is*
-a `uint32_t` 0xRRGGBB pixel buffer on this architecture, the same idiom
+a `uint32_t` pixel buffer on this architecture, the same idiom
 `SYS_BLIT`/DOOM already uses for its own fixed-size screen buffer.
+
+App-window pixels are `0xAARRGGBB` — the top byte is a real per-pixel
+alpha value (0-255), alpha-composited onto the desktop via
+`fb_blend_pixel()` rather than opaquely copied, for every app window,
+bordered or not (a caller that always writes alpha 255 renders exactly
+like the original always-opaque behavior — `fb_blend_pixel()`'s
+alpha=255 case is a direct `fb_put_pixel()` call, so this is provably
+pixel-identical, not just visually similar). `SYS_WIN_OPEN` also takes a
+4th argument now, a style-flags bitmask in `esi` (a syscall-argument
+register every syscall before this one just happened not to need) —
+currently one bit, `WIN_FLAG_BORDERLESS`, which skips the rounded
+frame/drop-shadow/title-bar chrome entirely, leaving only the app's own
+alpha-composited pixels visible. That's what turns this into a genuine
+**desktop pet** capability: a window with no box around it at all,
+floating directly on the wallpaper, transparent everywhere except the
+pixels the app actually draws — see `sdk/examples/aipet/aipet.c`, which
+uses exactly this to render as a free-floating face instead of a face
+inside a titled window.
 
 **The SDK itself** (`sdk/`) is aimed at anyone building an app for ZapOS
 who isn't necessarily working inside this repo: `sdk/zapos.h` is one
