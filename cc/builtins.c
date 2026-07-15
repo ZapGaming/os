@@ -12,13 +12,18 @@
  *
  * Provided: print(s), print_int(n), yield(), sleep(ms), get_ticks(),
  * poll_key(), exit(code), ipc_open(name), ipc_send(id,buf,len),
- * ipc_recv(id,buf,cap), ipc_close(id) -- one thin wrapper per syscall in
+ * ipc_recv(id,buf,cap), ipc_close(id), win_open(title,w,h),
+ * win_blit(handle,pixels) -- one thin wrapper per syscall in
  * include/kernel/syscall.h, plus the two print variants since there's
  * no other way for a compiled program to produce output at all (no
  * libc means no sprintf/itoa either). SYS_BLIT is deliberately not
  * wrapped -- it wants a raw pointer to a large fixed-size pixel
  * buffer, which is far more useful to a program that already has
- * `int screen[76800];`-style global arrays than a canned builtin. */
+ * `int screen[76800];`-style global arrays than a canned builtin.
+ * win_blit's `pixels` is exactly that same idiom, just for a much
+ * smaller, app-owned window instead of the whole screen -- an
+ * `int buf[W*H];` global array is a uint32_t 0xRRGGBB pixel buffer on
+ * this architecture, same as SYS_BLIT/DOOM already documents. */
 #include <cc/codegen.h>
 #include <cc/emit.h>
 #include <kernel/syscall.h>
@@ -183,6 +188,37 @@ static void emit_ipc_close(struct cc_buf *b) {
     emit_epilogue(b);
 }
 
+/* int win_open(char *title, int w, int h) -- SYS_WIN_OPEN(title, w, h).
+ * Three cdecl stack args, same "one slot further along per parameter"
+ * layout ipc_send()'s comment above already explains, just with the
+ * pointer first instead of second: `title` at [ebp+8], `w` at
+ * [ebp+12], `h` at [ebp+16]. Returns a window handle (>=0), or -1 if
+ * w/h are invalid or no window slot is free -- see gui/compositor.c's
+ * gui_app_window_open(). */
+static void emit_win_open(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_mem(b, ECX, EBP, 12);
+    emit_mov_reg_mem(b, EDX, EBP, 16);
+    emit_mov_reg_imm32(b, EAX, SYS_WIN_OPEN);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int win_blit(int handle, int *pixels) -- SYS_WIN_BLIT(handle, pixels).
+ * Two cdecl stack args: `handle` (from win_open) at [ebp+8], `pixels`
+ * at [ebp+12]. `pixels` must point at exactly width*height ints (see
+ * this file's header comment on the "int array as raw pixel buffer"
+ * idiom) matching the window's own w/h from win_open(). */
+static void emit_win_blit(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_mem(b, ECX, EBP, 12);
+    emit_mov_reg_imm32(b, EAX, SYS_WIN_BLIT);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
 /* `param_ptr_depths` is a `param_count`-length array (NULL when
  * param_count == 0), one ptr_depth slot per parameter in declaration
  * order -- e.g. ipc_send(int id, char *buf, int len) passes {0, 1, 0}.
@@ -226,6 +262,8 @@ void cc_register_builtins(struct cc_module *m) {
     static const int ptrs_1_ptr[]      = { 1 };    /* (T*) */
     static const int ptrs_1_int[]      = { 0 };    /* (int) */
     static const int ptrs_int_ptr_int[] = { 0, 1, 0 }; /* (int, T*, int) */
+    static const int ptrs_ptr_int_int[] = { 1, 0, 0 }; /* (T*, int, int) */
+    static const int ptrs_int_ptr[]     = { 0, 1 };    /* (int, T*) */
 
     f = cc_register_builtin(m, "print", 1, ptrs_1_ptr, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_print(&m->text); }
@@ -259,4 +297,10 @@ void cc_register_builtins(struct cc_module *m) {
 
     f = cc_register_builtin(m, "ipc_close", 1, ptrs_1_int, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_ipc_close(&m->text); }
+
+    f = cc_register_builtin(m, "win_open", 3, ptrs_ptr_int_int, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_win_open(&m->text); }
+
+    f = cc_register_builtin(m, "win_blit", 2, ptrs_int_ptr, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_win_blit(&m->text); }
 }

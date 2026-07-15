@@ -127,6 +127,26 @@ static void syscall_handler(struct registers *regs) {
             ipc_close((int)regs->ebx);
             regs->eax = 0;
             break;
+        case SYS_WIN_OPEN:
+            /* `ebx` is a pointer into the CALLING task's own address
+             * space -- same reasoning as SYS_WRITE/SYS_BLIT/SYS_IPC_OPEN
+             * above. gui_app_window_open() copies the title out of it
+             * (a bounded strncpy) immediately, before this handler
+             * returns, so there's nothing left to guard once it's back. */
+            regs->eax = (uint32_t)gui_app_window_open(scheduler_current()->pid,
+                                                       (const char *)regs->ebx,
+                                                       regs->ecx, regs->edx);
+            break;
+        case SYS_WIN_BLIT: {
+            /* `ecx` is a pointer into the CALLING task's own address
+             * space -- same reasoning as SYS_BLIT's pixel buffer above.
+             * gui_app_window_blit() memcpy's it into the window's own
+             * kernel-owned staging buffer synchronously, same as
+             * gui_blit_fullscreen() does for the fullscreen case. */
+            int r = gui_app_window_blit((int)regs->ebx, (const void *)regs->ecx);
+            regs->eax = (r < 0) ? (uint32_t)-1 : 0;
+            break;
+        }
         case SYS_EXIT:
             task_exited(); /* never returns */
             break;

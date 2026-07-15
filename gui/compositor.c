@@ -111,6 +111,70 @@ void gui_blit_fullscreen(const uint32_t *pixels, int owner_pid) {
     fs_owner_pid = owner_pid;
 }
 
+/* Windowed app graphics (SYS_WIN_OPEN/SYS_WIN_BLIT, see
+ * kernel/syscall.c): the gap between SYS_WRITE (text only) and the
+ * fullscreen takeover above (the ENTIRE screen, for DOOM) -- a normal
+ * desktop window a task draws its own pixels into, same as every
+ * built-in app here. Deliberately a small, SEPARATE, fixed-size table
+ * (APP_WINDOW_MAX slots), NOT folded into windows[]/window_order[]
+ * above: those are a compile-time-fixed set (the 8 built-in apps,
+ * created once in gui_init(), with no removal/reuse machinery at all),
+ * whereas app windows are opened and destroyed at arbitrary times by
+ * arbitrary tasks -- retrofitting that onto windows[] would risk the 8
+ * working built-in windows for no benefit. Ownership/cleanup mirrors
+ * fs_active/fs_owner_pid above exactly: each slot remembers the pid
+ * that opened it, and draw_app_windows() (called once per frame from
+ * draw_frame(), below) frees the slot the instant
+ * scheduler_task_state(owner_pid) == TASK_TERMINATED -- this is the
+ * ENTIRE cleanup mechanism. Deliberate scope cuts, all follow-on work:
+ * no SYS_WIN_CLOSE (a window only ever closes by its owner exiting),
+ * no drag support, no close button, no dock icon/taskbar entry. */
+#define APP_WINDOW_MAX       4
+#define APP_WINDOW_MAX_W     400
+#define APP_WINDOW_MAX_H     300
+#define APP_WINDOW_TITLE_MAX 24
+
+typedef struct {
+    int in_use;
+    int owner_pid;
+    uint32_t w, h;
+    char title[APP_WINDOW_TITLE_MAX];
+    uint32_t *pixels; /* kmalloc'd w*h*4 bytes, zeroed at open time */
+} app_window_t;
+
+static app_window_t app_windows[APP_WINDOW_MAX]; /* zero-initialized statically -- no in_use slot until gui_app_window_open() sets one */
+
+int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0 || w > APP_WINDOW_MAX_W || h > APP_WINDOW_MAX_H) return -1;
+
+    int slot = -1;
+    for (int i = 0; i < APP_WINDOW_MAX; i++) {
+        if (!app_windows[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    uint32_t *pixels = (uint32_t *)kmalloc(w * h * sizeof(uint32_t));
+    if (!pixels) return -1;
+    memset(pixels, 0, (size_t)w * h * sizeof(uint32_t));
+
+    app_window_t *win = &app_windows[slot];
+    win->in_use = 1;
+    win->owner_pid = owner_pid;
+    win->w = w;
+    win->h = h;
+    strncpy(win->title, title, APP_WINDOW_TITLE_MAX - 1);
+    win->title[APP_WINDOW_TITLE_MAX - 1] = 0;
+    win->pixels = pixels;
+    return slot;
+}
+
+int gui_app_window_blit(int handle, const void *pixels) {
+    if (handle < 0 || handle >= APP_WINDOW_MAX || !app_windows[handle].in_use) return -1;
+    app_window_t *win = &app_windows[handle];
+    memcpy(win->pixels, pixels, (size_t)win->w * win->h * sizeof(uint32_t));
+    return 0;
+}
+
 #define TASKBAR_ICON_W 44
 #define TASKBAR_ICON_H 32
 #define TASKBAR_ICON_GAP 6
@@ -2163,6 +2227,56 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->is_terminal) draw_terminal(w);
 }
 
+/* Draws every currently-open app window (see the app_windows[] table
+ * and gui_app_window_open()/gui_app_window_blit() above), and reclaims
+ * any whose owning task has exited -- called once per frame from
+ * draw_frame(), the exact same "poll scheduler_task_state() once a
+ * frame" pattern fs_active/fs_owner_pid already uses for SYS_BLIT's
+ * fullscreen takeover. NOT called at all while fs_active is set (see
+ * draw_frame()'s early return), matching how the fullscreen path
+ * already skips every other kind of drawing.
+ *
+ * Chrome reuses draw_window()'s nested-rounded-rect trick and
+ * CHROME_RADIUS so these read as the same visual family as the 8
+ * built-in windows, just with a fixed cascaded position (by slot
+ * index) instead of a draggable one -- no drag support, no close
+ * button, no dock icon for these in this pass (deliberate scope cuts,
+ * follow-on work: a real window manager for app windows). */
+static void draw_app_windows(void) {
+    for (int i = 0; i < APP_WINDOW_MAX; i++) {
+        app_window_t *win = &app_windows[i];
+        if (!win->in_use) continue;
+
+        if (scheduler_task_state(win->owner_pid) == TASK_TERMINATED) {
+            kfree(win->pixels);
+            memset(win, 0, sizeof(*win));
+            continue;
+        }
+
+        /* Fixed absolute offsets (NOT the SX()/SY() desktop-scaling
+         * helpers the built-in windows use) so the worst case -- slot 3,
+         * both dimensions at the APP_WINDOW_MAX_W/H cap -- still lands
+         * safely clear of the taskbar even on the smallest resolution
+         * this kernel supports (1024x768, where SX()/SY() are a no-op):
+         * x_max = 40+3*30+404 = 534 <= 1024; y_max = 40+3*30+334 = 464,
+         * comfortably above a 1024x768 desktop's taskbar top at 724. */
+        int x = 40 + i * 30;
+        int y = 40 + i * 30;
+        int w = (int)win->w + 4;  /* +4 = the 2px inset border on each side, matching draw_window()'s nested-rect trick */
+        int h = (int)win->h + TITLEBAR_H + 6;
+
+        draw_shadow(x, y, w, h);
+        fb_fill_rounded_rect(x, y, w, h, CHROME_RADIUS, 0x3E6FF0);
+        fb_fill_rounded_rect(x + 2, y + 2, w - 4, h - 4,
+                              CHROME_RADIUS > 2 ? CHROME_RADIUS - 2 : 0, 0x1B2040);
+        fb_fill_gradient_v(x + CHROME_RADIUS, y + 2, w - 2 * CHROME_RADIUS, TITLEBAR_H - 2,
+                            0x3E6FF0, 0x1F3878);
+        fb_draw_string(x + 10, y + 10, win->title, 0xFFFFFF, 1);
+
+        fb_blit_rgb(x + 2, y + TITLEBAR_H + 2, (int)win->w, (int)win->h, win->pixels, (int)win->w, (int)win->h);
+    }
+}
+
 /* Geometry for the taskbar icon of windows[slot] -- shared between drawing
  * and click hit-testing so they can never drift apart. */
 static void taskbar_icon_rect(int slot, int *ix, int *iy, int *iw, int *ih) {
@@ -2259,6 +2373,8 @@ static void draw_frame(int mx, int my) {
         if (!windows[wi].open) continue;
         draw_window(&windows[wi], i == top_open_pos);
     }
+
+    draw_app_windows();
 
     draw_taskbar(top_open_pos >= 0 ? window_order[top_open_pos] : -1);
     draw_cursor(mx, my);
