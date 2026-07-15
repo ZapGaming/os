@@ -132,8 +132,8 @@ different source-level spellings of it.
 | 8 | `zos_ipc_send(id,buf,len)` | `ipc_send(id,buf,len)` | id, buffer, length (≤256) | 0, or -1 | blocking send of one message |
 | 9 | `zos_ipc_recv(id,buf,cap)` | `ipc_recv(id,buf,cap)` | id, buffer, capacity | actual message length, or -1 | blocking receive (FIFO), truncates to `cap` if the message is bigger |
 | 10 | `zos_ipc_close(id)` | `ipc_close(id)` | id | 0 (always) | leaves a channel; frees it once every opener has left |
-| 11 | `zos_win_open(title,w,h)` | `win_open(title,w,h)` | title string, width, height (≤400×300) | handle ≥0, or -1 | opens this task's own desktop window |
-| 12 | `zos_win_blit(handle,px)` | `win_blit(handle,px)` | handle, pixel buffer (w×h 0xRRGGBB) | 0, or -1 | redraws that window with new pixel contents |
+| 11 | `zos_win_open(title,w,h,flags)` | `win_open(title,w,h,flags)` | title string, width, height (≤400×300), style flags (`ZOS_WIN_BORDERLESS` bit, or 0) | handle ≥0, or -1 | opens this task's own desktop window, bordered or (with the flag) a chrome-less floating one |
+| 12 | `zos_win_blit(handle,px)` | `win_blit(handle,px)` | handle, pixel buffer (w×h 0xAARRGGBB, top byte = alpha) | 0, or -1 | redraws that window with new pixel contents, alpha-composited onto the desktop |
 
 Note on #6: `zos_blit_fullscreen()` is deliberately *not* given a `cc`
 builtin — it wants a raw pointer to a large fixed-size pixel buffer,
@@ -154,9 +154,31 @@ app (Browser, File Manager, Terminal, ...) already draws into a window
 like this; `zos_win_open()`/`zos_win_blit()` is the same capability,
 exposed to your own code.
 
-- **Pixel format:** `uint32_t`, `0x00RRGGBB` (top byte unused/zero),
-  row-major, top-to-bottom — pixel `(x, y)` lives at `buf[y*w + x]`.
-  Identical format and orientation to `zos_blit_fullscreen()`.
+- **Pixel format:** `uint32_t`, `0xAARRGGBB` — top byte is now a real
+  alpha channel (0-255), not unused padding — row-major, top-to-bottom,
+  pixel `(x, y)` lives at `buf[y*w + x]`. The compositor alpha-composites
+  every app-window pixel onto whatever's behind it (`fb_blend_pixel()`)
+  rather than opaquely copying it: alpha=0 is fully transparent (the
+  desktop/whatever's underneath shows through untouched), alpha=255 is
+  fully opaque, values in between blend proportionally. This applies to
+  *every* app window, bordered or borderless — one consistent format,
+  not two. If you don't need transparency, just set alpha=255 on every
+  pixel (`0xFF000000 | your_0xRRGGBB_color`) and it behaves exactly like
+  a plain opaque blit. **This is different from `zos_blit_fullscreen()`**,
+  which is unrelated and still `0x00RRGGBB`/opaque-only — only app
+  windows gained an alpha channel.
+- **Style flags — bordered or borderless:** `zos_win_open()`'s 4th
+  argument is a flags bitmask. `0` gives you the original window: a
+  rounded frame, a drop shadow, and a title bar with your `title` text
+  drawn in it. `ZOS_WIN_BORDERLESS` instead draws NONE of that chrome —
+  no frame, no shadow, no title bar — just your own alpha-composited
+  pixels floating directly on the desktop at the same cascaded slot
+  position a bordered window would use, with no inset/offset around it.
+  `title` is still stored (and still shows up if you later imagine a
+  taskbar entry), but a borderless window never draws it anywhere, since
+  there's no title bar for it to appear in. This is what
+  `sdk/examples/aipet/aipet.c` uses to be a real floating desktop pet
+  instead of a pet-shaped box.
 - **Size cap:** 400×300 (`ZOS_WIN_MAX_W`/`ZOS_WIN_MAX_H` in
   `sdk/zapos.h`) — this is "room for a handful of small app windows,"
   not a general-purpose windowing system. At most 4 app windows total
@@ -269,7 +291,9 @@ Manager.
 
 **Windowed graphics from the quick path, too** — `win_open`/`win_blit`
 are ordinary `cc` builtins, no special syntax needed. A minimal
-example (open a small window, fill it solid red):
+example (open a small window, fill it solid, fully-opaque red — note
+the top byte of every pixel is now alpha, so it has to be `0xFF`, not
+`0x00`, or the window renders fully transparent/invisible):
 
 ```c
 int buf[400]; /* 20x20 -- an int array IS a uint32_t pixel buffer here */
@@ -277,10 +301,10 @@ int buf[400]; /* 20x20 -- an int array IS a uint32_t pixel buffer here */
 int main() {
     int h;
     int i;
-    h = win_open("Quick Win", 20, 20);
+    h = win_open("Quick Win", 20, 20, 0); /* 0 = bordered (the default style) */
     i = 0;
     while (i < 400) {
-        buf[i] = 16711680; /* 0xFF0000 */
+        buf[i] = -65536; /* 0xFFFF0000 as a 32-bit signed int: alpha=0xFF, red=0xFF, green=blue=0x00 */
         i = i + 1;
     }
     win_blit(h, buf);
@@ -290,7 +314,10 @@ int main() {
 
 See `sdk/examples/aipet/aipet.c` for the full-path version of this same
 idea taken much further — a properly animated face, decaying state,
-and keyboard input.
+keyboard input, and (unlike the minimal example above) a real
+borderless, transparent floating desktop pet: no rectangular window box
+at all, just the face's own pixels composited straight onto the
+desktop.
 
 ## 6. Honesty / limitations section
 
@@ -332,9 +359,10 @@ Read this before you build something that assumes otherwise:
 
 - `sdk/zapos.h` — the syscall header every full-path app includes.
 - `sdk/examples/hello/hello.c` — minimal full-path example.
-- `sdk/examples/aipet/aipet.c` — the flagship "Pixel Pet" demo:
-  windowed graphics, keyboard input, timer-driven decay, all built on
-  this SDK.
+- `sdk/examples/aipet/aipet.c` — the flagship "Pixel Pet" demo: a real
+  borderless, transparent floating desktop pet (`ZOS_WIN_BORDERLESS`,
+  alpha-composited pixels, no rectangular window box), with keyboard
+  input and timer-driven decay, all built on this SDK.
 - `userprogs/user.ld` — the linker script every full-path app links
   against (shared with this repo's own sample programs — not
   SDK-specific, but required either way).

@@ -1,7 +1,10 @@
 /* "Pixel Pet" -- the flagship ZapOS SDK example. A Tamagotchi-style
- * virtual pet that lives in its own desktop window (via
- * zos_win_open()/zos_win_blit(), see sdk/zapos.h), reacts to keypresses,
- * and draws its own animated face with plain integer geometry.
+ * virtual pet that lives in its own BORDERLESS, TRANSPARENT desktop
+ * window (via zos_win_open(..., ZOS_WIN_BORDERLESS)/zos_win_blit(), see
+ * sdk/zapos.h) -- a real floating face on the desktop, no rectangular
+ * window box, no title bar, no frame: just the pet's own alpha-
+ * composited pixels. It reacts to keypresses and draws its own animated
+ * face with plain integer geometry.
  *
  * IMPORTANT, read this before assuming otherwise: the "AI" in "AI pet"
  * is a simple, fully deterministic RULE-BASED STATE MACHINE -- two
@@ -54,7 +57,8 @@
 #define LOOP_SLEEP_MS 50          /* ~20fps redraw/input-poll rate */
 
 /* The pet's whole pixel buffer -- an app window's backing store is
- * exactly a `uint32_t` 0xRRGGBB array, row-major top-to-bottom (see
+ * exactly a `uint32_t` 0xAARRGGBB array (top byte = alpha), row-major
+ * top-to-bottom (see
  * zos_win_blit()'s doc comment). Global, not a stack local: WIN_W*
  * WIN_H*4 bytes (76800) is comfortably fine as static storage but
  * would be a needlessly large stack frame. */
@@ -111,39 +115,56 @@ static void draw_mouth(int cx, int base_y, int half_width, int smile, unsigned i
 /* Redraws the whole face into `pixels` from scratch every call --
  * cheap enough at 160x120 to just always fully repaint rather than
  * track dirty regions. `hunger`/`happiness` are each 0-100 (100 =
- * great, 0 = neglected); `blinking` closes the eyes for this frame. */
+ * great, 0 = neglected); `blinking` closes the eyes for this frame.
+ *
+ * The window is borderless (see _start()'s zos_win_open() call) and
+ * every app-window pixel is now 0xAARRGGBB (top byte = alpha, see
+ * sdk/zapos.h's zos_win_blit() doc comment) -- so every color constant
+ * below explicitly carries 0xFF000000 (fully opaque) in its top byte.
+ * There is no rectangular background fill anymore: the area outside the
+ * face circle is left fully TRANSPARENT (alpha 0, RGB value irrelevant
+ * since a 0-alpha pixel is skipped outright by the compositor), so only
+ * the round face itself is ever visible, floating directly on the
+ * desktop -- no box around it. */
 static void draw_face(int hunger, int happiness, int blinking) {
     int mood = (hunger + happiness) / 2; /* 0-100, the simple rule this whole face is driven by */
 
-    /* Background: integer lerp from a reddish (mood low) to a greenish
-     * (mood high) tone -- purely linear, no easing, deliberately simple. */
-    unsigned int bg_r = (unsigned int)(100 - mood) * 180 / 100 + 40;
-    unsigned int bg_g = (unsigned int)mood * 170 / 100 + 30;
-    unsigned int bg_b = 50;
-    if (bg_r > 255) bg_r = 255;
-    if (bg_g > 255) bg_g = 255;
-    fill_rect(0, 0, WIN_W - 1, WIN_H - 1, (bg_r << 16) | (bg_g << 8) | bg_b);
+    /* Fully transparent -- color value 0 is fine, alpha 0 means it's
+     * never actually drawn (see blit_app_window_pixels() in
+     * gui/compositor.c's alpha=0 early-out). */
+    fill_rect(0, 0, WIN_W - 1, WIN_H - 1, 0);
 
     int cx = WIN_W / 2, cy = WIN_H / 2;
     int head_r = 44;
-    fill_circle(cx, cy, head_r, 0xF2D98C); /* face -- a constant warm tone regardless of mood */
+
+    /* The face circle's own base color now carries the mood signal that
+     * used to live on the (now-gone) rectangular background: the exact
+     * same integer lerp from a reddish (mood low) to a greenish (mood
+     * high) tone, same thresholds, just tinting the face instead of a
+     * background rect -- purely linear, no easing, deliberately simple. */
+    unsigned int face_r = (unsigned int)(100 - mood) * 180 / 100 + 40;
+    unsigned int face_g = (unsigned int)mood * 170 / 100 + 30;
+    unsigned int face_b = 50;
+    if (face_r > 255) face_r = 255;
+    if (face_g > 255) face_g = 255;
+    fill_circle(cx, cy, head_r, 0xFF000000 | (face_r << 16) | (face_g << 8) | face_b);
 
     int eye_dx = 16, eye_y = cy - 10;
     if (blinking) {
-        fill_rect(cx - eye_dx - 6, eye_y, cx - eye_dx + 6, eye_y + 2, 0x2A2010);
-        fill_rect(cx + eye_dx - 6, eye_y, cx + eye_dx + 6, eye_y + 2, 0x2A2010);
+        fill_rect(cx - eye_dx - 6, eye_y, cx - eye_dx + 6, eye_y + 2, 0xFF2A2010);
+        fill_rect(cx + eye_dx - 6, eye_y, cx + eye_dx + 6, eye_y + 2, 0xFF2A2010);
     } else {
-        fill_circle(cx - eye_dx, eye_y, 6, 0xFFFFFF);
-        fill_circle(cx + eye_dx, eye_y, 6, 0xFFFFFF);
-        fill_circle(cx - eye_dx, eye_y, 3, 0x1A1A1A);
-        fill_circle(cx + eye_dx, eye_y, 3, 0x1A1A1A);
+        fill_circle(cx - eye_dx, eye_y, 6, 0xFFFFFFFF);
+        fill_circle(cx + eye_dx, eye_y, 6, 0xFFFFFFFF);
+        fill_circle(cx - eye_dx, eye_y, 3, 0xFF1A1A1A);
+        fill_circle(cx + eye_dx, eye_y, 3, 0xFF1A1A1A);
     }
 
     /* Smile once mood is comfortably above the midpoint, frown once
      * comfortably below it -- a small dead zone around 50 avoids the
      * mouth flickering between the two shapes on every single tick. */
     int smile = mood > 55;
-    draw_mouth(cx, cy + 18, 18, smile, 0x2A2010);
+    draw_mouth(cx, cy + 18, 18, smile, 0xFF2A2010);
 }
 
 /* Hand-written unsigned-to-decimal, appended into `buf` starting at
@@ -177,7 +198,11 @@ static void write_status(int hunger, int happiness) {
 }
 
 void _start(void) {
-    unsigned int win = zos_win_open("Pixel Pet", WIN_W, WIN_H);
+    /* ZOS_WIN_BORDERLESS: no rounded frame, no drop shadow, no title
+     * bar -- just this pet's own alpha-composited pixels floating
+     * directly on the desktop, which is the whole point of a "desktop
+     * pet" (see sdk/zapos.h's zos_win_open() doc comment). */
+    unsigned int win = zos_win_open("Pixel Pet", WIN_W, WIN_H, ZOS_WIN_BORDERLESS);
     if (win == (unsigned int)-1) {
         zos_write("aipet: zos_win_open failed (no free window slot?)\n");
         zos_exit();

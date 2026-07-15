@@ -12,7 +12,7 @@
  *
  * Provided: print(s), print_int(n), yield(), sleep(ms), get_ticks(),
  * poll_key(), exit(code), ipc_open(name), ipc_send(id,buf,len),
- * ipc_recv(id,buf,cap), ipc_close(id), win_open(title,w,h),
+ * ipc_recv(id,buf,cap), ipc_close(id), win_open(title,w,h,flags),
  * win_blit(handle,pixels) -- one thin wrapper per syscall in
  * include/kernel/syscall.h, plus the two print variants since there's
  * no other way for a compiled program to produce output at all (no
@@ -188,18 +188,27 @@ static void emit_ipc_close(struct cc_buf *b) {
     emit_epilogue(b);
 }
 
-/* int win_open(char *title, int w, int h) -- SYS_WIN_OPEN(title, w, h).
- * Three cdecl stack args, same "one slot further along per parameter"
- * layout ipc_send()'s comment above already explains, just with the
- * pointer first instead of second: `title` at [ebp+8], `w` at
- * [ebp+12], `h` at [ebp+16]. Returns a window handle (>=0), or -1 if
- * w/h are invalid or no window slot is free -- see gui/compositor.c's
- * gui_app_window_open(). */
+/* int win_open(char *title, int w, int h, int flags) --
+ * SYS_WIN_OPEN(title, w, h, flags). Four cdecl stack args, same "one
+ * slot further along per parameter" layout ipc_send()'s comment above
+ * already explains, just with the pointer first instead of second:
+ * `title` at [ebp+8], `w` at [ebp+12], `h` at [ebp+16], `flags` at
+ * [ebp+20]. `flags` is a WIN_FLAG_* bitmask (include/kernel/syscall.h)
+ * -- 0 for the original bordered/opaque-chrome window, or
+ * WIN_FLAG_BORDERLESS for a chrome-less floating window (a caller using
+ * this builtin has no #include, so it has to spell out the literal bit
+ * value itself, same as every other builtin constant here). Loaded into
+ * ESI (the 4th syscall argument register -- see kernel/syscall.c's
+ * SYS_WIN_OPEN handler), not one of EBX/ECX/EDX, since those three are
+ * already spoken for by title/w/h. Returns a window handle (>=0), or -1
+ * if w/h are invalid or no window slot is free -- see
+ * gui/compositor.c's gui_app_window_open(). */
 static void emit_win_open(struct cc_buf *b) {
     emit_prologue(b, 0);
     emit_mov_reg_mem(b, EBX, EBP, 8);
     emit_mov_reg_mem(b, ECX, EBP, 12);
     emit_mov_reg_mem(b, EDX, EBP, 16);
+    emit_mov_reg_mem(b, ESI, EBP, 20);
     emit_mov_reg_imm32(b, EAX, SYS_WIN_OPEN);
     emit_int80(b);
     emit_epilogue(b);
@@ -262,8 +271,8 @@ void cc_register_builtins(struct cc_module *m) {
     static const int ptrs_1_ptr[]      = { 1 };    /* (T*) */
     static const int ptrs_1_int[]      = { 0 };    /* (int) */
     static const int ptrs_int_ptr_int[] = { 0, 1, 0 }; /* (int, T*, int) */
-    static const int ptrs_ptr_int_int[] = { 1, 0, 0 }; /* (T*, int, int) */
     static const int ptrs_int_ptr[]     = { 0, 1 };    /* (int, T*) */
+    static const int ptrs_ptr_int_int_int[] = { 1, 0, 0, 0 }; /* (T*, int, int, int) */
 
     f = cc_register_builtin(m, "print", 1, ptrs_1_ptr, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_print(&m->text); }
@@ -298,7 +307,7 @@ void cc_register_builtins(struct cc_module *m) {
     f = cc_register_builtin(m, "ipc_close", 1, ptrs_1_int, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_ipc_close(&m->text); }
 
-    f = cc_register_builtin(m, "win_open", 3, ptrs_ptr_int_int, 0, 0);
+    f = cc_register_builtin(m, "win_open", 4, ptrs_ptr_int_int_int, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_win_open(&m->text); }
 
     f = cc_register_builtin(m, "win_blit", 2, ptrs_int_ptr, 0, 0);

@@ -34,8 +34,22 @@
  * becomes TASK_TERMINATED (checked once per frame, mirroring
  * SYS_BLIT's fs_active/fs_owner_pid cleanup below) -- there is no
  * SYS_WIN_CLOSE in this pass. */
-#define SYS_WIN_OPEN  11 /* ebx = pointer to a NUL-terminated title string, ecx = width, edx = height (both capped, see APP_WINDOW_MAX_W/H in gui/compositor.c); returns a window handle (>=0) in eax, or (uint32_t)-1 if w/h are invalid (0, or over the cap) or no free slot exists */
-#define SYS_WIN_BLIT  12 /* ebx = window handle from SYS_WIN_OPEN, ecx = pointer to a caller-owned width*height uint32_t 0xRRGGBB buffer (row-major, top-to-bottom -- same format SYS_BLIT/fb_blit_rgb already use), matching the window's own w/h; returns 0 in eax, or (uint32_t)-1 for an invalid/closed handle */
+#define SYS_WIN_OPEN  11 /* ebx = pointer to a NUL-terminated title string, ecx = width, edx = height (both capped, see APP_WINDOW_MAX_W/H in gui/compositor.c), esi = style flags bitmask (see WIN_FLAG_* below); returns a window handle (>=0) in eax, or (uint32_t)-1 if w/h are invalid (0, or over the cap) or no free slot exists */
+#define SYS_WIN_BLIT  12 /* ebx = window handle from SYS_WIN_OPEN, ecx = pointer to a caller-owned width*height uint32_t 0xAARRGGBB buffer (row-major, top-to-bottom -- top byte is now alpha, 0-255, alpha-composited onto the desktop rather than opaquely copied -- see fb_blend_pixel()/draw_app_windows() in gui/compositor.c), matching the window's own w/h; returns 0 in eax, or (uint32_t)-1 for an invalid/closed handle */
+
+/* SYS_WIN_OPEN style flag bits (the `esi` argument above). Only one bit
+ * defined so far: WIN_FLAG_BORDERLESS drops the rounded frame/drop-
+ * shadow/title-bar chrome draw_app_windows() (gui/compositor.c) would
+ * otherwise draw around the window, so only the app's own alpha-
+ * composited pixels ever show -- e.g. a "desktop pet" that wants to
+ * float directly on the wallpaper instead of sitting inside a titled
+ * box. flags=0 (i.e. omitting this bit) is the original, unchanged
+ * bordered/opaque-chrome behavior every existing app-window user still
+ * gets. This bit's VALUE must match sdk/zapos.h's ZOS_WIN_BORDERLESS
+ * exactly -- there is no shared header across the kernel/SDK boundary,
+ * so the two are kept in sync by hand (same pattern the SYS_WIN_OPEN/
+ * ZOS_SYS_WIN_OPEN syscall numbers above already use). */
+#define WIN_FLAG_BORDERLESS (1u << 0)
 
 /* Fixed resolution SYS_BLIT always copies -- matches the original DOOM's
  * internal resolution. Not user-configurable: the syscall has no way to

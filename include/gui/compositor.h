@@ -22,15 +22,26 @@ void gui_blit_fullscreen(const uint32_t *pixels, int owner_pid);
  * from the compile-time-fixed windows[]/window_order[] the 8 built-in
  * apps use). `title` is copied into the slot (bounded, truncated if
  * too long); `w`/`h` must both be > 0 and within APP_WINDOW_MAX_W/H, or
- * this fails. Returns a window handle (the slot index, >= 0) on
- * success, or -1 if `w`/`h` are invalid, no free slot exists, or the
- * backing pixel buffer's kmalloc() fails. */
-int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h);
+ * this fails. `flags` is a bitmask of WIN_FLAG_* (see
+ * include/kernel/syscall.h) -- currently just WIN_FLAG_BORDERLESS,
+ * which drops the rounded frame/shadow/title bar draw_app_windows()
+ * would otherwise draw, leaving only the app's own alpha-composited
+ * pixels visible (a floating "desktop pet" window, not a titled box);
+ * flags=0 is the original bordered/opaque-chrome behavior. `title` is
+ * still stored either way, but a borderless window never draws it
+ * anywhere -- there is no title bar for it to appear in. Returns a
+ * window handle (the slot index, >= 0) on success, or -1 if `w`/`h` are
+ * invalid, no free slot exists, or the backing pixel buffer's
+ * kmalloc() fails. */
+int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h, uint32_t flags);
 
 /* Called from kernel/syscall.c's SYS_WIN_BLIT handler: copies exactly
- * that window's own w*h uint32_t 0xRRGGBB pixels (row-major, top-to-
- * bottom) from `pixels` into its kernel-owned backing buffer, drawn on
- * the next frame by draw_app_windows(). Returns 0 on success, -1 if
+ * that window's own w*h uint32_t 0xAARRGGBB pixels (row-major, top-to-
+ * bottom -- top byte is alpha, 0-255) from `pixels` into its kernel-
+ * owned backing buffer, alpha-composited onto the desktop on the next
+ * frame by draw_app_windows() (via fb_blend_pixel()) rather than
+ * opaquely copied -- this applies to EVERY app window, bordered or
+ * borderless, one consistent pixel format. Returns 0 on success, -1 if
  * `handle` is out of range or not currently open. */
 int gui_app_window_blit(int handle, const void *pixels);
 

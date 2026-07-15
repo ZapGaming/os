@@ -132,10 +132,14 @@ static void syscall_handler(struct registers *regs) {
              * space -- same reasoning as SYS_WRITE/SYS_BLIT/SYS_IPC_OPEN
              * above. gui_app_window_open() copies the title out of it
              * (a bounded strncpy) immediately, before this handler
-             * returns, so there's nothing left to guard once it's back. */
+             * returns, so there's nothing left to guard once it's back.
+             * `esi` is the new 4th argument (style flags, see
+             * WIN_FLAG_BORDERLESS in include/kernel/syscall.h) -- populated
+             * by the `pusha` in kernel/isr_stubs.asm's isr_common_stub,
+             * same as every other field struct registers already exposes. */
             regs->eax = (uint32_t)gui_app_window_open(scheduler_current()->pid,
                                                        (const char *)regs->ebx,
-                                                       regs->ecx, regs->edx);
+                                                       regs->ecx, regs->edx, regs->esi);
             break;
         case SYS_WIN_BLIT: {
             /* `ecx` is a pointer into the CALLING task's own address

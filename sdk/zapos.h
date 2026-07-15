@@ -17,7 +17,9 @@
  * How a syscall works, mechanically: `int $0x80` traps to ring 0 with
  * the syscall number in `eax` and up to three arguments in `ebx`/`ecx`/
  * `edx` (kernel/idt.h's `struct registers` exposes exactly those three
- * general-purpose registers to the handler). A pointer argument (a
+ * general-purpose registers to the handler) -- `zos_win_open()` below is
+ * the one exception, with a 4th argument in `esi` (also exposed by
+ * `struct registers`, just unused by every syscall before it). A pointer argument (a
  * string, a pixel buffer, an IPC message buffer) is a raw pointer into
  * YOUR OWN address space -- safe to pass directly, because a syscall
  * trap doesn't switch CR3, so the kernel handler runs with your
@@ -68,6 +70,17 @@
  * doc comment. Matches gui/compositor.c's APP_WINDOW_MAX_W/H exactly. */
 #define ZOS_WIN_MAX_W 400
 #define ZOS_WIN_MAX_H 300
+
+/* zos_win_open()'s `flags` bitmask -- see that function's doc comment.
+ * Only one bit defined so far: a chrome-less window, just your own
+ * alpha-composited pixels floating directly on the desktop (no rounded
+ * frame, no drop shadow, no title bar) -- e.g. a "desktop pet" that
+ * shouldn't look like it's sitting inside a titled box. This bit's
+ * VALUE must match include/kernel/syscall.h's WIN_FLAG_BORDERLESS
+ * exactly -- there's no shared header across the kernel/SDK boundary,
+ * so the two copies are kept in sync by hand (same pattern the raw
+ * syscall numbers above already use). */
+#define ZOS_WIN_BORDERLESS (1u << 0)
 
 /* -------------------------------------------------------------------- */
 
@@ -195,8 +208,7 @@ static inline void zos_ipc_close(int id) {
 /* Opens a normal desktop window this task owns -- the gap between
  * zos_write() (text only) and zos_blit_fullscreen() (the ENTIRE
  * screen): a window drawn on the regular windowed desktop alongside
- * the Browser/File Manager/Terminal/etc., with its own rounded chrome
- * and title bar, that YOUR pixels go into.
+ * the Browser/File Manager/Terminal/etc. that YOUR pixels go into.
  *
  * `title` is a NUL-terminated string (copied into the kernel, bounded
  * to 23 characters + NUL -- longer titles are truncated, not
@@ -204,6 +216,18 @@ static inline void zos_ipc_close(int id) {
  * (400x300) -- this is a "one small window per app" feature, not a
  * general-purpose windowing system, and the cap keeps the kernel-side
  * backing buffer's size bounded.
+ *
+ * `flags` picks the window's style: 0 gives you the original window,
+ * with its own rounded chrome and title bar (`title` is drawn there).
+ * ZOS_WIN_BORDERLESS instead gives you NO frame, NO drop shadow, and NO
+ * title bar at all -- just your own alpha-composited pixels floating
+ * directly on the desktop, positioned at the same cascaded slot a
+ * bordered window would use but with no inset/offset around it. `title`
+ * is still stored either way, but a borderless window never draws it
+ * anywhere (there's no title bar for it to appear in) -- pass whatever
+ * you like, or an empty string. This is what you want for something
+ * like a "desktop pet" that shouldn't look like it's sitting inside a
+ * titled box (see sdk/examples/aipet/aipet.c).
  *
  * Returns a window handle (>= 0) to pass to zos_win_blit() below, or
  * (unsigned)-1 if `w`/`h` are invalid, or if all 4 app-window slots
@@ -216,18 +240,31 @@ static inline void zos_ipc_close(int id) {
  * (every task shares the one global zos_poll_key() queue) -- see
  * sdk/README.md's windowed-graphics section for the full, honest list
  * of what this does and doesn't do yet. */
-static inline unsigned int zos_win_open(const char *title, unsigned int w, unsigned int h) {
+static inline unsigned int zos_win_open(const char *title, unsigned int w, unsigned int h, unsigned int flags) {
     unsigned int ret;
-    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(ZOS_SYS_WIN_OPEN), "b"(title), "c"(w), "d"(h) : "memory");
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(ZOS_SYS_WIN_OPEN), "b"(title), "c"(w), "d"(h), "S"(flags) : "memory");
     return ret;
 }
 
 /* Redraws window `handle` (from zos_win_open()) with the contents of
- * `pixels`: exactly width*height uint32_t 0xRRGGBB values, row-major,
- * top-to-bottom (identical format/orientation to zos_blit_fullscreen()
- * above), where width/height are the exact w/h you passed to
+ * `pixels`: exactly width*height uint32_t 0xAARRGGBB values, row-major,
+ * top-to-bottom, where width/height are the exact w/h you passed to
  * zos_win_open() for this handle -- there's no separate size argument
  * here because the window already remembers its own size.
+ *
+ * The top byte of every pixel is now an alpha value (0-255), NOT unused
+ * padding: the compositor alpha-composites your pixels onto whatever's
+ * behind the window rather than opaquely copying them, for BOTH window
+ * styles (bordered and ZOS_WIN_BORDERLESS alike -- one consistent pixel
+ * format regardless of flags). alpha=0 is fully transparent (that pixel
+ * shows whatever's already on the desktop there -- e.g. a borderless
+ * pet's background), alpha=255 is fully opaque (identical to the old
+ * always-opaque behavior), and values in between blend proportionally.
+ * If you don't care about transparency, just set alpha=255 on every
+ * pixel (e.g. OR your 0xRRGGBB values with 0xFF000000) and every pixel
+ * renders exactly as it always did. This is DIFFERENT from
+ * zos_blit_fullscreen() above, which stays 0x00RRGGBB/opaque-only --
+ * only app windows (this syscall) gained an alpha channel.
  *
  * There is no double-buffering or vsync of any kind: call this
  * whenever your own state changes and you want the window to reflect

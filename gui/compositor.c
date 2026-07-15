@@ -139,12 +139,13 @@ typedef struct {
     int owner_pid;
     uint32_t w, h;
     char title[APP_WINDOW_TITLE_MAX];
-    uint32_t *pixels; /* kmalloc'd w*h*4 bytes, zeroed at open time */
+    uint32_t *pixels; /* kmalloc'd w*h*4 bytes, zeroed at open time; 0xAARRGGBB per pixel (top byte = alpha) */
+    int is_borderless; /* set at open time from WIN_FLAG_BORDERLESS (include/kernel/syscall.h) -- see draw_app_windows() */
 } app_window_t;
 
 static app_window_t app_windows[APP_WINDOW_MAX]; /* zero-initialized statically -- no in_use slot until gui_app_window_open() sets one */
 
-int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h) {
+int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h, uint32_t flags) {
     if (w == 0 || h == 0 || w > APP_WINDOW_MAX_W || h > APP_WINDOW_MAX_H) return -1;
 
     int slot = -1;
@@ -155,6 +156,10 @@ int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h
 
     uint32_t *pixels = (uint32_t *)kmalloc(w * h * sizeof(uint32_t));
     if (!pixels) return -1;
+    /* Zeroed -- alpha byte 0 means "fully transparent" under the new
+     * 0xAARRGGBB format, so an app window shows nothing at all until its
+     * first gui_app_window_blit(), same "blank until first draw" spirit
+     * the old opaque-black zeroed buffer had. */
     memset(pixels, 0, (size_t)w * h * sizeof(uint32_t));
 
     app_window_t *win = &app_windows[slot];
@@ -165,6 +170,7 @@ int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h
     strncpy(win->title, title, APP_WINDOW_TITLE_MAX - 1);
     win->title[APP_WINDOW_TITLE_MAX - 1] = 0;
     win->pixels = pixels;
+    win->is_borderless = (flags & WIN_FLAG_BORDERLESS) != 0;
     return slot;
 }
 
@@ -2227,6 +2233,29 @@ static void draw_window(const gui_window_t *w, int focused) {
     if (w->is_terminal) draw_terminal(w);
 }
 
+/* Alpha-composites an app window's own w*h 0xAARRGGBB pixel buffer onto
+ * the desktop at (x, y), top-left-anchored -- the replacement for the
+ * old fb_blit_rgb() opaque nearest-neighbor copy, now that the top byte
+ * is a meaningful per-pixel alpha (see gui_app_window_blit()'s doc
+ * comment in include/gui/compositor.h). alpha=0 is skipped entirely
+ * (cheap early-out for a mostly-transparent window, e.g. a borderless
+ * desktop pet's background) rather than calling fb_blend_pixel() for a
+ * no-op 0%-opacity blend; alpha=255 calls through exactly like the old
+ * opaque blit did (fb_blend_pixel() with alpha=255 fully replaces the
+ * destination pixel), so a caller that always writes alpha=255 (every
+ * existing bordered app-window user) renders pixel-identically to
+ * before this change. */
+static void blit_app_window_pixels(int x, int y, const app_window_t *win) {
+    for (uint32_t row = 0; row < win->h; row++) {
+        for (uint32_t col = 0; col < win->w; col++) {
+            uint32_t p = win->pixels[row * win->w + col];
+            uint8_t alpha = (uint8_t)(p >> 24);
+            if (alpha == 0) continue;
+            fb_blend_pixel(x + (int)col, y + (int)row, p & 0x00FFFFFF, alpha);
+        }
+    }
+}
+
 /* Draws every currently-open app window (see the app_windows[] table
  * and gui_app_window_open()/gui_app_window_blit() above), and reclaims
  * any whose owning task has exited -- called once per frame from
@@ -2236,12 +2265,18 @@ static void draw_window(const gui_window_t *w, int focused) {
  * draw_frame()'s early return), matching how the fullscreen path
  * already skips every other kind of drawing.
  *
- * Chrome reuses draw_window()'s nested-rounded-rect trick and
- * CHROME_RADIUS so these read as the same visual family as the 8
- * built-in windows, just with a fixed cascaded position (by slot
- * index) instead of a draggable one -- no drag support, no close
- * button, no dock icon for these in this pass (deliberate scope cuts,
- * follow-on work: a real window manager for app windows). */
+ * Bordered windows (flags=0, the default) reuse draw_window()'s
+ * nested-rounded-rect trick and CHROME_RADIUS so these read as the same
+ * visual family as the 8 built-in windows, just with a fixed cascaded
+ * position (by slot index) instead of a draggable one -- no drag
+ * support, no close button, no dock icon for these in this pass
+ * (deliberate scope cuts, follow-on work: a real window manager for app
+ * windows). Borderless windows (WIN_FLAG_BORDERLESS) skip every bit of
+ * that chrome -- no shadow, no rounded frame, no title bar/text -- and
+ * just alpha-composite their own pixel buffer directly at the slot's
+ * (x, y), with no inset/offset at all: the whole point is floating
+ * un-boxed pixels directly on the desktop (a "desktop pet"), not a
+ * window with an invisible border. */
 static void draw_app_windows(void) {
     for (int i = 0; i < APP_WINDOW_MAX; i++) {
         app_window_t *win = &app_windows[i];
@@ -2262,6 +2297,12 @@ static void draw_app_windows(void) {
          * comfortably above a 1024x768 desktop's taskbar top at 724. */
         int x = 40 + i * 30;
         int y = 40 + i * 30;
+
+        if (win->is_borderless) {
+            blit_app_window_pixels(x, y, win);
+            continue;
+        }
+
         int w = (int)win->w + 4;  /* +4 = the 2px inset border on each side, matching draw_window()'s nested-rect trick */
         int h = (int)win->h + TITLEBAR_H + 6;
 
@@ -2273,7 +2314,7 @@ static void draw_app_windows(void) {
                             0x3E6FF0, 0x1F3878);
         fb_draw_string(x + 10, y + 10, win->title, 0xFFFFFF, 1);
 
-        fb_blit_rgb(x + 2, y + TITLEBAR_H + 2, (int)win->w, (int)win->h, win->pixels, (int)win->w, (int)win->h);
+        blit_app_window_pixels(x + 2, y + TITLEBAR_H + 2, win);
     }
 }
 
