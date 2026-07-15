@@ -1,0 +1,28 @@
+[
+  { "id": "c001", "name": "Fireheart Ronin", "series": "Blade Chronicles", "rarity": "Common", "image": "", "flavor": "A wandering swordsman with a burning resolve." },
+  { "id": "c002", "name": "Shadow Ninja Recruit", "series": "Starlit Academy", "rarity": "Common", "image": "", "flavor": "Fresh out of the academy, sharp of eye and blade." },
+  { "id": "c003", "name": "Iron Cadet", "series": "Steel Requiem", "rarity": "Common", "image": "", "flavor": "Trained since childhood for the mech corps." },
+  { "id": "c004", "name": "Wandering Herbalist", "series": "Verdant Sky", "rarity": "Common", "image": "", "flavor": "Knows every leaf in the forest by name." },
+  { "id": "c005", "name": "Rookie Spellcaster", "series": "Arcane Drift", "rarity": "Common", "image": "", "flavor": "Still learning to control the mana surge." },
+  { "id": "c006", "name": "Street Racer Kaito", "series": "Neon Velocity", "rarity": "Common", "image": "", "flavor": "Lives for the roar of the engine." },
+
+  { "id": "u001", "name": "Crimson Blade Yuna", "series": "Blade Chronicles", "rarity": "Uncommon", "image": "", "flavor": "Her strikes leave trails of red light." },
+  { "id": "u002", "name": "Twilight Assassin", "series": "Starlit Academy", "rarity": "Uncommon", "image": "", "flavor": "Never seen twice in the same shadow." },
+  { "id": "u003", "name": "Mech Pilot Rena", "series": "Steel Requiem", "rarity": "Uncommon", "image": "", "flavor": "Synced with her unit at a 99% resonance rate." },
+  { "id": "u004", "name": "Forest Guardian Sable", "series": "Verdant Sky", "rarity": "Uncommon", "image": "", "flavor": "The trees whisper her name when danger nears." },
+  { "id": "u005", "name": "Arcane Duelist Mira", "series": "Arcane Drift", "rarity": "Uncommon", "image": "", "flavor": "Undefeated in the academy's spell circuits." },
+
+  { "id": "r001", "name": "Stormcaller Ryu", "series": "Blade Chronicles", "rarity": "Rare", "image": "", "flavor": "Thunder answers when he raises his blade." },
+  { "id": "r002", "name": "Void Walker Aiko", "series": "Starlit Academy", "rarity": "Rare", "image": "", "flavor": "Steps between shadows like they were doors." },
+  { "id": "r003", "name": "Titan Frame Zero", "series": "Steel Requiem", "rarity": "Rare", "image": "", "flavor": "A prototype that outclassed every model after it." },
+  { "id": "r004", "name": "Starlight Oracle", "series": "Arcane Drift", "rarity": "Rare", "image": "", "flavor": "Sees three seconds into every possible future." },
+
+  { "id": "e001", "name": "Dragon Emperor Kaen", "series": "Blade Chronicles", "rarity": "Epic", "image": "", "flavor": "The last of the dragonblood royals." },
+  { "id": "e002", "name": "Phantom Empress Noire", "series": "Starlit Academy", "rarity": "Epic", "image": "", "flavor": "Rules the academy's shadow council from unseen." },
+  { "id": "e003", "name": "Apex Unit Valkyrie", "series": "Steel Requiem", "rarity": "Epic", "image": "", "flavor": "Built to end the war in a single deployment." },
+
+  { "id": "l001", "name": "Celestial Sovereign Amaterasu-ka", "series": "Arcane Drift", "rarity": "Legendary", "image": "", "flavor": "Her light rewrites the rules of the arena." },
+  { "id": "l002", "name": "Eternal Blade Master Getsuga", "series": "Blade Chronicles", "rarity": "Legendary", "image": "", "flavor": "A single cut that has ended a thousand duels." },
+
+  { "id": "s001", "name": "The Nameless One", "series": "???", "rarity": "Secret", "image": "", "flavor": "No archive records this card's origin." }
+]
