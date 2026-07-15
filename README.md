@@ -61,6 +61,15 @@ you can keep building on.
   data, including two fully isolated ELF user processes (separate page
   directories) that otherwise share nothing at all. See "How IPC works"
   below.
+- **Windowed app graphics + a developer SDK**: any user program can open
+  its own real desktop window and draw into it (`SYS_WIN_OPEN`/
+  `SYS_WIN_BLIT`) — closing the old gap between plain text output and
+  hijacking the entire screen (what DOOM does). `sdk/` packages the
+  whole syscall surface into a documented SDK — a consolidated header,
+  a developer guide covering both the zero-setup in-kernel `cc`
+  compiler and the full host-gcc build path, and a worked example app
+  (a Tamagotchi-style "Pixel Pet" with an animated face, timer-driven
+  state decay, and keyboard reactions). See `sdk/README.md`.
 - **Networking**: PCI enumeration, two NIC drivers — an RTL8139 driver
   (IRQ-driven RX ring + TX descriptors, I/O-space registers) and an
   Intel 8254x ("e1000") driver (MMIO registers, descriptor rings the
@@ -864,6 +873,58 @@ alongside `ebx`'s channel id, the same way `ebx` alone already carried
 every earlier syscall's single argument. The self-hosted C compiler
 (`cc/`) gained matching builtins (`ipc_open`/`ipc_send`/`ipc_recv`/`ipc_close`)
 so a compiled program can use this directly — see `cc/builtins.c`.
+
+## How windowed app graphics + the SDK work
+
+Before this, a user program had exactly two ways to produce output:
+`SYS_WRITE` (plain text) or `SYS_BLIT` (hijack the *entire* screen,
+letterboxed, until the task exits — what DOOM uses). Nothing sat in
+between: no way for an ordinary program to get a normal desktop window
+like the Browser, File Manager, or Terminal already have. `SYS_WIN_OPEN`/
+`SYS_WIN_BLIT` (11-12) close that gap.
+
+`gui/compositor.c` keeps these in a small, separate, fixed-size table
+(`APP_WINDOW_MAX`, currently 4 slots, each capped at 400×300 pixels) —
+deliberately NOT folded into `windows[]`/`window_order[]`, the
+compile-time-fixed array the 8 built-in apps use (that array has no
+removal/reuse machinery at all, since those 8 windows are created once
+at boot and never destroyed; app windows are opened and closed by
+arbitrary tasks at arbitrary times, which would mean retrofitting real
+lifecycle management onto code that currently doesn't need it). A
+window closes itself automatically the instant its owning task's state
+becomes `TASK_TERMINATED` — checked once per frame in `draw_app_windows()`,
+exactly mirroring how `SYS_BLIT`'s fullscreen takeover already cleans
+itself up (`fs_active`/`fs_owner_pid`). There is no `SYS_WIN_CLOSE`, no
+window dragging, no close button, and no dock/taskbar icon for these in
+this pass — deliberate scope cuts, a real window manager for app
+windows (rather than a fixed cascaded position) is explicit follow-on
+work. There's also no per-window keyboard focus: every task and the
+desktop itself share the one global `SYS_POLL_KEY` event queue.
+
+`cc/builtins.c` gained matching `win_open`/`win_blit` builtins, so even
+a program built with the in-kernel `cc` compiler (no host toolchain at
+all) can open a window and draw into it — an `int buf[w*h];` array *is*
+a `uint32_t` 0xRRGGBB pixel buffer on this architecture, the same idiom
+`SYS_BLIT`/DOOM already uses for its own fixed-size screen buffer.
+
+**The SDK itself** (`sdk/`) is aimed at anyone building an app for ZapOS
+who isn't necessarily working inside this repo: `sdk/zapos.h` is one
+consolidated, fully-documented syscall header (all 13 syscalls, 0-12);
+`sdk/README.md` covers both ways to build an app (the in-kernel `cc`
+compiler for zero-setup experiments, or plain host `gcc -m32
+-ffreestanding` + `userprogs/user.ld` for full C — no special
+cross-compiler needed, the same toolchain this repo's own kernel and
+`userprogs/` samples already build with), a full syscall reference
+table, and honest limitations (no libc on either path, no filesystem
+access from user programs at all yet, one shared keyboard queue, no
+window chrome beyond the basics). `sdk/examples/aipet/aipet.c` is the
+flagship example: a Tamagotchi-style "Pixel Pet" — hunger/happiness
+state that decays on a timer and responds to feed/pet keypresses, with
+an animated face drawn entirely with integer-only geometry (a midpoint
+circle algorithm, no floats, no trig) into its own `SYS_WIN_OPEN`-ed
+window. Its own header comment (and the SDK README) is explicit that
+"AI" here means a small deterministic state machine, not a trained
+model — ZapOS has no machine-learning runtime of any kind.
 
 ## How the DOOM port works
 
