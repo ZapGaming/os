@@ -1,6 +1,6 @@
 /* ZapOS user-mode SDK -- the ONE header a real (host-gcc-built) app needs.
  *
- * Covers the entire syscall surface (numbers 0-12, see
+ * Covers the entire syscall surface (numbers 0-14, see
  * include/kernel/syscall.h in the kernel source tree -- these wrappers
  * mirror that file exactly, just with friendlier names and full
  * documentation per function). Every function here is a `static inline`
@@ -9,10 +9,17 @@
  * an oversight, it's the whole ABI a ZapOS program gets, ring-3, full
  * stop.
  *
- * ZapOS itself has NO trained-model ML runtime anywhere in it. Nothing
- * in this header (or the SDK example apps that use it, including the
- * "AI pet") talks to a neural network of any kind -- see sdk/README.md's
- * honesty section if you came here expecting that.
+ * ZapOS itself has NO trained-model ML runtime anywhere in it, and NO
+ * bundled AI/API integration of any kind -- no API keys, no built-in
+ * calls to any AI provider or web service. Nothing in this header (or
+ * the SDK example apps that use it, including the "AI pet") talks to a
+ * neural network, or to any AI service, on its own -- see sdk/README.md's
+ * honesty section if you came here expecting that. `zos_http_request()`
+ * below gives your app the GENERIC ability to make an HTTP/HTTPS
+ * request with a method/headers/body of YOUR choosing (which is exactly
+ * what's needed to call a real AI provider's API, or any other web API)
+ * -- but you supply your own endpoint and credentials; ZapOS provides
+ * none.
  *
  * How a syscall works, mechanically: `int $0x80` traps to ring 0 with
  * the syscall number in `eax` and up to three arguments in `ebx`/`ecx`/
@@ -57,6 +64,8 @@
 #define ZOS_SYS_IPC_CLOSE 10
 #define ZOS_SYS_WIN_OPEN  11
 #define ZOS_SYS_WIN_BLIT  12
+#define ZOS_SYS_WIN_MOVE  13
+#define ZOS_SYS_HTTP_REQUEST 14
 
 /* Fixed resolution zos_blit_fullscreen() always copies -- matches the
  * original DOOM's internal resolution. Not configurable: the syscall
@@ -277,6 +286,131 @@ static inline unsigned int zos_win_open(const char *title, unsigned int w, unsig
 static inline unsigned int zos_win_blit(unsigned int handle, const unsigned int *pixels) {
     unsigned int ret;
     __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(ZOS_SYS_WIN_BLIT), "b"(handle), "c"(pixels) : "memory");
+    return ret;
+}
+
+/* Repositions window `handle` (from zos_win_open()) to a new (x, y) --
+ * the piece that lets an app move its own window around at runtime
+ * instead of sitting at its fixed cascaded-by-slot-index default
+ * forever. This is what turns a desktop pet into something that
+ * actually WALKS instead of just sitting in place (see
+ * sdk/examples/aipet/aipet.c's wandering logic).
+ *
+ * `x`/`y` are plain signed pixel coordinates in the desktop's own
+ * coordinate space (the same space your window's top-left corner was
+ * placed in by zos_win_open()). There is NO screen-bounds clamping --
+ * moving your window fully or partially off-screen just renders it
+ * clipped/invisible there, exactly like any other out-of-bounds pixel
+ * write already safely does nothing; keeping your window on-screen (if
+ * you care) is entirely your own responsibility; this kernel has no
+ * "query screen resolution" syscall to check against anyway, so pick a
+ * conservative wander area if you need one (see aipet.c's fixed wander
+ * box for a worked example).
+ *
+ * Returns 0 on success, or (unsigned)-1 if `handle` is out of range or
+ * was never opened by this task. */
+static inline unsigned int zos_win_move(unsigned int handle, int x, int y) {
+    unsigned int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(ZOS_SYS_WIN_MOVE), "b"(handle), "c"(x), "d"(y) : "memory");
+    return ret;
+}
+
+/* The struct zos_http_request() below takes a pointer to. Field order
+ * and types must stay EXACTLY in sync with the kernel's own copy
+ * (include/kernel/syscall.h's `struct zos_http_request`) -- there is no
+ * shared header across the kernel/SDK boundary (same pattern every
+ * other syscall constant in this file already uses), but since both
+ * sides are compiled for the same 32-bit x86 C ABI, identical field
+ * order/types guarantees an identical memory layout, so this is safe as
+ * long as the two copies don't drift apart.
+ *
+ * Fields above the "written by the kernel" line are inputs you fill in
+ * before the call; fields below it are outputs the kernel writes back
+ * through this same struct before the syscall returns -- read them
+ * AFTER calling zos_http_request(), not before. */
+struct zos_http_request {
+    const char *host;            /* NUL-terminated hostname, e.g. "example.com" (no scheme, no path) */
+    unsigned int port;           /* 0 = default (80 for plain HTTP, 443 for TLS) */
+    unsigned int use_tls;        /* 0 = plain HTTP, 1 = HTTPS (net/tls.c's TLS 1.2 client) */
+    const char *method;          /* NUL-terminated verb, e.g. "GET" or "POST" -- used verbatim */
+    const char *path;            /* NUL-terminated request path, e.g. "/v1/messages" (include the leading '/') */
+    const char *extra_headers;   /* NULL, or NUL-terminated "Name: value\r\n..." block (see doc comment below) */
+    const void *body;            /* NULL, or a request body buffer (raw bytes, not required to be NUL-terminated) */
+    unsigned int body_len;       /* 0 if body is NULL */
+    char *response_buf;          /* YOUR buffer -- the kernel copies up to response_cap bytes of decoded response body into it */
+    unsigned int response_cap;   /* capacity of response_buf, in bytes */
+    char *content_type_buf;      /* NULL to skip, else YOUR buffer for the response's Content-Type header value */
+    unsigned int content_type_cap; /* capacity of content_type_buf, in bytes */
+    /* --- written by the kernel, read by you after the call returns --- */
+    int status_out;              /* HTTP status code (e.g. 200, 404), or 0 if the request itself failed (DNS/TCP/TLS) */
+    unsigned int response_len_out; /* actual decoded response body length copied into response_buf */
+};
+
+/* Makes a generic outbound HTTP or HTTPS request -- GET, POST, or any
+ * other method, with whatever headers and body YOU choose -- and blocks
+ * (yielding internally, exactly like zos_sleep()/zos_ipc_send()/
+ * zos_ipc_recv() already do) until the response arrives or the attempt
+ * fails. This is the ONLY way a ZapOS app can talk to the outside
+ * network beyond what the built-in Browser already does for you.
+ *
+ * BE CLEAR ABOUT WHAT THIS IS AND ISN'T: ZapOS has no bundled AI
+ * integration, ships no API key, and this function does not talk to any
+ * AI service (or any other specific service) on its own. It is generic
+ * HTTP client capability, full stop -- exactly what you need to call a
+ * real AI provider's API (or a weather API, or literally any other web
+ * API), but YOU supply your own endpoint (`req->host`/`req->path`), your
+ * own credentials (typically an `Authorization: ...` line in
+ * `req->extra_headers`), and your own request body (`req->body`). This
+ * function has no idea what service it's talking to; it just sends
+ * bytes over a socket (optionally through TLS) and hands you back
+ * whatever bytes came back.
+ *
+ * Every field of `*req` (see `struct zos_http_request` above) is an
+ * input you set before calling except `status_out`/`response_len_out`,
+ * which the kernel fills in for you to read after the call returns --
+ * writing to the same struct through the same pointer, so you see them
+ * immediately, no separate "fetch the result" step needed.
+ *
+ * `req->extra_headers`, if non-NULL, is one or more already-formatted
+ * "Header-Name: value\r\n" lines concatenated together (you build this
+ * string yourself -- there's no libc sprintf here either), e.g.
+ * `"Authorization: Bearer sk-...\r\nContent-Type: application/json\r\n"`.
+ * These are spliced into the request between this client's own standard
+ * headers (Host/User-Agent/Accept-Encoding/Cookie) and the end of the
+ * request -- this is how you supply auth/content-type/whatever else a
+ * real API needs that this client doesn't hardcode itself.
+ *
+ * `req->body`/`req->body_len`: set both to send a request body (e.g. a
+ * JSON payload for a POST) -- a Content-Length header is added
+ * automatically. Leave `body` NULL (and `body_len` 0) for a bodyless
+ * request like a plain GET.
+ *
+ * Redirects (3xx) are ONLY followed automatically when `req->method` is
+ * exactly `"GET"` -- a POST (or any other non-GET method) that hits a
+ * redirect just returns that response as-is (status code + whatever
+ * body came with it), since blindly resubmitting a POST body to a
+ * different endpoint is not correct HTTP behavior. The response cache
+ * this kernel keeps for GET requests is likewise never used for, or
+ * populated by, a non-GET request.
+ *
+ * BLOCKS: real network I/O (DNS, TCP or TLS handshake, waiting for the
+ * response) can take real wall-clock time -- this call does not return
+ * until it's done, though your task keeps yielding the CPU to others
+ * while it waits, same as zos_sleep()/zos_ipc_send()/zos_ipc_recv().
+ *
+ * Returns 0 if the request mechanically completed -- check
+ * `req->status_out` for the actual HTTP status (a non-2xx status, e.g.
+ * 404 or 500, is still a return value of 0 here; it just means the
+ * SERVER responded with an error, not that the request itself failed).
+ * Returns (unsigned)-1 if DNS resolution, the TCP connection, or the TLS
+ * handshake itself failed -- in that case `status_out` is 0. See
+ * sdk/examples/http_fetch/http_fetch.c for a complete worked example
+ * (a plain GET), and sdk/README.md's networking guide for a POST
+ * example against a real API endpoint (illustrative only -- you supply
+ * your own key). */
+static inline unsigned int zos_http_request(struct zos_http_request *req) {
+    unsigned int ret;
+    __asm__ volatile ("int $0x80" : "=a"(ret) : "a"(ZOS_SYS_HTTP_REQUEST), "b"(req) : "memory");
     return ret;
 }
 

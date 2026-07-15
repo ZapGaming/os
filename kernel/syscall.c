@@ -7,6 +7,7 @@
 #include <kernel/ipc.h>
 #include <drivers/keyboard.h>
 #include <gui/compositor.h>
+#include <net/http.h>
 #include <string.h>
 
 extern void isr128(void);
@@ -149,6 +150,94 @@ static void syscall_handler(struct registers *regs) {
              * gui_blit_fullscreen() does for the fullscreen case. */
             int r = gui_app_window_blit((int)regs->ebx, (const void *)regs->ecx);
             regs->eax = (r < 0) ? (uint32_t)-1 : 0;
+            break;
+        }
+        case SYS_WIN_MOVE: {
+            /* `ebx` = handle, `ecx`/`edx` = new x/y. Both cast to signed
+             * int -- an app might legitimately want to move slightly
+             * negative mid-bounce (see include/kernel/syscall.h's doc
+             * comment), and `struct registers`' fields are all uint32_t,
+             * so a caller's negative int arrives here as a large
+             * unsigned value that has to be reinterpreted back to
+             * signed, not clamped to 0. No pointer dereference at all in
+             * this case, unlike most syscalls here. */
+            int r = gui_app_window_move((int)regs->ebx, (int)regs->ecx, (int)regs->edx);
+            regs->eax = (r < 0) ? (uint32_t)-1 : 0;
+            break;
+        }
+        case SYS_HTTP_REQUEST: {
+            /* `ebx` is a pointer to a `struct zos_http_request` living in
+             * the CALLING task's own address space -- safe to
+             * dereference directly for the same "syscall trap doesn't
+             * change CR3" reason as every other pointer-argument syscall
+             * here. Because CR3 doesn't change for the whole duration of
+             * this handler, the struct's own pointer FIELDS (host/
+             * method/path/extra_headers/body/response_buf/
+             * content_type_buf) are ALSO still pointers into that same
+             * still-loaded address space, so they're safe to dereference
+             * too -- not just the outer struct pointer itself.
+             *
+             * host/method/path are bounds-copied into small fixed
+             * kernel-side stack buffers before use (same sizing net/
+             * http.c's own http_request() uses internally for
+             * cur_host/cur_path) -- a non-NUL-terminated or absurdly
+             * long string from a misbehaving caller just gets truncated,
+             * never overruns anything. `extra_headers`/`body`/
+             * `response_buf`/`content_type_buf` are passed straight
+             * through to http_request(), which only ever reads
+             * extra_headers/body and only ever writes up to the given
+             * *_cap bytes into the two output buffers -- no additional
+             * copying needed here.
+             *
+             * This is a BLOCKING syscall: http_request()'s own receive
+             * loop already yields (pit_sleep()) while waiting on the
+             * network, exactly like SYS_SLEEP/SYS_IPC_SEND/SYS_IPC_RECV
+             * above already block by yielding from inside their handler
+             * -- nothing new about that here, just a longer-running
+             * example of the same idiom. */
+            struct zos_http_request *req = (struct zos_http_request *)regs->ebx;
+
+            char host[128], method[16], path[512];
+            strncpy(host, req->host ? req->host : "", sizeof(host) - 1); host[sizeof(host) - 1] = 0;
+            strncpy(method, req->method ? req->method : "GET", sizeof(method) - 1); method[sizeof(method) - 1] = 0;
+            strncpy(path, req->path ? req->path : "/", sizeof(path) - 1); path[sizeof(path) - 1] = 0;
+
+            uint16_t port = (uint16_t)req->port;
+            if (port == 0) port = req->use_tls ? 443 : 80;
+
+            /* MUST re-enable interrupts before calling into http_request()
+             * below. `int 0x80` is an interrupt gate (see syscall_init()'s
+             * idt_set_gate(0x80, ..., 0xEE) -- type 0xE = interrupt gate),
+             * which clears EFLAGS.IF the instant the CPU vectors in here,
+             * and switch_task() (kernel/switch_task.asm) never saves or
+             * restores EFLAGS across a task switch -- it's a single,
+             * genuinely global CPU register in this design, not per-task
+             * state. http_request()'s receive loop waits via net/http.c's
+             * pit_sleep(), which busy-waits on a bare `hlt` (not a
+             * schedule()-loop like SYS_SLEEP/SYS_IPC_SEND/SYS_IPC_RECV
+             * above) -- and `hlt` executed with IF=0 can NEVER be woken by
+             * a maskable interrupt (the timer tick included), only by
+             * NMI/SMI/reset. Without this `sti`, the very first pit_sleep()
+             * inside http_request() halts the entire (single-core) system
+             * forever -- confirmed by an actual hang during this feature's
+             * own verification pass (EFL showed IF clear, CPU parked in
+             * `hlt`, pit_ticks() frozen). This is the exact same class of
+             * bug scheduler.c's task_exited() already documents and fixes
+             * for its own schedule()-loop -- see its comment -- just newly
+             * hit here because this is the first syscall whose blocking
+             * wait is `hlt`-based rather than schedule()-based (a
+             * schedule()-based wait can still make progress with IF
+             * momentarily 0, since OTHER tasks' own ordinary interrupt
+             * returns keep flipping the shared IF bit back to 1; a bare
+             * `hlt` has no such escape hatch since nothing else can run at
+             * all while this one CPU is parked). */
+            __asm__ volatile ("sti");
+
+            int ok = http_request(req->use_tls, host, port, method, path,
+                                   req->extra_headers, req->body, req->body_len,
+                                   &req->status_out, req->response_buf, req->response_cap,
+                                   &req->response_len_out, req->content_type_buf, req->content_type_cap);
+            regs->eax = ok ? 0 : (uint32_t)-1;
             break;
         }
         case SYS_EXIT:

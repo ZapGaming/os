@@ -898,11 +898,30 @@ window closes itself automatically the instant its owning task's state
 becomes `TASK_TERMINATED` — checked once per frame in `draw_app_windows()`,
 exactly mirroring how `SYS_BLIT`'s fullscreen takeover already cleans
 itself up (`fs_active`/`fs_owner_pid`). There is no `SYS_WIN_CLOSE`, no
-window dragging, no close button, and no dock/taskbar icon for these in
-this pass — deliberate scope cuts, a real window manager for app
-windows (rather than a fixed cascaded position) is explicit follow-on
-work. There's also no per-window keyboard focus: every task and the
-desktop itself share the one global `SYS_POLL_KEY` event queue.
+USER-driven window dragging, no close button, and no dock/taskbar icon
+for these in this pass — deliberate scope cuts, a real window manager
+for app windows is explicit follow-on work. There's also no per-window
+keyboard focus: every task and the desktop itself share the one global
+`SYS_POLL_KEY` event queue.
+
+**`SYS_WIN_MOVE` (13)** closes a different gap: the app itself
+repositioning its own window at runtime, rather than sitting forever at
+its cascaded-by-slot-index default (`40 + slot*30` for both x and y).
+`app_window_t` (`gui/compositor.c`) gained real, mutable `x`/`y` fields
+— initialized at `gui_app_window_open()` time to that exact same
+default (so nothing changes visually for a task that never calls the
+new syscall), and updated in place by `gui_app_window_move()`
+(`ebx`=handle, `ecx`/`edx`=new x/y, both cast back to signed since a
+caller might legitimately want to move slightly negative mid-bounce
+before clamping itself). `draw_app_windows()` now reads `win->x`/`win->y`
+directly instead of recomputing a position from the slot index every
+frame. There is deliberately **no screen-bounds clamping** in the
+kernel — a window moved off-screen just renders clipped/invisible,
+exactly like any other out-of-bounds `fb_put_pixel()` call already
+safely no-ops; staying on-screen is the calling app's own
+responsibility. This is the missing piece for a desktop pet that
+actually walks around — see `sdk/examples/aipet/aipet.c`, which now
+uses it for a simple bounce/patrol wander instead of sitting still.
 
 `cc/builtins.c` gained matching `win_open`/`win_blit` builtins, so even
 a program built with the in-kernel `cc` compiler (no host toolchain at
@@ -928,24 +947,122 @@ pixels the app actually draws — see `sdk/examples/aipet/aipet.c`, which
 uses exactly this to render as a free-floating face instead of a face
 inside a titled window.
 
+**`SYS_HTTP_REQUEST` (14)** gives a user app outbound HTTP(S) client
+capability — GET, POST, or any other method, with custom headers and a
+request body, not just the GET-only fetch the Browser/WASM/CSS/image
+loaders already had. Under the hood, `net/http.c`'s old GET-only
+`http_get()` was refactored into a new, general-purpose
+`http_request(use_tls, host, port, method, path, extra_headers, body,
+body_len, ...)`; `http_get()` is now a thin wrapper
+(`http_request(..., "GET", NULL, NULL, 0, ...)`) with an **unchanged**
+signature and **unchanged** wire behavior — every existing caller
+(`gui/compositor.c`'s browser page/CSS/image/WASM fetch helpers) needed
+zero changes. `extra_headers` is a caller-formatted block of
+`"Name: value\r\n"` lines spliced into the request (e.g. an
+`Authorization` or `Content-Type` header); a `body`/`body_len` appends a
+`Content-Length` header and the raw bytes instead of the old bare
+blank-line terminator. Redirects are only followed for `method ==
+"GET"` (resubmitting a POST body to a redirect target isn't correct
+HTTP semantics), and the response cache is likewise GET-only, gated
+explicitly so a cached GET response can never leak into a POST call.
+The syscall itself (`ebx` = pointer to a caller-owned
+`struct zos_http_request`, since the operation needs far more fields
+than the 5 available argument registers can hold) is a **blocking**
+call — real network I/O takes real wall-clock time, exactly like
+`SYS_SLEEP`/`SYS_IPC_SEND`/`SYS_IPC_RECV` already block by yielding
+internally. One sharp edge this surfaced and had to be fixed: `int
+0x80` is an interrupt gate, which clears `EFLAGS.IF` on entry, and
+`switch_task()` never saves/restores `EFLAGS` (a single, genuinely
+global CPU register in this design, not per-task state — see
+`kernel/scheduler.c`'s `task_exited()` for the identical class of bug
+already documented there); `net/http.c`'s receive loop waits via a bare
+`hlt` (`pit_sleep()`), which — unlike a `schedule()`-loop — can never be
+woken by a maskable interrupt (the timer included) if `IF` is clear, so
+the very first blocking wait inside a syscall-handler-called
+`http_request()` would otherwise halt the entire (single-core) system
+forever. The `SYS_HTTP_REQUEST` handler (`kernel/syscall.c`) explicitly
+re-enables interrupts (`sti`) before calling into `http_request()` to
+fix this — confirmed by an actual hang during this feature's own
+verification pass, not a hypothetical.
+
+Two more sharp edges, both found and fixed only *after* the `sti` fix
+made genuine concurrent `SYS_HTTP_REQUEST` calls actually possible:
+
+- **Shared state, one caller at a time.** `net/http.c`'s `raw_buf`/
+  `comp_buf` receive buffers and `net/tcp.c`'s single `conn` struct
+  (whose own comment says "one connection at a time — this OS only
+  ever needs one HTTP request in flight") were correct by *accident*,
+  not by design: `http_get()` had exactly one caller anywhere in this
+  codebase (the Browser), always synchronous, one request at a time.
+  `SYS_HTTP_REQUEST` breaks that assumption — any ring-3 task can call
+  it now, genuinely concurrently. `net/http.c` gained a
+  `http_lock_acquire()`/`http_lock_release()` pair around a renamed
+  `http_request_impl()` (the old `http_request()` body), using the same
+  non-blocking-check-plus-`schedule()`-loop-retry shape as
+  `kernel/ipc.c`'s `ipc_try_send()`/`ipc_try_recv()` — a plain
+  `lock_acquire_irqsave()`/`lock_release_irqrestore()` guards only the
+  flag check-and-set itself, never the whole multi-second network
+  operation (that would freeze the timer for as long as the request
+  takes). Net effect: a second caller just waits its turn instead of
+  corrupting the first caller's in-flight connection/buffers.
+- **Stack depth.** Even after the lock above, two overlapping
+  `SYS_HTTP_REQUEST` calls could still crash the kernel outright — a
+  genuine ring-0 Invalid Opcode exception, at a different EIP every
+  run. Root cause: `http_request_impl()`'s per-hop redirect loop
+  declared `char req[HTTP_REQ_HDR_BUF_SIZE]` (8192 bytes, bumped up from
+  an original 1600 when POST/custom-header support was added) and
+  `char cookie_hdr[512]` as plain stack locals, at the bottom of a
+  syscall's already-deep call chain (`isr_common_stub` →
+  `syscall_handler` → `http_request` → `http_request_impl` →
+  `dns_resolve`/`conn_connect`/`conn_send`/`conn_recv`, each with their
+  own locals) — against a 16KB `TASK_STACK_SIZE` with no guard page
+  between one kmalloc'd task stack and the next, that was enough stack
+  in one frame to overflow into a neighboring task's stack and corrupt
+  it (explaining both why a single in-flight call was always fine, and
+  why the crash address varied run to run — it depended on exactly
+  which task's stack got clobbered). Fixed by moving both buffers off
+  the stack into lazily-`kmalloc`'d static buffers (`req_buf`/
+  `cookie_hdr_buf`), exactly mirroring the existing `raw_buf`/`comp_buf`
+  pattern — safe as shared statics specifically because the `http_lock`
+  above already guarantees only one `http_request_impl()` call is ever
+  in flight at a time. Verified fixed by launching the same test ELF
+  twice concurrently, both calling `SYS_HTTP_REQUEST`, across several
+  repeated runs (the bug's non-determinism means one clean run alone
+  wouldn't prove much).
+
+**Be clear about scope, since it's an easy thing to over-read:** ZapOS
+has **no bundled AI integration** anywhere in it, ships **no API key**,
+and neither this syscall nor `net/http.c` talks to any AI provider (or
+any other specific web service) on its own. This is generic HTTP client
+capability — exactly what's needed for a ZapOS app to call a real AI
+provider's API, or any other web API that needs POST + auth headers —
+but the developer supplies their own endpoint and credentials. See
+`sdk/examples/http_fetch/http_fetch.c` for a real, runnable GET against
+example.com, plus a clearly-labeled illustrative (not executable — this
+repo has no key to test it against) comment showing the POST-with-
+Authorization-header shape a real AI API call would take.
+
 **The SDK itself** (`sdk/`) is aimed at anyone building an app for ZapOS
 who isn't necessarily working inside this repo: `sdk/zapos.h` is one
-consolidated, fully-documented syscall header (all 13 syscalls, 0-12);
+consolidated, fully-documented syscall header (all 15 syscalls, 0-14);
 `sdk/README.md` covers both ways to build an app (the in-kernel `cc`
 compiler for zero-setup experiments, or plain host `gcc -m32
 -ffreestanding` + `userprogs/user.ld` for full C — no special
 cross-compiler needed, the same toolchain this repo's own kernel and
 `userprogs/` samples already build with), a full syscall reference
-table, and honest limitations (no libc on either path, no filesystem
-access from user programs at all yet, one shared keyboard queue, no
-window chrome beyond the basics). `sdk/examples/aipet/aipet.c` is the
-flagship example: a Tamagotchi-style "Pixel Pet" — hunger/happiness
-state that decays on a timer and responds to feed/pet keypresses, with
-an animated face drawn entirely with integer-only geometry (a midpoint
-circle algorithm, no floats, no trig) into its own `SYS_WIN_OPEN`-ed
-window. Its own header comment (and the SDK README) is explicit that
+table, a networking guide, and honest limitations (no libc on either
+path, no filesystem access from user programs at all yet, one shared
+keyboard queue, no window chrome beyond the basics, no bundled AI/API
+integration). `sdk/examples/aipet/aipet.c` is the flagship example: a
+Tamagotchi-style "Pixel Pet" — hunger/happiness state that decays on a
+timer and responds to feed/pet keypresses, with an animated face drawn
+entirely with integer-only geometry (a midpoint circle algorithm, no
+floats, no trig) into its own `SYS_WIN_OPEN`-ed window, which now also
+wanders around a fixed patrol box via `SYS_WIN_MOVE` instead of sitting
+still. Its own header comment (and the SDK README) is explicit that
 "AI" here means a small deterministic state machine, not a trained
 model — ZapOS has no machine-learning runtime of any kind.
+`sdk/examples/http_fetch/http_fetch.c` demonstrates `SYS_HTTP_REQUEST`.
 
 ## How the DOOM port works
 

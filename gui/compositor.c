@@ -141,6 +141,18 @@ typedef struct {
     char title[APP_WINDOW_TITLE_MAX];
     uint32_t *pixels; /* kmalloc'd w*h*4 bytes, zeroed at open time; 0xAARRGGBB per pixel (top byte = alpha) */
     int is_borderless; /* set at open time from WIN_FLAG_BORDERLESS (include/kernel/syscall.h) -- see draw_app_windows() */
+    /* Real, mutable position -- set at open time to the same cascaded
+     * default draw_app_windows() used to compute on-the-fly from the
+     * slot index (40 + slot*30 for both), so nothing changes visually
+     * for a task that never calls SYS_WIN_MOVE. Mutable via
+     * gui_app_window_move() below (SYS_WIN_MOVE, kernel/syscall.c) --
+     * this is what lets an app (e.g. a desktop pet) reposition itself
+     * at runtime instead of sitting at one fixed spot forever. No
+     * screen-bounds clamping happens here or in draw_app_windows(): a
+     * window moved off-screen just renders clipped/invisible, same as
+     * any other out-of-bounds fb_put_pixel() call already safely
+     * no-ops -- staying on-screen is the app's own responsibility. */
+    int x, y;
 } app_window_t;
 
 static app_window_t app_windows[APP_WINDOW_MAX]; /* zero-initialized statically -- no in_use slot until gui_app_window_open() sets one */
@@ -171,6 +183,14 @@ int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h
     win->title[APP_WINDOW_TITLE_MAX - 1] = 0;
     win->pixels = pixels;
     win->is_borderless = (flags & WIN_FLAG_BORDERLESS) != 0;
+    /* Same cascaded-by-slot-index default draw_app_windows() used to
+     * compute fresh every frame (see its own comment on why this is
+     * safe even at slot 3 / max size on the smallest supported
+     * resolution) -- now baked into the window's own mutable x/y at
+     * open time instead, so the default position is unchanged but an
+     * app can move away from it afterward via gui_app_window_move(). */
+    win->x = 40 + slot * 30;
+    win->y = 40 + slot * 30;
     return slot;
 }
 
@@ -178,6 +198,16 @@ int gui_app_window_blit(int handle, const void *pixels) {
     if (handle < 0 || handle >= APP_WINDOW_MAX || !app_windows[handle].in_use) return -1;
     app_window_t *win = &app_windows[handle];
     memcpy(win->pixels, pixels, (size_t)win->w * win->h * sizeof(uint32_t));
+    return 0;
+}
+
+/* Called from kernel/syscall.c's SYS_WIN_MOVE handler: repositions an
+ * already-open app window. No screen-bounds clamping -- see app_window_t's
+ * x/y comment above. Returns 0 on success, -1 for an invalid/closed handle. */
+int gui_app_window_move(int handle, int x, int y) {
+    if (handle < 0 || handle >= APP_WINDOW_MAX || !app_windows[handle].in_use) return -1;
+    app_windows[handle].x = x;
+    app_windows[handle].y = y;
     return 0;
 }
 
@@ -2288,15 +2318,18 @@ static void draw_app_windows(void) {
             continue;
         }
 
-        /* Fixed absolute offsets (NOT the SX()/SY() desktop-scaling
-         * helpers the built-in windows use) so the worst case -- slot 3,
-         * both dimensions at the APP_WINDOW_MAX_W/H cap -- still lands
-         * safely clear of the taskbar even on the smallest resolution
-         * this kernel supports (1024x768, where SX()/SY() are a no-op):
-         * x_max = 40+3*30+404 = 534 <= 1024; y_max = 40+3*30+334 = 464,
-         * comfortably above a 1024x768 desktop's taskbar top at 724. */
-        int x = 40 + i * 30;
-        int y = 40 + i * 30;
+        /* win->x/win->y (NOT the SX()/SY() desktop-scaling helpers the
+         * built-in windows use) -- initialized by gui_app_window_open()
+         * to the same fixed cascaded default this used to recompute
+         * fresh every frame (see its own comment: worst case, slot 3 at
+         * the APP_WINDOW_MAX_W/H cap, still lands safely clear of the
+         * taskbar even on the smallest supported resolution, 1024x768),
+         * but now mutable at runtime via gui_app_window_move()
+         * (SYS_WIN_MOVE) -- e.g. a desktop pet walking around instead
+         * of sitting at that default forever. No bounds clamping here:
+         * a window moved off-screen just renders clipped/invisible. */
+        int x = win->x;
+        int y = win->y;
 
         if (win->is_borderless) {
             blit_app_window_pixels(x, y, win);

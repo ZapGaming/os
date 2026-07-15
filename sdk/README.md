@@ -62,10 +62,25 @@ The builtins this compiler gives you (called like ordinary functions —
 see `cc/builtins.c` if you want to see exactly how, they're just
 hand-emitted machine code spliced in ahead of your program): `print`,
 `print_int`, `yield`, `sleep`, `get_ticks`, `poll_key`, `exit`,
-`ipc_open`, `ipc_send`, `ipc_recv`, `ipc_close`, `win_open`, `win_blit`.
-See the syscall reference table below for what each one does — they're
-one-to-one with the syscalls `sdk/zapos.h`'s `zos_*` wrappers cover,
-just under shorter names and without the `zos_` prefix.
+`ipc_open`, `ipc_send`, `ipc_recv`, `ipc_close`, `win_open`, `win_blit`,
+`win_move`, `http_request`. See the syscall reference table below for
+what each one does — they're one-to-one with the syscalls
+`sdk/zapos.h`'s `zos_*` wrappers cover, just under shorter names and
+without the `zos_` prefix.
+
+**A caveat specific to `http_request` on this path:** the real syscall
+(`SYS_HTTP_REQUEST`) takes a pointer to a `struct zos_http_request` with
+14 fields (host, port, method, headers, body, ...) — but this
+compiler's language subset has no `struct` syntax at all (see above:
+`int`/pointers only). Using `http_request` from a `cc`-compiled program
+means hand-laying-out those 14 fields into a plain `int`/pointer array
+at the exact byte offsets the real struct uses, matching field order by
+hand with no compiler help checking you got it right — possible in
+principle (an `int` array is just raw memory here, same idiom
+`win_blit`'s pixel buffer already relies on) but genuinely awkward and
+easy to get wrong. If you want to make an HTTP request, the full gcc
+path below (with `sdk/zapos.h`'s actual `struct zos_http_request`) is
+the realistic way to do it.
 
 ### Full path: real gcc, off-device
 
@@ -114,7 +129,7 @@ like any of the built-in sample programs.
 
 ## 2. Full syscall reference
 
-Every syscall ZapOS has, as of this SDK (numbers 0–12). "cc builtin"
+Every syscall ZapOS has, as of this SDK (numbers 0–14). "cc builtin"
 is the in-kernel compiler's name for the same operation where one
 exists — both call the exact same underlying syscall, they're just two
 different source-level spellings of it.
@@ -134,6 +149,8 @@ different source-level spellings of it.
 | 10 | `zos_ipc_close(id)` | `ipc_close(id)` | id | 0 (always) | leaves a channel; frees it once every opener has left |
 | 11 | `zos_win_open(title,w,h,flags)` | `win_open(title,w,h,flags)` | title string, width, height (≤400×300), style flags (`ZOS_WIN_BORDERLESS` bit, or 0) | handle ≥0, or -1 | opens this task's own desktop window, bordered or (with the flag) a chrome-less floating one |
 | 12 | `zos_win_blit(handle,px)` | `win_blit(handle,px)` | handle, pixel buffer (w×h 0xAARRGGBB, top byte = alpha) | 0, or -1 | redraws that window with new pixel contents, alpha-composited onto the desktop |
+| 13 | `zos_win_move(handle,x,y)` | `win_move(handle,x,y)` | handle, new x, new y (signed) | 0, or -1 | repositions that window — no screen-bounds clamping, moving off-screen just clips/hides it |
+| 14 | `zos_http_request(req)` | `http_request(req)` | pointer to a `struct zos_http_request` (see section 5) | 0, or -1 | makes a blocking outbound HTTP/HTTPS request (GET/POST/any method, custom headers/body) |
 
 Note on #6: `zos_blit_fullscreen()` is deliberately *not* given a `cc`
 builtin — it wants a raw pointer to a large fixed-size pixel buffer,
@@ -143,6 +160,13 @@ which is far more directly useful to a program that already declares
 `win_blit`'s `pixels` argument uses) than a canned wrapper function
 would be. Same reasoning applies to `win_blit`'s pixel argument, which
 *is* wrapped since the window handle it also needs makes it worth one.
+
+Note on #14: `http_request`'s `cc` builtin *is* wired up (every syscall
+gets one, for consistency), but see section 1's caveat above — this
+compiler has no `struct` syntax, so using it means hand-laying-out
+`struct zos_http_request`'s 14 fields into a raw `int`/pointer array by
+hand. The full gcc path (section 5 below) is the realistic way to
+actually make an HTTP request.
 
 ## 3. Windowed graphics guide
 
@@ -198,11 +222,27 @@ exposed to your own code.
   `zos_blit_fullscreen()`'s fullscreen takeover already works: the
   kernel notices your task's state is `TASK_TERMINATED` and reclaims
   the window on its own, once per desktop frame.
-- **No dragging, no close button, no dock/taskbar icon** for app
-  windows in this version — real, current limitations, not hidden
-  ones. An app window is fixed in position (cascaded by a small offset
-  per open window, so a second and third app window don't fully
-  overlap) and can only be closed by the app itself exiting.
+- **No dragging (by the user), no close button, no dock/taskbar icon**
+  for app windows in this version — real, current limitations, not
+  hidden ones. A window still can't be closed except by the app itself
+  exiting, and the desktop user can't click-and-drag it around like the
+  8 built-in windows.
+- **The app itself CAN reposition its own window at runtime**, via
+  `zos_win_move(handle, x, y)` (`win_move` on the `cc` path) — the
+  piece that turns a fixed-cascaded-position window into something that
+  can actually move, e.g. a desktop pet that wanders instead of sitting
+  still (see `sdk/examples/aipet/aipet.c`). A window opens at the same
+  cascaded-by-slot default position as before (`40 + slot*30` for both
+  x and y) and stays there until/unless the app calls `zos_win_move()`.
+  There is **no screen-bounds clamping** — moving your window off-screen
+  (fully or partially) just renders it clipped/invisible there, exactly
+  like any other out-of-bounds pixel write already safely does nothing;
+  staying on-screen, if you care, is entirely your own responsibility.
+  There's also no "query screen resolution" syscall, so if you need to
+  bounce within a wander box, pick a conservative fixed one well inside
+  the smallest resolution this kernel supports (1024×768) rather than
+  guessing the real screen size — see aipet.c's own wander box for a
+  worked example.
 - **No per-window keyboard focus.** There is exactly **one** global
   keyboard event queue (`zos_poll_key()`), shared by the desktop itself
   and every task currently running — there's no concept of "this
@@ -246,7 +286,96 @@ each other's pid and have entirely private address spaces.
   You don't need to coordinate who "owns" cleanup — just close your own
   end when you're done with it.
 
-## 5. Getting started in 5 minutes
+## 5. Networking guide
+
+`zos_http_request()` (`SYS_HTTP_REQUEST`, #14) is what makes a ZapOS
+app able to talk to the outside world beyond the built-in Browser: a
+generic outbound HTTP or HTTPS request — GET, POST, or any other
+method, with whatever headers and body you choose.
+
+**Read this before assuming otherwise:** ZapOS has **no bundled AI
+integration** anywhere in it, ships **no API key**, and this syscall
+does not itself talk to any AI provider (or any other specific web
+service) on its own. It is generic HTTP client capability, full stop —
+exactly what's needed to call a real AI provider's chat/completions
+API, a weather API, or literally any other web API that needs POST +
+custom headers, but **you** supply your own endpoint (host/path) and
+your own credentials (typically an `Authorization: ...` header). This
+function has no idea what service it's talking to.
+
+- **What it can do:** plain HTTP or TLS 1.2 HTTPS (`use_tls`), any
+  request method (`method`, e.g. `"GET"`/`"POST"`), a block of custom
+  headers you format yourself (`extra_headers`, e.g.
+  `"Authorization: Bearer sk-...\r\nContent-Type: application/json\r\n"`),
+  and an optional raw request body (`body`/`body_len`, e.g. a JSON
+  payload for a POST). It transparently follows redirects **for GET
+  only** (never for POST — resubmitting a POST body to a redirect
+  target isn't correct HTTP behavior), sends/stores cookies, and decodes
+  chunked transfer-encoding and gzip/deflate content-encoding, same as
+  the kernel's own Browser gets from the underlying `net/http.c`.
+- **The struct-in-memory ABI.** This syscall needs far more input/
+  output fields than the 5 available registers can hold, so `ebx` is a
+  pointer to a caller-owned `struct zos_http_request` (defined in
+  `sdk/zapos.h`, mirrored byte-for-byte in the kernel's own
+  `include/kernel/syscall.h` — the two copies are kept in sync by hand,
+  same pattern every other syscall constant in this SDK already uses).
+  You fill in the input fields (`host`, `port`, `use_tls`, `method`,
+  `path`, `extra_headers`, `body`, `body_len`, `response_buf`,
+  `response_cap`, `content_type_buf`, `content_type_cap`) before the
+  call; the kernel writes `status_out` and `response_len_out` back
+  through the same pointer, which you read after the call returns.
+- **It blocks.** Real network I/O (DNS, TCP or TLS handshake, waiting
+  for bytes) takes real wall-clock time — this call does not return
+  until the request finishes or fails, exactly like
+  `zos_sleep()`/`zos_ipc_send()`/`zos_ipc_recv()` already block by
+  yielding internally rather than spinning.
+- **Return value vs. HTTP status — don't confuse the two.** The
+  syscall itself returns 0 if the request mechanically completed (DNS
+  resolved, TCP/TLS connected, a response came back) — check
+  `req.status_out` for the actual HTTP status code, which might well be
+  a 404 or 500 (that's still a return value of 0 here; the SERVER
+  responded with an error, the request itself didn't fail). It returns
+  `(unsigned)-1` only if DNS resolution, the TCP connection, or the TLS
+  handshake itself failed — in that case `status_out` is 0.
+
+A minimal worked example (a plain GET, no headers, no body) —
+see `sdk/examples/http_fetch/http_fetch.c` for the complete, runnable
+version of this:
+
+```c
+struct zos_http_request req;
+req.host = "example.com";
+req.port = 0;            /* 0 = default (80, since use_tls is 0) */
+req.use_tls = 0;
+req.method = "GET";
+req.path = "/";
+req.extra_headers = 0;   /* NULL -- no custom headers */
+req.body = 0;            /* NULL -- no request body */
+req.body_len = 0;
+req.response_buf = response_buf;       /* your own buffer */
+req.response_cap = sizeof(response_buf) - 1;
+req.content_type_buf = content_type_buf; /* or NULL to skip */
+req.content_type_cap = sizeof(content_type_buf);
+
+unsigned int r = zos_http_request(&req);
+if (r == (unsigned int)-1) {
+    /* DNS/TCP/TLS failed -- no response at all */
+} else {
+    /* req.status_out is the HTTP status; response_buf/response_len_out
+       hold the decoded body */
+}
+```
+
+Adapting this into a POST against a real AI provider's API is a matter
+of setting `method = "POST"`, `use_tls = 1`, pointing `extra_headers` at
+a string containing your own `Authorization`/`Content-Type` lines, and
+`body`/`body_len` at your own hand-built JSON payload — see the large
+comment block at the bottom of `sdk/examples/http_fetch/http_fetch.c`
+for the exact shape of this (marked clearly as illustrative, since this
+repo has no real API key to test it against and does not pretend
+otherwise).
+
+## 6. Getting started in 5 minutes
 
 **Quick path** (paste this into a file via the Text Editor, or type it
 directly into the Terminal with whatever ZapOS gives you for creating
@@ -319,7 +448,7 @@ borderless, transparent floating desktop pet: no rectangular window box
 at all, just the face's own pixels composited straight onto the
 desktop.
 
-## 6. Honesty / limitations section
+## 7. Honesty / limitations section
 
 Read this before you build something that assumes otherwise:
 
@@ -342,18 +471,31 @@ Read this before you build something that assumes otherwise:
   programs — the File Manager and Terminal read/write files, but they
   do it from kernel-side code, not by exposing a syscall your ELF
   binary can call. Your app's only ways to communicate with the world
-  are `zos_write` (one-way, to the log/Terminal), the two windowed-
-  graphics syscalls, and IPC to another cooperating task. If your app
-  needs to persist state across a run, it currently can't, on its own.
+  are `zos_write` (one-way, to the log/Terminal), the windowed-graphics
+  syscalls, `zos_http_request()` (outbound network only — there is no
+  way to LISTEN/accept an inbound connection), and IPC to another
+  cooperating task. If your app needs to persist state across a run, it
+  currently can't, on its own.
 - **One global keyboard queue, no window focus.** Covered in section 3
   above — every task and the desktop itself share one event stream.
-- **No drag, no close button, no dock icon for app windows.** Covered
-  in section 3 above — a real window manager for these is explicit
-  follow-on work, not attempted here.
+- **No drag (by the user), no close button, no dock icon for app
+  windows.** Covered in section 3 above — an app CAN reposition its own
+  window at runtime (`zos_win_move()`), but the user still can't
+  click-and-drag one, and there's no close button or taskbar entry; a
+  real window manager for these is explicit follow-on work, not
+  attempted here.
 - **The "AI pet" example is not AI in the trained-model sense.**
   Covered at the top of this file and in `sdk/examples/aipet/aipet.c`'s
   own header comment — worth repeating here since it's easy to
-  skim past: it's an `if`/`else`-driven counter pair, nothing more.
+  skim past: it's an `if`/`else`-driven counter pair, nothing more. It
+  now wanders around the desktop (via `zos_win_move()`) instead of
+  sitting in one fixed spot, but that's still just position bookkeeping
+  in a loop — no smarter than before.
+- **`zos_http_request()` is generic HTTP capability, not bundled AI
+  access.** Covered in section 5 above — ZapOS ships no API key and
+  this syscall doesn't talk to any particular service on its own; it's
+  a bring-your-own-endpoint-and-credentials HTTP client, the same way a
+  real OS's socket API doesn't know or care what you connect it to.
 
 ## Where things live
 
@@ -362,7 +504,13 @@ Read this before you build something that assumes otherwise:
 - `sdk/examples/aipet/aipet.c` — the flagship "Pixel Pet" demo: a real
   borderless, transparent floating desktop pet (`ZOS_WIN_BORDERLESS`,
   alpha-composited pixels, no rectangular window box), with keyboard
-  input and timer-driven decay, all built on this SDK.
+  input, timer-driven decay, and now (via `zos_win_move()`) a wandering
+  bounce-around-the-desktop movement pattern, all built on this SDK.
+- `sdk/examples/http_fetch/http_fetch.c` — demonstrates
+  `zos_http_request()`: a plain GET to example.com, printing the status
+  code and a snippet of the response, plus a large illustrative (not
+  executable) comment showing how to adapt the same call into a POST
+  against a real AI provider's API with your own key.
 - `userprogs/user.ld` — the linker script every full-path app links
   against (shared with this repo's own sample programs — not
   SDK-specific, but required either way).

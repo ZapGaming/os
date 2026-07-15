@@ -13,7 +13,8 @@
  * Provided: print(s), print_int(n), yield(), sleep(ms), get_ticks(),
  * poll_key(), exit(code), ipc_open(name), ipc_send(id,buf,len),
  * ipc_recv(id,buf,cap), ipc_close(id), win_open(title,w,h,flags),
- * win_blit(handle,pixels) -- one thin wrapper per syscall in
+ * win_blit(handle,pixels), win_move(handle,x,y), http_request(req) --
+ * one thin wrapper per syscall in
  * include/kernel/syscall.h, plus the two print variants since there's
  * no other way for a compiled program to produce output at all (no
  * libc means no sprintf/itoa either). SYS_BLIT is deliberately not
@@ -228,6 +229,57 @@ static void emit_win_blit(struct cc_buf *b) {
     emit_epilogue(b);
 }
 
+/* int win_move(int handle, int x, int y) -- SYS_WIN_MOVE(handle, x, y).
+ * Three plain-int cdecl stack args -- simpler than win_open() above,
+ * no pointer involved at all: `handle` at [ebp+8], `x` at [ebp+12], `y`
+ * at [ebp+16], loaded straight into EBX/ECX/EDX (the first three
+ * syscall argument registers), no ESI needed. This is the builtin that
+ * lets a `cc`-compiled program (e.g. a desktop pet) reposition its own
+ * window at runtime instead of sitting at its cascaded default forever
+ * -- see gui/compositor.c's gui_app_window_move(). Returns 0 on
+ * success, or -1 for an invalid/closed handle. */
+static void emit_win_move(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_mem(b, ECX, EBP, 12);
+    emit_mov_reg_mem(b, EDX, EBP, 16);
+    emit_mov_reg_imm32(b, EAX, SYS_WIN_MOVE);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
+/* int http_request(int *req) -- SYS_HTTP_REQUEST(req). One pointer
+ * argument at [ebp+8], loaded into EBX -- mirrors ipc_open()'s single-
+ * pointer-arg shape above. `req` must point at a `struct
+ * zos_http_request` (include/kernel/syscall.h / sdk/zapos.h) laid out
+ * in memory.
+ *
+ * Be honest about how impractical this is from THIS compiler
+ * specifically: `cc`'s language subset has no struct syntax at all (see
+ * this file's own header comment -- int/pointer only), so a `cc`-path
+ * program wanting to use this would have to declare a plain `int
+ * req[14];`-style array and hand-lay-out every one of struct
+ * zos_http_request's 14 fields into it at the exact byte offsets the
+ * real C struct would use (matching field order, with every pointer/
+ * uint32_t/int field occupying exactly one 4-byte slot on this
+ * architecture) -- entirely possible in principle, since an int array
+ * IS just raw memory here (the same idiom win_blit's pixel buffer
+ * already relies on), but genuinely awkward and easy to get wrong with
+ * no compiler help checking the layout. The real gcc SDK path
+ * (sdk/zapos.h's actual `struct zos_http_request`) is the realistic way
+ * to use this capability -- this builtin is wired up mainly for
+ * consistency (every syscall gets one), not because it's a good fit for
+ * this language subset. Returns 0 on mechanical success (check the
+ * struct's status_out field for the actual HTTP status), or -1 if DNS/
+ * TCP/TLS failed. */
+static void emit_http_request(struct cc_buf *b) {
+    emit_prologue(b, 0);
+    emit_mov_reg_mem(b, EBX, EBP, 8);
+    emit_mov_reg_imm32(b, EAX, SYS_HTTP_REQUEST);
+    emit_int80(b);
+    emit_epilogue(b);
+}
+
 /* `param_ptr_depths` is a `param_count`-length array (NULL when
  * param_count == 0), one ptr_depth slot per parameter in declaration
  * order -- e.g. ipc_send(int id, char *buf, int len) passes {0, 1, 0}.
@@ -273,6 +325,7 @@ void cc_register_builtins(struct cc_module *m) {
     static const int ptrs_int_ptr_int[] = { 0, 1, 0 }; /* (int, T*, int) */
     static const int ptrs_int_ptr[]     = { 0, 1 };    /* (int, T*) */
     static const int ptrs_ptr_int_int_int[] = { 1, 0, 0, 0 }; /* (T*, int, int, int) */
+    static const int ptrs_int_int_int[] = { 0, 0, 0 }; /* (int, int, int) */
 
     f = cc_register_builtin(m, "print", 1, ptrs_1_ptr, 1, 0);
     if (f) { f->text_offset = m->text.len; emit_print(&m->text); }
@@ -312,4 +365,10 @@ void cc_register_builtins(struct cc_module *m) {
 
     f = cc_register_builtin(m, "win_blit", 2, ptrs_int_ptr, 0, 0);
     if (f) { f->text_offset = m->text.len; emit_win_blit(&m->text); }
+
+    f = cc_register_builtin(m, "win_move", 3, ptrs_int_int_int, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_win_move(&m->text); }
+
+    f = cc_register_builtin(m, "http_request", 1, ptrs_1_ptr, 0, 0);
+    if (f) { f->text_offset = m->text.len; emit_http_request(&m->text); }
 }

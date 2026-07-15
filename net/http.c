@@ -6,6 +6,8 @@
 #include <kernel/pit.h>
 #include <kernel/kheap.h>
 #include <kernel/serial.h>
+#include <kernel/spinlock.h>
+#include <kernel/scheduler.h>
 #include <string.h>
 
 static int ci_starts_with(const char *s, const char *prefix);
@@ -123,6 +125,30 @@ static uint8_t *raw_buf = NULL;
  * undone but before Content-Encoding (gzip/deflate) has -- i.e. still
  * possibly compressed. Same lazy-kmalloc/sizing convention as raw_buf. */
 static uint8_t *comp_buf = NULL;
+
+/* req_buf/cookie_hdr_buf: the outgoing request-line+headers buffer and
+ * the built Cookie: header value. These used to be plain stack-local
+ * arrays (char req[HTTP_REQ_HDR_BUF_SIZE]; char cookie_hdr[512];) inside
+ * http_request_impl()'s per-hop redirect loop -- fine back when
+ * HTTP_REQ_HDR_BUF_SIZE was 1600 bytes and the only caller was the
+ * Browser's single-threaded http_get(), but the POST/custom-headers pass
+ * bumped it to 8192, and SYS_HTTP_REQUEST (kernel/syscall.c) now lets any
+ * ring-3 task reach this deep, preemptible call chain (isr_common_stub ->
+ * isr_dispatch -> syscall_handler -> http_request -> http_request_impl ->
+ * dns_resolve/conn_connect/conn_send/conn_recv). Against a 16KB
+ * TASK_STACK_SIZE (include/kernel/scheduler.h) with no guard page between
+ * adjacent kmalloc'd task stacks, 8192+512 bytes of stack in ONE frame of
+ * that chain was enough to overflow into a neighboring task's stack --
+ * observed as a ring-0 Invalid Opcode exception at a different, seemingly
+ * random EIP each run, only when two SYS_HTTP_REQUEST calls actually
+ * overlapped (a single in-flight call never got close to 16KB and never
+ * crashed). Moved off the stack into lazily-kmalloc'd static buffers,
+ * exactly mirroring raw_buf/comp_buf above -- safe as static (shared,
+ * reused) buffers specifically because http_lock (below) already
+ * guarantees only one http_request_impl() call is ever in flight at a
+ * time, so there's never a second writer. */
+static char *req_buf = NULL;
+static char *cookie_hdr_buf = NULL;
 
 /* A small in-memory response cache, keyed by "host:port/path", so a
  * page revisited (or a stylesheet/image shared by several pages) in
@@ -414,33 +440,148 @@ static int is_redirect_status(int status) {
     return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
-int http_get(int use_tls, const char *host, uint16_t port, const char *path,
-             int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
-             char *content_type_out, uint32_t content_type_cap) {
+/* Bounded string append used while assembling the request headers below
+ * -- appends as much of `s` as still fits in `buf` (capacity `cap`,
+ * always left NUL-terminated), silently truncating the rest rather than
+ * overrunning. Returns the number of bytes actually appended (which can
+ * be less than strlen(s) if it didn't all fit). Used instead of bare
+ * strcat() now that a caller-supplied `extra_headers` block (or a POST
+ * body's Content-Length line) means the pieces being concatenated are
+ * no longer all small, fixed, trusted literals. */
+static uint32_t http_append(char *buf, uint32_t len, uint32_t cap, const char *s) {
+    uint32_t i = 0;
+    while (s[i] && len + i + 1 < cap) { buf[len + i] = s[i]; i++; }
+    buf[len + i] = 0;
+    return i;
+}
+
+/* Formats `val` as unsigned decimal into `out` (at least 11 bytes) and
+ * returns the digit count -- used for the Content-Length header value,
+ * since there's no sprintf without libc. */
+static uint32_t uint_to_str(uint32_t val, char *out) {
+    char tmp[12];
+    int n = 0;
+    if (val == 0) tmp[n++] = '0';
+    while (val > 0) { tmp[n++] = (char)('0' + val % 10); val /= 10; }
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+    return (uint32_t)n;
+}
+
+/* Sized generously over the original GET-only 1600 bytes: a caller-
+ * supplied `extra_headers` block (e.g. an Authorization bearer token
+ * plus a Content-Type line for a real API call) and a Content-Length
+ * header for a POST body can both push a request's header section well
+ * past what a bare "GET /path HTTP/1.1\r\nHost: ...\r\n..." ever needed.
+ * Still a hard cap, not unbounded -- see http_append() above, which
+ * truncates (rather than overflows) anything that doesn't fit. The
+ * request BODY itself is sent separately, in its own conn_send() calls
+ * below (chunked to fit conn_send()'s uint16_t length parameter), so it
+ * doesn't need to fit in this buffer at all -- only the header text
+ * does. */
+#define HTTP_REQ_HDR_BUF_SIZE 8192
+
+/* Guards every module-level piece of shared state below (`raw_buf`/
+ * `comp_buf`, and -- transitively, via conn_connect()/conn_send()/
+ * conn_recv() -- net/tcp.c's single `conn` struct, whose own comment
+ * there says "one connection at a time -- this OS only ever needs one
+ * HTTP request in flight") against genuine concurrent callers. That
+ * assumption was true by ACCIDENT, not by design, before SYS_HTTP_REQUEST
+ * existed: http_get() had exactly one caller anywhere in this codebase
+ * (the Browser, via gui/compositor.c), which only ever called it
+ * synchronously to completion, one call at a time, from its own single
+ * task -- so nothing else could ever be mid-request when it ran. Now
+ * that ANY ring-3 task can call SYS_HTTP_REQUEST (kernel/syscall.c), and
+ * that syscall's handler runs with interrupts enabled (needed to fix a
+ * real hang -- see its own comment), two genuinely concurrent requests
+ * (the Browser mid-fetch while a background app also calls
+ * SYS_HTTP_REQUEST, or two apps both calling it) are now really
+ * possible, and without a lock they'd silently corrupt each other's
+ * connection state and response buffers -- easily the worse of the two
+ * failure modes, since it wouldn't necessarily crash, just return
+ * corrupted data to one or both callers.
+ *
+ * This is deliberately NOT held across the whole multi-second network
+ * operation via an IRQ-disabling spinlock -- that would freeze the
+ * timer (and every other interrupt) for as long as the request takes,
+ * which is exactly the class of bug kernel/syscall.c's SYS_HTTP_REQUEST
+ * handler just had to fix for a different reason. Instead,
+ * lock_acquire_irqsave()/lock_release_irqrestore() (kernel/spinlock.h)
+ * only ever guard the plain `http_in_use` flag's own check-and-set (a
+ * handful of instructions); a caller that finds it already set just
+ * yields (schedule()) and retries, exactly the same "non-blocking
+ * primitive plus a schedule()-loop around it" shape kernel/ipc.c's
+ * ipc_try_send()/ipc_try_recv() already use for the same reason. Net
+ * effect: at most one http_request_impl() call runs at a time, system-
+ * wide; everyone else's call just waits its turn instead of racing. */
+static spinlock_t http_lock = SPINLOCK_INIT;
+static volatile int http_in_use = 0;
+
+static void http_lock_acquire(void) {
+    for (;;) {
+        uint32_t eflags = lock_acquire_irqsave(&http_lock);
+        if (!http_in_use) {
+            http_in_use = 1;
+            lock_release_irqrestore(&http_lock, eflags);
+            return;
+        }
+        lock_release_irqrestore(&http_lock, eflags);
+        schedule();
+    }
+}
+
+static void http_lock_release(void) {
+    uint32_t eflags = lock_acquire_irqsave(&http_lock);
+    http_in_use = 0;
+    lock_release_irqrestore(&http_lock, eflags);
+}
+
+static int http_request_impl(int use_tls, const char *host, uint16_t port, const char *method,
+                  const char *path, const char *extra_headers, const char *body, uint32_t body_len,
+                  int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
+                  char *content_type_out, uint32_t content_type_cap) {
     *status_out = 0;
     *body_len_out = 0;
     if (content_type_out && content_type_cap) content_type_out[0] = 0;
 
+    /* Redirects are only ever chased for GET (see is_redirect_status()
+     * below and this function's own doc comment / the header comment in
+     * include/net/http.h): resubmitting a POST's body to a new host on
+     * a 3xx is not correct HTTP semantics, so a non-GET method hitting a
+     * redirect just returns that response as-is. The in-memory cache is
+     * likewise GET-only -- a POST is never served from it and never
+     * populates it, since caching a request that has side effects (or
+     * whose response depends on the body sent) would be wrong. */
+    int is_get = (strcmp(method, "GET") == 0);
+
+    /* Filled unconditionally (cheap -- just string formatting) even
+     * though it's only ever looked up or stored against when is_get, so
+     * there's no maybe-uninitialized path into the cache_store() call
+     * near the bottom of this function. */
     char cache_key[HTTP_CACHE_KEY_LEN];
     make_cache_key(cache_key, sizeof(cache_key), host, port, path);
-    struct http_cache_entry *hit = cache_find(cache_key);
-    if (hit) {
-        *status_out = hit->status;
-        uint32_t n = hit->body_len < body_cap ? hit->body_len : body_cap;
-        memcpy(body_out, hit->body, n);
-        *body_len_out = n;
-        if (content_type_out && content_type_cap) {
-            strncpy(content_type_out, hit->content_type, content_type_cap - 1);
-            content_type_out[content_type_cap - 1] = 0;
+    if (is_get) {
+        struct http_cache_entry *hit = cache_find(cache_key);
+        if (hit) {
+            *status_out = hit->status;
+            uint32_t n = hit->body_len < body_cap ? hit->body_len : body_cap;
+            memcpy(body_out, hit->body, n);
+            *body_len_out = n;
+            if (content_type_out && content_type_cap) {
+                strncpy(content_type_out, hit->content_type, content_type_cap - 1);
+                content_type_out[content_type_cap - 1] = 0;
+            }
+            hit->last_used = http_cache_clock++;
+            serial_printf("http: %s%s -> CACHED status=%d body=%u bytes\n", host, path, hit->status, n);
+            return 1;
         }
-        hit->last_used = http_cache_clock++;
-        serial_printf("http: %s%s -> CACHED status=%d body=%u bytes\n", host, path, hit->status, n);
-        return 1;
     }
 
     if (!raw_buf) raw_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
     if (!comp_buf) comp_buf = (uint8_t *)kmalloc(HTTP_RAW_BUF_SIZE);
-    if (!raw_buf || !comp_buf) {
+    if (!req_buf) req_buf = (char *)kmalloc(HTTP_REQ_HDR_BUF_SIZE);
+    if (!cookie_hdr_buf) cookie_hdr_buf = (char *)kmalloc(512);
+    if (!raw_buf || !comp_buf || !req_buf || !cookie_hdr_buf) {
         serial_printf("http: out of memory allocating %u-byte receive buffer\n", HTTP_RAW_BUF_SIZE);
         return 0;
     }
@@ -459,25 +600,64 @@ int http_get(int use_tls, const char *host, uint16_t port, const char *path,
         if (!dns_resolve(cur_host, &ip)) return 0;
         if (!conn_connect(cur_is_https, ip, cur_port, cur_host)) return 0;
 
-        char cookie_hdr[512];
-        uint32_t cookie_hdr_len = cookie_build_header(cur_host, cookie_hdr, sizeof(cookie_hdr));
+        char *cookie_hdr = cookie_hdr_buf;
+        uint32_t cookie_hdr_len = cookie_build_header(cur_host, cookie_hdr, 512);
 
-        char req[1600];
-        strcpy(req, "GET ");
-        strcat(req, cur_path);
-        strcat(req, " HTTP/1.1\r\nHost: ");
-        strcat(req, cur_host);
-        strcat(req, "\r\nUser-Agent: ZapOS/1.0\r\nAccept-Encoding: gzip, deflate\r\n");
+        char *req = req_buf;
+        uint32_t rl = 0;
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, method);
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, " ");
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, cur_path);
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, " HTTP/1.1\r\nHost: ");
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, cur_host);
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "\r\nUser-Agent: ZapOS/1.0\r\nAccept-Encoding: gzip, deflate\r\n");
         if (cookie_hdr_len > 0) {
-            strcat(req, "Cookie: ");
-            strcat(req, cookie_hdr);
-            strcat(req, "\r\n");
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "Cookie: ");
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, cookie_hdr);
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "\r\n");
         }
-        strcat(req, "Connection: close\r\n\r\n");
+        /* Caller-supplied header lines (e.g. "Authorization: Bearer ...\r\n"
+         * or "Content-Type: application/json\r\n"), spliced in between the
+         * standard headers above and Connection: close/the final blank
+         * line below -- exactly the mechanism that lets a real web API
+         * call carry auth/content-type headers this client never
+         * hardcodes itself. NULL means "none", same as passing NULL to
+         * content_type_out. */
+        if (extra_headers) {
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, extra_headers);
+        }
+        rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "Connection: close\r\n");
+        if (body && body_len > 0) {
+            char lenbuf[12];
+            uint_to_str(body_len, lenbuf);
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "Content-Length: ");
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, lenbuf);
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "\r\n\r\n");
+        } else {
+            rl += http_append(req, rl, HTTP_REQ_HDR_BUF_SIZE, "\r\n");
+        }
 
-        if (!conn_send(cur_is_https, req, (uint16_t)strlen(req))) {
+        if (!conn_send(cur_is_https, req, (uint16_t)rl)) {
             conn_close(cur_is_https);
             return 0;
+        }
+
+        /* Body sent as its own conn_send() call(s), chunked to fit its
+         * uint16_t length parameter -- treated as a raw byte buffer, NOT
+         * assumed to be NUL-terminated text (a real API's JSON body
+         * could in principle contain any byte), so this never uses
+         * strlen()/strcat() on it, unlike the header text above. */
+        if (body && body_len > 0) {
+            uint32_t sent = 0;
+            while (sent < body_len) {
+                uint32_t chunk = body_len - sent;
+                if (chunk > 32768) chunk = 32768; /* comfortably under the uint16_t cap conn_send() takes */
+                if (!conn_send(cur_is_https, (const char *)body + sent, (uint16_t)chunk)) {
+                    conn_close(cur_is_https);
+                    return 0;
+                }
+                sent += chunk;
+            }
         }
 
         total = 0;
@@ -522,7 +702,7 @@ int http_get(int use_tls, const char *host, uint16_t port, const char *path,
             sc = find_header_next((const char *)raw_buf, header_end, "set-cookie", sc);
         }
 
-        if (is_redirect_status(*status_out) && hop < HTTP_MAX_REDIRECTS) {
+        if (is_get && is_redirect_status(*status_out) && hop < HTTP_MAX_REDIRECTS) {
             const char *loc = find_header((const char *)raw_buf, header_end, "location");
             if (loc) {
                 const char *line_end = loc;
@@ -547,7 +727,11 @@ int http_get(int use_tls, const char *host, uint16_t port, const char *path,
         break;
     }
 
-    const uint8_t *body = raw_buf + header_end;
+    /* Named resp_body/resp_body_len (not body/body_len) to avoid
+     * shadowing this function's own `body`/`body_len` REQUEST-body
+     * parameters -- those are the bytes sent, these are the bytes
+     * received. */
+    const uint8_t *resp_body = raw_buf + header_end;
     uint32_t body_avail = total - header_end;
 
     const char *chunked = find_header((const char *)raw_buf, header_end, "transfer-encoding");
@@ -577,46 +761,87 @@ int http_get(int use_tls, const char *host, uint16_t port, const char *path,
      * name: the compressed-but-de-chunked body. */
     uint32_t comp_len;
     if (is_chunked) {
-        comp_len = decode_chunked(body, body_avail, comp_buf, HTTP_RAW_BUF_SIZE);
+        comp_len = decode_chunked(resp_body, body_avail, comp_buf, HTTP_RAW_BUF_SIZE);
     } else {
         const char *cl = find_header((const char *)raw_buf, header_end, "content-length");
         uint32_t content_length = cl ? parse_uint(cl, (const char *)raw_buf + header_end) : body_avail;
         comp_len = content_length < body_avail ? content_length : body_avail;
         if (comp_len > HTTP_RAW_BUF_SIZE) comp_len = HTTP_RAW_BUF_SIZE;
-        memcpy(comp_buf, body, comp_len);
+        memcpy(comp_buf, resp_body, comp_len);
     }
 
     const char *enc = find_header((const char *)raw_buf, header_end, "content-encoding");
     int is_gzip = enc && ci_starts_with(enc, "gzip");
     int is_deflate = enc && ci_starts_with(enc, "deflate");
 
-    uint32_t body_len;
+    uint32_t resp_body_len;
     if (is_gzip) {
-        gzip_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &body_len);
+        gzip_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &resp_body_len);
     } else if (is_deflate) {
-        deflate_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &body_len);
+        deflate_decompress(comp_buf, comp_len, (uint8_t *)body_out, body_cap, &resp_body_len);
     } else {
-        body_len = comp_len < body_cap ? comp_len : body_cap;
-        memcpy(body_out, comp_buf, body_len);
+        resp_body_len = comp_len < body_cap ? comp_len : body_cap;
+        memcpy(body_out, comp_buf, resp_body_len);
     }
 
-    *body_len_out = body_len;
-    serial_printf("http: %s%s -> status=%d body=%u bytes%s%s\n",
-                  host, path, *status_out, body_len, is_chunked ? " (chunked)" : "",
+    *body_len_out = resp_body_len;
+    serial_printf("http: %s %s%s -> status=%d body=%u bytes%s%s\n",
+                  method, host, path, *status_out, resp_body_len, is_chunked ? " (chunked)" : "",
                   is_gzip ? " (gzip)" : is_deflate ? " (deflate)" : "");
 
-    const char *cc = find_header((const char *)raw_buf, header_end, "cache-control");
-    if (cc) {
-        const char *hdr_end = (const char *)raw_buf + header_end;
-        const char *line_end = cc;
-        while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
-        if (!cache_control_has(cc, line_end, "no-store") && !cache_control_has(cc, line_end, "no-cache")) {
-            int max_age = cache_control_max_age(cc, line_end);
-            if (max_age > 0) {
-                cache_store(cache_key, *status_out, content_type_buf, (const uint8_t *)body_out,
-                            body_len, (uint32_t)max_age);
+    /* Cache store is GET-only, mirroring the GET-only cache_find() at
+     * the top of this function -- a POST (or any other non-GET method)
+     * never populates the cache, since its response may depend on the
+     * body sent (or have side effects), so treating it as a cacheable-
+     * by-URL GET-style response would be wrong. */
+    if (is_get) {
+        const char *cc = find_header((const char *)raw_buf, header_end, "cache-control");
+        if (cc) {
+            const char *hdr_end = (const char *)raw_buf + header_end;
+            const char *line_end = cc;
+            while (line_end < hdr_end && *line_end != '\r' && *line_end != '\n') line_end++;
+            if (!cache_control_has(cc, line_end, "no-store") && !cache_control_has(cc, line_end, "no-cache")) {
+                int max_age = cache_control_max_age(cc, line_end);
+                if (max_age > 0) {
+                    cache_store(cache_key, *status_out, content_type_buf, (const uint8_t *)body_out,
+                                resp_body_len, (uint32_t)max_age);
+                }
             }
         }
     }
     return 1;
+}
+
+/* Public entry point: just http_request_impl() above, serialized against
+ * every other caller system-wide -- see http_lock_acquire()'s doc
+ * comment for why this exists and why it's a schedule()-loop around a
+ * flag rather than holding a spinlock across the whole call. Wrapping
+ * here (rather than adding http_lock_release() before each of
+ * http_request_impl()'s own several early `return`s) means the lock is
+ * always released exactly once, no matter which of those return points
+ * fires, without touching that function's internals at all. */
+int http_request(int use_tls, const char *host, uint16_t port, const char *method,
+                  const char *path, const char *extra_headers, const char *body, uint32_t body_len,
+                  int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
+                  char *content_type_out, uint32_t content_type_cap) {
+    http_lock_acquire();
+    int r = http_request_impl(use_tls, host, port, method, path, extra_headers, body, body_len,
+                               status_out, body_out, body_cap, body_len_out,
+                               content_type_out, content_type_cap);
+    http_lock_release();
+    return r;
+}
+
+/* GET-only convenience wrapper over http_request() above -- see this
+ * function's own doc comment in include/net/http.h. Produces byte-
+ * identical request traffic and identical caching behavior to the
+ * pre-http_request() version of this function: every existing caller
+ * (gui/compositor.c's browser/CSS/image/WASM fetch helpers) needed zero
+ * changes for this refactor. */
+int http_get(int use_tls, const char *host, uint16_t port, const char *path,
+             int *status_out, char *body_out, uint32_t body_cap, uint32_t *body_len_out,
+             char *content_type_out, uint32_t content_type_cap) {
+    return http_request(use_tls, host, port, "GET", path, NULL, NULL, 0,
+                         status_out, body_out, body_cap, body_len_out,
+                         content_type_out, content_type_cap);
 }

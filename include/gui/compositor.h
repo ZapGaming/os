@@ -45,6 +45,19 @@ int gui_app_window_open(int owner_pid, const char *title, uint32_t w, uint32_t h
  * `handle` is out of range or not currently open. */
 int gui_app_window_blit(int handle, const void *pixels);
 
+/* Called from kernel/syscall.c's SYS_WIN_MOVE handler: repositions an
+ * already-open app window (opened via gui_app_window_open() above) to a
+ * new (x, y) -- the missing piece that let a fixed-cascaded-position app
+ * window (e.g. a "desktop pet") only ever sit still. `x`/`y` are plain
+ * signed ints, no validation against screen bounds: a window moved off
+ * the visible desktop just renders clipped/invisible on the next
+ * draw_app_windows() pass, exactly like any other out-of-bounds
+ * fb_put_pixel() call already safely no-ops -- staying on-screen is the
+ * calling app's own responsibility, not something the kernel enforces.
+ * Returns 0 on success, or -1 if `handle` is out of range or not
+ * currently open. */
+int gui_app_window_move(int handle, int x, int y);
+
 /* Called from kernel/syscall.c's SYS_WRITE case for every task's
  * output, not just the fullscreen-takeover case above -- a no-op
  * unless `pid` is the one program the Terminal window currently has

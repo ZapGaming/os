@@ -3,8 +3,11 @@
  * window (via zos_win_open(..., ZOS_WIN_BORDERLESS)/zos_win_blit(), see
  * sdk/zapos.h) -- a real floating face on the desktop, no rectangular
  * window box, no title bar, no frame: just the pet's own alpha-
- * composited pixels. It reacts to keypresses and draws its own animated
- * face with plain integer geometry.
+ * composited pixels. It reacts to keypresses, draws its own animated
+ * face with plain integer geometry, and -- via zos_win_move() -- now
+ * actually WANDERS around the desktop instead of sitting in one fixed
+ * spot the whole time it's running (see the wander/bounce logic in
+ * _start() below).
  *
  * IMPORTANT, read this before assuming otherwise: the "AI" in "AI pet"
  * is a simple, fully deterministic RULE-BASED STATE MACHINE -- two
@@ -55,6 +58,25 @@
 #define BLINK_DURATION_TICKS 12   /* ~120ms eyes-closed */
 #define STATUS_INTERVAL_TICKS 400 /* ~4s between "stats readout" lines */
 #define LOOP_SLEEP_MS 50          /* ~20fps redraw/input-poll rate */
+
+/* Wander/bounce movement, added on top of the original fixed-position
+ * pet via zos_win_move() (sdk/zapos.h). ZapOS has no "query screen
+ * resolution" syscall (out of scope for this pass), so rather than
+ * guess the real desktop size, this uses a conservative, clearly fixed
+ * wander box that's safely inside even the smallest resolution this
+ * kernel supports (1024x768 -- see gui/compositor.c's SX()/SY()
+ * comment), with comfortable margin on every side (WIN_W/WIN_H add
+ * another 160x120 beyond the box's own top-left coordinate, and the
+ * taskbar alone reserves the bottom 44px of a 1024x768 desktop). A
+ * bigger real screen just means more unused margin, never clipping. */
+#define WANDER_X_MIN 0
+#define WANDER_X_MAX 700
+#define WANDER_Y_MIN 0
+#define WANDER_Y_MAX 500
+/* Pixels moved per ~50ms loop iteration -- picked (and eyeballed in
+ * QEMU) to read as a leisurely "wander," not a twitchy dart or a
+ * glacial creep: 3px * 20 iterations/sec = ~60px/sec. */
+#define WANDER_SPEED 3
 
 /* The pet's whole pixel buffer -- an app window's backing store is
  * exactly a `uint32_t` 0xAARRGGBB array (top byte = alpha), row-major
@@ -212,6 +234,20 @@ void _start(void) {
     unsigned int last_decay = zos_get_ticks();
     unsigned int last_status = last_decay;
 
+    /* Wander state. Starting position matches gui_app_window_open()'s
+     * own cascaded default for the first app-window slot (40, 40 --
+     * see gui/compositor.c) so there's no visible jump on the very
+     * first move; if this pet isn't the only/first app window open,
+     * the real starting slot might differ slightly, which just means
+     * one slightly-larger first step into the wander box -- harmless,
+     * since zos_win_move() has no bounds requirement on where you're
+     * moving FROM. dx/dy is the current velocity, one bounce-reversing
+     * component at a time (a diagonal "bounce off the wall" -- both
+     * hitting a wall simultaneously just reverses both, which is still
+     * a correct bounce). */
+    int pet_x = 40, pet_y = 40;
+    int dx = WANDER_SPEED, dy = WANDER_SPEED;
+
     for (;;) {
         unsigned int now = zos_get_ticks();
 
@@ -220,6 +256,18 @@ void _start(void) {
             if (hunger > 0) hunger--;
             if (happiness > 0) happiness--;
         }
+
+        /* Advance and bounce -- reverse whichever axis just hit its
+         * boundary, then clamp so a single oversized step can't leave
+         * the window sitting fully past the wall (it just lands
+         * exactly on it instead, same as any well-behaved bounce). */
+        pet_x += dx;
+        if (pet_x < WANDER_X_MIN) { pet_x = WANDER_X_MIN; dx = -dx; }
+        else if (pet_x > WANDER_X_MAX) { pet_x = WANDER_X_MAX; dx = -dx; }
+        pet_y += dy;
+        if (pet_y < WANDER_Y_MIN) { pet_y = WANDER_Y_MIN; dy = -dy; }
+        else if (pet_y > WANDER_Y_MAX) { pet_y = WANDER_Y_MAX; dy = -dy; }
+        zos_win_move(win, pet_x, pet_y);
 
         /* Drain every pending key event this tick -- poll_key is
          * non-blocking and only ever returns one event per call, so a
