@@ -73,7 +73,7 @@ function inventoryPage(rows, page, ownerLabel, totalOwnedUnique, totalCards) {
   return { embed, totalPages, clampedPage };
 }
 
-function shopEmbed(packs, rarities) {
+function shopEmbed(packs, rarities, economy) {
   const rarityLines = rarities
     .map((r) => `${r.emoji} **${r.name}** — ${r.weight}% base odds — sells for ${r.sellValue} coins`)
     .join('\n');
@@ -89,6 +89,10 @@ function shopEmbed(packs, rarities) {
       {
         name: `${packs.standard.label}`,
         value: `${packs.standard.cardCount} cards: **${packs.standard.cost}** coins`,
+      },
+      {
+        name: 'Free rewards',
+        value: `🎁 \`/freepack\` — 1 free card every 6 hours\n☀️ \`/daily\` — ${economy.dailyReward} coins every 24 hours\n📅 \`/weekly\` — ${economy.weeklyReward} coins every 7 days`,
       },
       { name: 'Rarity odds & sell values', value: rarityLines }
     );

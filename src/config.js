@@ -20,6 +20,8 @@ module.exports = {
     startingCoins: 1000,
     dailyReward: 250,
     dailyCooldownMs: 24 * 60 * 60 * 1000,
+    weeklyReward: 1500,
+    weeklyCooldownMs: 7 * 24 * 60 * 60 * 1000,
   },
 
   packs: {
@@ -34,6 +36,11 @@ module.exports = {
       label: 'Standard Pack',
       cost: 500,
       cardCount: 5,
+    },
+    free: {
+      label: 'Free Pack',
+      cardCount: 1,
+      cooldownMs: 6 * 60 * 60 * 1000,
     },
   },
 

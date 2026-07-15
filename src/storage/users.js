@@ -1,12 +1,12 @@
 const { JsonStore } = require('./store');
-const { economy } = require('../config');
+const { economy, packs } = require('../config');
 
 const store = new JsonStore('users.json');
 
 function getUser(userId) {
   let user = store.get(userId);
   if (!user) {
-    user = { coins: economy.startingCoins, lastDaily: 0 };
+    user = { coins: economy.startingCoins, lastDaily: 0, lastWeekly: 0, lastFreePack: 0 };
     store.set(userId, user);
   }
   return user;
@@ -32,26 +32,57 @@ function spendCoins(userId, amount) {
   return true;
 }
 
-function getDailyStatus(userId) {
+/** Generic cooldown check against a timestamp field on the user record. */
+function checkCooldown(userId, field, cooldownMs) {
   const user = getUser(userId);
   const now = Date.now();
-  const elapsed = now - user.lastDaily;
-  const ready = elapsed >= economy.dailyCooldownMs;
-  return { ready, msRemaining: ready ? 0 : economy.dailyCooldownMs - elapsed };
+  const elapsed = now - (user[field] || 0);
+  const ready = elapsed >= cooldownMs;
+  return { ready, msRemaining: ready ? 0 : cooldownMs - elapsed };
+}
+
+function markCooldown(userId, field) {
+  const user = getUser(userId);
+  user[field] = Date.now();
+  store.set(userId, user);
+}
+
+function getDailyStatus(userId) {
+  return checkCooldown(userId, 'lastDaily', economy.dailyCooldownMs);
+}
+
+function getWeeklyStatus(userId) {
+  return checkCooldown(userId, 'lastWeekly', economy.weeklyCooldownMs);
+}
+
+function getFreePackStatus(userId) {
+  return checkCooldown(userId, 'lastFreePack', packs.free.cooldownMs);
 }
 
 /** Claims the daily reward if available. Returns { claimed, amount, msRemaining }. */
 function claimDaily(userId) {
-  const user = getUser(userId);
-  const now = Date.now();
-  const elapsed = now - user.lastDaily;
-  if (elapsed < economy.dailyCooldownMs) {
-    return { claimed: false, amount: 0, msRemaining: economy.dailyCooldownMs - elapsed };
-  }
-  user.lastDaily = now;
-  user.coins += economy.dailyReward;
-  store.set(userId, user);
+  const status = getDailyStatus(userId);
+  if (!status.ready) return { claimed: false, amount: 0, msRemaining: status.msRemaining };
+  addCoins(userId, economy.dailyReward);
+  markCooldown(userId, 'lastDaily');
   return { claimed: true, amount: economy.dailyReward, msRemaining: 0 };
+}
+
+/** Claims the weekly reward if available. Returns { claimed, amount, msRemaining }. */
+function claimWeekly(userId) {
+  const status = getWeeklyStatus(userId);
+  if (!status.ready) return { claimed: false, amount: 0, msRemaining: status.msRemaining };
+  addCoins(userId, economy.weeklyReward);
+  markCooldown(userId, 'lastWeekly');
+  return { claimed: true, amount: economy.weeklyReward, msRemaining: 0 };
+}
+
+/** Marks the free-pack cooldown as used if available. Returns { claimed, msRemaining}. */
+function claimFreePackCooldown(userId) {
+  const status = getFreePackStatus(userId);
+  if (!status.ready) return { claimed: false, msRemaining: status.msRemaining };
+  markCooldown(userId, 'lastFreePack');
+  return { claimed: true, msRemaining: 0 };
 }
 
 function getAllUsers() {
@@ -64,6 +95,10 @@ module.exports = {
   addCoins,
   spendCoins,
   getDailyStatus,
+  getWeeklyStatus,
+  getFreePackStatus,
   claimDaily,
+  claimWeekly,
+  claimFreePackCooldown,
   getAllUsers,
 };
