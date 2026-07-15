@@ -1,5 +1,0 @@
-node_modules/
-.env
-src/storage/db/*.json
-!src/storage/db/.gitkeep
-npm-debug.log*
